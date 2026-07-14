@@ -20,8 +20,9 @@ use crate::token::{CapabilityToken, TokenIssuer};
 use crate::tree::Tree;
 use ed25519_dalek::VerifyingKey;
 use loom_core::{
-    is_provenance, latest_node_key, source_index_key, ActorId, BranchId, CommitId, DerivationNode,
-    Key, LoomError, NodeId, Record, Result, SessionId, SourceRef, TenantId, Value, WriteEnvelope,
+    is_provenance, latest_node_key, node_storage_key, prov_seq_key, source_index_key, ActorId,
+    BranchId, CommitId, DerivationNode, Key, LoomError, NodeId, Record, Result, SessionId,
+    SourceRef, TenantId, Value, WriteEnvelope,
 };
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::{Arc, Mutex};
@@ -528,13 +529,28 @@ impl Loom {
         {
             let nodes =
                 self.derivation_nodes(branch, head, &written, envelope, &captured, extra_parents);
+
+            // **Append-ordered provenance.** Nodes used to be stored AT their content hash, which put
+            // every provenance write at a uniformly random point in the keyspace — so each commit
+            // dirtied nearly every leaf and rewrote a large fraction of the database. They now append
+            // to the tail of this branch's range. See `NodeId::key` for the full story.
+            let mut seq = match tree.get(&prov_seq_key(branch.as_str()))? {
+                Some(Record::Value(Value::Counter(n))) => n as u64,
+                _ => 0,
+            };
+
             for node in &nodes {
-                tree.insert(node.id.key(), Record::Value(Value::Blob(node.encode()?)))?;
+                tree.insert(
+                    node_storage_key(branch.as_str(), seq),
+                    Record::Value(Value::Blob(node.encode()?)),
+                )?;
 
                 // "Which node last wrote this key" — one lookup instead of a scan of the whole DAG.
                 // Reserved, and therefore never merged: it is mutable per-branch bookkeeping, not
                 // history, and handing it to the merge engine produced a conflict on an opaque blob
                 // with a report asking the caller to pick one. Nobody can answer that.
+                //
+                // This one is keyed by the DATA key, so it already had the locality the others lacked.
                 tree.insert(
                     latest_node_key(&node.key),
                     Record::Value(Value::Blob(node.id.as_bytes().to_vec())),
@@ -542,13 +558,26 @@ impl Loom {
 
                 // "Which nodes cite this source" — so `taint()` has somewhere to start without
                 // reading every node in every branch. A taint too slow to run is a taint nobody runs.
+                //
+                // Append-ordered too, within each source's range. The node id rides in the VALUE now;
+                // putting it in the KEY is what made this random in the first place.
                 for source in &node.sources {
                     tree.insert(
-                        source_index_key(source, node.id),
-                        Record::Value(Value::Blob(vec![])),
+                        source_index_key(source, branch.as_str(), seq),
+                        Record::Value(Value::Blob(node.id.as_bytes().to_vec())),
                     )?;
                 }
+
+                seq += 1;
             }
+
+            // The branch's next sequence number. Reserved, so it never merges: each branch counts for
+            // itself, and the branch name is inside the node key, so two branches sitting at the same
+            // sequence cannot collide.
+            tree.insert(
+                prov_seq_key(branch.as_str()),
+                Record::Value(Value::Counter(seq as i64)),
+            )?;
         }
 
         tree.flush(&mut txn)?;

@@ -43,8 +43,9 @@ pub use ids::{
     ActorId, BranchId, ClaimId, CommitId, ObservationId, PolicyDecisionId, SessionId, TenantId,
 };
 pub use provenance::{
-    is_provenance, latest_node_key, node_from_index_key, source_index_key, source_index_prefix,
-    DerivationNode, NodeId, PROV_PREFIX, RESERVED_LATEST_PREFIX, SRC_PREFIX,
+    is_provenance, latest_node_key, node_from_index_value, node_storage_key, prov_seq_key,
+    source_index_key, source_index_prefix, DerivationNode, NodeId, PROV_PREFIX,
+    RESERVED_LATEST_PREFIX, SRC_PREFIX,
 };
 pub use recall::{Compensation, IrreversibleItem, RecallPlan, ReversibleItem};
 pub use time::{Interval, Timestamp};

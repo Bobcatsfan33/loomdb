@@ -23,8 +23,9 @@
 
 use loom_branch::{CapabilityToken, Loom, Tree};
 use loom_core::{
-    node_from_index_key, source_index_prefix, BranchId, ClaimStatus, Compensation, DerivationNode,
-    LoomError, NodeId, RecallPlan, Record, Result, ReversibleItem, SourceRef, Value,
+    node_from_index_value, source_index_prefix, BranchId, ClaimStatus, Compensation,
+    DerivationNode, LoomError, NodeId, RecallPlan, Record, Result, ReversibleItem, SourceRef,
+    Value,
 };
 use std::collections::{BTreeMap, BTreeSet};
 use substrate_pager::PageStore;
@@ -94,11 +95,17 @@ impl<'a> Provenance<'a> {
         let prefix = source_index_prefix(source);
         let mut seeds = BTreeSet::new();
 
-        for (key, _) in tree.scan()? {
+        for (key, record) in tree.scan()? {
             if !key.starts_with(&prefix) {
                 continue;
             }
-            if let Some(node) = node_from_index_key(&key) {
+            // The node id is in the VALUE. It used to be in the key — which is exactly what forced the
+            // key to carry a content hash, and therefore to be random, and therefore to rewrite the
+            // whole tree on every commit.
+            let Record::Value(Value::Blob(bytes)) = record else {
+                continue;
+            };
+            if let Some(node) = node_from_index_value(&bytes) {
                 seeds.insert(node);
             }
         }

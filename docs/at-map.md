@@ -190,43 +190,79 @@ three other rows and print it as a measurement.
 
 ---
 
-## Where we are weak — the write path, and we found it before a customer did
+## Write amplification — **found by benchmarking, fixed before L3**
 
-Running the AT-011 sweep surfaced the **largest known problem in LoomDB**. It is not AT-011.
+### What was wrong
 
-**Write cost grows with the size of the database.** The same 100,000 records cost:
+**Write cost grew with the size of the database.** The same 100,000 records cost:
 
-| how it was written | time |
+| how it was written | before |
 |---|---|
+| one commit of 100,000 | 9.4 s |
 | ten commits of 10,000 | **36.9 s** |
-| one commit of 100,000 | **9.4 s** |
 
-Same data, same tree, same records. The only variable is the *number of commits* — so the cost of a
-commit is scaling with **the size of the tree**, not with the size of the batch.
+Same data, same records. The only variable was the **number of commits** — so a commit's cost was
+scaling with the size of the *tree*, not the size of the *batch*. Each commit was rewriting a large
+fraction of the database.
 
-**The cause.** Three of LoomDB's four records per write have **content-addressed keys**, which is to say
-**random** ones. Once the tree holds more leaves than a commit holds records, a commit's random keys
-touch nearly *every leaf* — so nearly every leaf is dirtied, re-encoded, re-hashed and written. **Each
-commit rewrites a large fraction of the database.**
+### The cause, stated correctly
 
-This is the price of provenance, and provenance is the product. But the current price is too high, and
-this is the first thing to fix — probably by giving derivation nodes an append-ordered storage key and
-keeping the content-addressed id as an index, so that writes go to the tail of the tree instead of all
-over it.
+A first version of this page said *three of four* records per write have random keys. That was wrong,
+and the corrected count is **two of four**:
 
-**It is not a correctness bug, and it does not affect AT-011** — which is exactly why the branch column
-above is flat and can be trusted.
+| record | key | locality |
+|---|---|---|
+| the data | the caller's key | caller's |
+| the derivation node | **the node's content hash** | **random** |
+| the source-index entry | source + **the node's content hash** | **random** |
+| the latest-node pointer | the *data* key | fine already |
 
-**Two real bugs were fixed while measuring:**
-- `is_full()` bincode-serialised the **entire leaf on every insert** — O(leaf) work per record, making a
-  leaf fill in O(leaf²). Now tracked incrementally, with one real encode at the fullness boundary.
-- The insert path **deep-cloned every node it descended through** — a fresh heap allocation for *every
-  key in the leaf*, in order to insert one record. Now moved, not cloned.
+A `NodeId` is a content hash, so storing a node **at** its id put every provenance write at a uniformly
+random point in the keyspace. Once the tree held more leaves than a commit held records, a commit's
+random keys touched *nearly every leaf* — so nearly every leaf was dirtied, re-encoded, re-hashed and
+written.
 
-Together those took the 10,000-record seed from **3.8 s to 0.9 s**. The remaining cost is the random-key
-problem above, which is architectural rather than a hot-loop mistake, and no amount of micro-optimising
-will remove it.
+### The fix
 
-**The known O(branches) cost is still here too:** the refs file is rewritten in full on every commit.
-It does not show up against baseline *size* — which is what AT-011 claims — but it will show up on a
-tenant with a great many branches. Not optimised, and not hidden.
+**Nothing ever looks a node up by id from storage.** `taint()` scans the provenance range and builds the
+`id → node` map in memory. So the content hash never needed to be the *storage key* — only the
+*identity*, which it still is, inside the node.
+
+Nodes now live at an **append-ordered** key: `(branch, sequence)`. The source index is append-ordered
+too, within each source's range, with the node id moved into the **value** — putting it in the key is
+what made it random in the first place. A commit's provenance now lands at the **tail** of its branch's
+range instead of scattered across every leaf.
+
+The branch is *in* the key, and that is load-bearing: without it two diverged branches would both write
+sequence `N` — same key, different nodes — and merging them would produce a **conflict on the provenance
+itself**, which is not a question any caller can answer.
+
+### What it bought — measured
+
+Seeding 100,000 records, varying only the number of commits:
+
+| commits | before | after |
+|---:|---:|---:|
+| 1 × 100,000 | 9.4 s | 13.0 s |
+| 10 × 10,000 | **36.9 s** | **11.4 s** |
+| 100 × 1,000 | *(not taken)* | **17.2 s** |
+
+**The claim is the flatness, not the seconds.** Before, ten commits cost **3.9×** what one commit cost —
+the amplification. After, ten commits cost **0.88×** and a hundred commits cost **1.3×**. Cost no longer
+tracks the number of commits, which is what "writes stop rewriting the database" means.
+
+Two other real bugs were fixed on the way, both found by benchmarking rather than by reading:
+- `Tree::is_full()` bincode-serialised the **entire leaf on every insert** — O(leaf) per record, making
+  a leaf fill in O(leaf²). Now tracked incrementally, with one real encode at the fullness boundary.
+- The insert path **deep-cloned every node it descended through** — a heap allocation for *every key in
+  the leaf*, to insert one record. Now moved, not cloned.
+
+**Both oracles were re-run after the layout change** — taint at 10,000 randomized cases, branch at
+4,000 — because the storage keys moved underneath the provenance engine, and agreement with the model is
+something to re-prove, not assume.
+
+### Still true, still not fixed
+
+**The refs file is rewritten in full on every commit.** That is O(branches), not O(1). It does not show
+up against baseline *size* — which is what AT-011 claims — but it will show up on a tenant with a great
+many branches. Not optimised, and not hidden.

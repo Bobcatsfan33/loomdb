@@ -62,7 +62,25 @@ impl NodeId {
         self.0.iter().map(|b| format!("{b:02x}")).collect()
     }
 
-    /// The key this node is stored at.
+    /// The key this node *used* to be stored at, and why it no longer is.
+    ///
+    /// # The write-amplification bug, in one paragraph
+    ///
+    /// A `NodeId` is a content hash, so storing a node **at** its id meant every provenance write went
+    /// to a **uniformly random** point in the keyspace. Once the tree held more leaves than a commit
+    /// held records, a commit's random keys touched *nearly every leaf* — so nearly every leaf was
+    /// dirtied, re-encoded, re-hashed and rewritten. **Each commit rewrote a large fraction of the
+    /// database.** The same 100,000 records cost 36.9 s in ten commits and 9.4 s in one; the only
+    /// variable was the number of commits.
+    ///
+    /// The fix is to notice that **nothing ever looks a node up by id from storage.** `taint()` scans
+    /// the provenance range and builds the `id → node` map in memory; the source index answers "who
+    /// cites this source". So the id never needed to be the *storage key* — it only needs to be the
+    /// *identity*, and it still is, inside the node.
+    ///
+    /// Nodes now live at [`node_storage_key`]: an **append-ordered** `(branch, sequence)`. A batch of
+    /// writes lands at the tail of the tree instead of all over it.
+    #[deprecated(note = "use node_storage_key: content-addressed keys rewrite the whole tree")]
     pub fn key(&self) -> Key {
         let mut key = PROV_PREFIX.to_vec();
         key.extend_from_slice(self.to_hex().as_bytes());
@@ -198,13 +216,57 @@ impl DerivationNode {
 /// The index answers "which derivation nodes cite this source" without scanning the DAG. Without it,
 /// `taint()` would have to read every node in every branch just to find where to start, and a taint
 /// that is too slow to run is a taint nobody runs.
-pub fn source_index_key(source: &SourceRef, node: NodeId) -> Key {
+pub fn source_index_key(source: &SourceRef, branch: &str, seq: u64) -> Key {
     let mut key = SRC_PREFIX.to_vec();
     key.extend_from_slice(source.to_string().as_bytes());
     key.push(b'/');
-    key.extend_from_slice(node.to_hex().as_bytes());
+    key.extend_from_slice(&branch_seq(branch, seq));
     key
 }
+
+/// `<u16 branch length><branch><u64 sequence, big-endian>`.
+///
+/// **Big-endian on purpose.** These keys are compared as bytes, so the sequence must sort numerically
+/// when it sorts lexicographically, or "append-ordered" is a lie and appends scatter again.
+///
+/// The branch is length-prefixed rather than delimited so that no branch name — whatever characters it
+/// contains — can be confused with another one's sequence bytes.
+fn branch_seq(branch: &str, seq: u64) -> Vec<u8> {
+    let mut out = Vec::with_capacity(2 + branch.len() + 8);
+    out.extend_from_slice(&(branch.len() as u16).to_be_bytes());
+    out.extend_from_slice(branch.as_bytes());
+    out.extend_from_slice(&seq.to_be_bytes());
+    out
+}
+
+/// **Where a derivation node is stored: append-ordered, not content-addressed.**
+///
+/// Keyed by `(branch, sequence)`, so a commit's provenance lands at the **tail** of its branch's range
+/// rather than scattered across every leaf in the tree. See [`NodeId::key`] for the bug this fixes.
+///
+/// The branch is part of the key, and that is load-bearing: without it, two branches that diverged
+/// would both write sequence `N` — different nodes, same key — and merging them would produce a
+/// **conflict on the provenance itself**. With it, each branch appends into its own range and a merge
+/// simply carries the source's range across.
+pub fn node_storage_key(branch: &str, seq: u64) -> Key {
+    let mut key = PROV_PREFIX.to_vec();
+    key.extend_from_slice(&branch_seq(branch, seq));
+    key
+}
+
+/// The reserved key holding a branch's next provenance sequence number.
+///
+/// Reserved, so it is hidden from `scan` and **excluded from merge** — it is mutable per-branch
+/// bookkeeping, not history. A fork inherits its parent's counter, which is harmless: the branch name
+/// is in the node key, so two branches at the same sequence number cannot collide.
+pub fn prov_seq_key(branch: &str) -> Key {
+    let mut key = RESERVED_PROV_SEQ_PREFIX.to_vec();
+    key.extend_from_slice(branch.as_bytes());
+    key
+}
+
+/// See [`prov_seq_key`].
+pub const RESERVED_PROV_SEQ_PREFIX: &[u8] = b"\x00loom/provseq/";
 
 /// The prefix that matches every index entry for one source.
 pub fn source_index_prefix(source: &SourceRef) -> Key {
@@ -214,17 +276,12 @@ pub fn source_index_prefix(source: &SourceRef) -> Key {
     key
 }
 
-/// Pull the node id back out of an index key.
-pub fn node_from_index_key(key: &[u8]) -> Option<NodeId> {
-    let hex = key.rsplit(|b| *b == b'/').next()?;
-    let hex = std::str::from_utf8(hex).ok()?;
-    if hex.len() != 64 {
-        return None;
-    }
-    let mut bytes = [0u8; 32];
-    for (i, slot) in bytes.iter_mut().enumerate() {
-        *slot = u8::from_str_radix(hex.get(i * 2..i * 2 + 2)?, 16).ok()?;
-    }
+/// Pull the node id back out of a source-index **value**.
+///
+/// It used to come out of the *key* — which is precisely what forced the key to contain a content
+/// hash, and therefore to be random. The id now rides in the value, and the key is free to be ordered.
+pub fn node_from_index_value(value: &[u8]) -> Option<NodeId> {
+    let bytes: [u8; 32] = value.try_into().ok()?;
     Some(NodeId(bytes))
 }
 
@@ -334,26 +391,67 @@ mod tests {
 
     #[test]
     fn provenance_keys_are_recognised_and_hidden() {
-        let n = node(b"claim/x", vec![], vec![]);
-        assert!(is_provenance(&n.id.key()));
+        assert!(is_provenance(&node_storage_key("main", 0)));
         assert!(is_provenance(&source_index_key(
             &SourceRef::new("web", "p"),
-            n.id
+            "main",
+            0
         )));
         assert!(!is_provenance(b"claim/x"), "user data must not be hidden");
     }
 
     #[test]
-    fn a_source_index_key_round_trips_to_its_node() {
+    fn a_source_index_entry_leads_back_to_its_node() {
         let n = node(b"claim/x", vec![], vec![]);
         let source = SourceRef::new("idp", "signin-847223");
-        let key = source_index_key(&source, n.id);
+        let key = source_index_key(&source, "main", 7);
 
-        assert!(key.starts_with(&source_index_prefix(&source)));
-        assert_eq!(
-            node_from_index_key(&key),
-            Some(n.id),
-            "the index must lead back to the node, or taint has nowhere to start"
+        assert!(
+            key.starts_with(&source_index_prefix(&source)),
+            "the index must still be scannable by source, or taint has nowhere to start"
         );
+        assert_eq!(
+            node_from_index_value(n.id.as_bytes()),
+            Some(n.id),
+            "the index must lead back to the node — now through the VALUE, not the key"
+        );
+    }
+
+    /// **Append-ordered keys must actually sort in append order.**
+    ///
+    /// They are compared as bytes. If the sequence number were little-endian, key 256 would sort
+    /// before key 1, appends would scatter across the tree, and the whole point of the change — that a
+    /// commit's provenance lands at the *tail* rather than everywhere — would be quietly lost. Nothing
+    /// would fail; writes would just go on rewriting the database.
+    #[test]
+    fn node_storage_keys_sort_in_sequence_order() {
+        let mut keys: Vec<Key> = (0u64..300).map(|i| node_storage_key("main", i)).collect();
+        let expected = keys.clone();
+
+        keys.sort();
+
+        assert_eq!(
+            keys, expected,
+            "storage keys do not sort in sequence order, so provenance writes are NOT appends"
+        );
+    }
+
+    /// Two branches at the same sequence number must not collide.
+    ///
+    /// Without the branch in the key, two branches that diverged would both write sequence `N` — the
+    /// same key, different nodes — and merging them would produce a conflict *on the provenance
+    /// itself*, which is not a question any caller can answer.
+    #[test]
+    fn two_branches_at_the_same_sequence_do_not_collide() {
+        assert_ne!(
+            node_storage_key("hypothesis-a", 4),
+            node_storage_key("hypothesis-b", 4)
+        );
+    }
+
+    /// A branch name cannot be confused with another branch's sequence bytes.
+    #[test]
+    fn a_branch_name_cannot_be_confused_with_a_sequence() {
+        assert_ne!(node_storage_key("ab", 1), node_storage_key("a", 1));
     }
 }
