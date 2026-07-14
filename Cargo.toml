@@ -1,0 +1,46 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/loom-core",
+    "crates/loom-branch",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.82"
+license = "Apache-2.0"
+repository = "https://github.com/Bobcatsfan33/loomdb"
+homepage = "https://github.com/Bobcatsfan33/loomdb"
+
+[workspace.dependencies]
+# --- the engine ---
+#
+# Pinned to a TAG, not a branch. Substrate's API is frozen at v1.0 and semver applies
+# (substrate/docs/substrate-api.md); a floating dependency on a storage engine is a way to
+# discover a format change in production.
+substrate-pager = { git = "https://github.com/Bobcatsfan33/substrate", tag = "substrate-v1.1" }
+substrate-wal = { git = "https://github.com/Bobcatsfan33/substrate", tag = "substrate-v1.1" }
+substrate-store = { git = "https://github.com/Bobcatsfan33/substrate", tag = "substrate-v1.1" }
+substrate-security = { git = "https://github.com/Bobcatsfan33/substrate", tag = "substrate-v1.1" }
+
+# --- internal ---
+loom-core = { path = "crates/loom-core", version = "0.1.0" }
+loom-branch = { path = "crates/loom-branch", version = "0.1.0" }
+
+# --- deps ---
+thiserror = "2.0"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+bincode = "1.3"
+blake3 = "1.5"
+ed25519-dalek = { version = "2", features = ["rand_core"] }
+proptest = "1.5"
+tempfile = "3"
+
+[profile.release]
+debug = true
+overflow-checks = true
+
+[profile.test]
+overflow-checks = true

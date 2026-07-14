@@ -1,0 +1,23 @@
+[package]
+name = "loom-branch"
+description = "Sessions-as-branches, capability tokens, and record-level merge for LoomDB."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+loom-core.workspace = true
+substrate-pager.workspace = true
+substrate-security.workspace = true
+thiserror.workspace = true
+serde.workspace = true
+bincode.workspace = true
+blake3.workspace = true
+getrandom = "0.2"
+ed25519-dalek.workspace = true
+
+[dev-dependencies]
+proptest.workspace = true
+tempfile.workspace = true

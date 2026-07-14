@@ -1,0 +1,16 @@
+[package]
+name = "loom-core"
+description = "Shared types for LoomDB: observations, claims, bitemporal time, and identifiers."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+substrate-pager.workspace = true
+thiserror.workspace = true
+serde.workspace = true
+bincode.workspace = true
+blake3.workspace = true
+getrandom = "0.2"
