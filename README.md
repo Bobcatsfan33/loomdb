@@ -67,7 +67,9 @@ This was written fast, largely by an AI. That should worry you. Enthusiasm is no
 
 ## Status
 
-**L1 complete** — sessions-as-branches, capability tokens, the record-level merge engine, and the B+tree record store. 59 tests, clippy clean.
+**L1 complete** — sessions-as-branches, capability tokens, the record-level merge engine, and the B+tree record store. 59 tests, clippy clean, model oracle green over 24,000 randomized sessions.
+
+**Known gap, stated plainly:** branch refs and the commit DAG are held in memory. The *data* is durable — every commit is a crash-safe substrate manifest — but a restart loses your branch *names*. Persisting them is a prerequisite for L2. Written down here rather than discovered later.
 
 Next: **L2** provenance and taint-and-recall · **L3** memory and retrieval · **L3.5** the action gateway and influence policy · **L4** the MCP server.
 

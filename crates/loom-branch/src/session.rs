@@ -13,17 +13,58 @@
 //! Enforced *here*, at the entry point — not as middleware, not as a decorator someone can forget.
 //! A bypassable audit trail is worse than none, because it is believed.
 
-use crate::merge::{
-    is_reserved, merged_from_key, merged_from_prefix, plan_merge, MergeOutcome, MergePolicy,
-};
+use crate::merge::{is_reserved, merged_from_key, plan_merge, MergeOutcome, MergePolicy};
 use crate::token::{CapabilityToken, TokenIssuer};
 use crate::tree::Tree;
 use loom_core::{
     BranchId, CommitId, Key, LoomError, Record, Result, SessionId, TenantId, Value, WriteEnvelope,
 };
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::sync::{Arc, Mutex};
-use substrate_pager::{BranchTree, ManifestId, PageStore, Pager, StoreConfig};
+use substrate_pager::{BranchTree, Clock, ManifestId, PageStore, Pager, StoreConfig};
+
+/// A commit clock that never hands out the same instant twice.
+///
+/// # Why this is not a detail
+///
+/// substrate's manifests are **content-addressed**: a manifest's id is the hash of its contents,
+/// which includes its parent and its timestamp. So two different branches that happen to reach the
+/// *same state* from the *same parent* within the *same millisecond* produce **the same commit id** —
+/// and the engine, quite correctly by its own rules, treats them as the same commit.
+///
+/// For a storage engine that is elegant. For an **audit database** it is unacceptable: two agents
+/// independently arriving at the same conclusion is two events, by two actors, and collapsing them
+/// into one commit destroys exactly the history this database exists to preserve. It also corrupts
+/// merge-base computation, because the commit DAG acquires edges that never happened.
+///
+/// The model oracle caught this the hard way: it passed locally and failed in CI, because whether
+/// two commits collided depended on how fast the machine was. A test whose result depends on the
+/// clock is a test that will eventually lie to you.
+///
+/// So every commit gets a distinct, monotonically increasing instant. Distinct events, distinct
+/// commits — always, regardless of how fast the machine is.
+#[derive(Debug)]
+struct CommitClock {
+    next: std::sync::atomic::AtomicU64,
+}
+
+impl CommitClock {
+    fn new() -> Self {
+        let start = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis() as u64)
+            .unwrap_or(0);
+        CommitClock {
+            next: std::sync::atomic::AtomicU64::new(start),
+        }
+    }
+}
+
+impl Clock for CommitClock {
+    fn now_ms(&self) -> u64 {
+        self.next.fetch_add(1, std::sync::atomic::Ordering::SeqCst)
+    }
+}
 
 /// How long a session's capability lasts, by default.
 pub const DEFAULT_SESSION_TTL_MS: u64 = 8 * 3_600_000; // 8 hours
@@ -47,9 +88,43 @@ pub struct SessionHandle {
 /// One tenant per store, and the tenant is the substrate *pool* — so two tenants never share a page,
 /// even when their bytes are identical (substrate docs/02 §9.1). That is not a check we perform; it
 /// is a property of where the bytes are written.
+///
+/// # What L1 does not persist yet, said plainly
+///
+/// **Branch refs and the commit DAG live in memory.** The *data* is durable — every commit is a
+/// substrate manifest, fsync'd, crash-safe, and every merge writes its bookkeeping into the tree. But
+/// the map from branch name to head, and the multi-parent merge edges, are rebuilt only for the life
+/// of the process.
+///
+/// So: **a restart loses your branch names.** The commits are all still there and still readable by
+/// id; nothing is corrupted and nothing is lost. But you cannot yet ask "where is branch h2" after a
+/// restart.
+///
+/// This is a real gap and it is written down here rather than discovered later. Persisting both — the
+/// refs, and the DAG (which can be rebuilt from the `merged-from` records already in each tree) — is
+/// a prerequisite for L2, because the provenance layer needs to walk history across restarts.
 pub struct Loom {
     pager: Arc<Pager>,
     branches: Mutex<BranchTree>,
+    /// **The commit DAG, with real multi-parent merge edges.**
+    ///
+    /// substrate's manifests have exactly one parent. Git's merge commits have two, and that is not
+    /// a stylistic difference — it is what makes a merge base correct the *second* time you merge.
+    ///
+    /// Without a second parent, asking the DAG for the merge base of two branches that have already
+    /// merged returns the **original fork point**, as though the merge never happened, and the merge
+    /// re-applies work the target already has. For a counter that is not a crash: a `+3` silently
+    /// becomes a `+6`, and the merge reports success.
+    ///
+    /// An earlier version tried to *reconstruct* the second parent from bookkeeping records in the
+    /// tree. It was clever, it was subtly wrong in ways that took three attempts to chase, and the
+    /// model oracle rejected every one of them. The lesson is the one CLAUDE.md rule 10 already
+    /// stated: **when there is a clever way and an obvious way, take the obvious one.** So we record
+    /// the parents. Both of them. At commit time.
+    ///
+    /// (In-memory for L1, alongside the branch refs. Persisting both is a prerequisite for L2 —
+    /// see the note in `docs/loom-format.md`.)
+    commits: Mutex<BTreeMap<CommitId, Vec<CommitId>>>,
     issuer: TokenIssuer,
     tenant: TenantId,
     now_ms: Box<dyn Fn() -> u64 + Send + Sync>,
@@ -66,10 +141,13 @@ impl std::fmt::Debug for Loom {
 impl Loom {
     /// Open an in-memory database for a tenant.
     pub fn in_memory(tenant: TenantId) -> Result<Self> {
-        let pager = Pager::in_memory(StoreConfig {
-            pool: tenant.as_str().to_string(),
-            ..Default::default()
-        })?;
+        let pager = Pager::in_memory_with_clock(
+            StoreConfig {
+                pool: tenant.as_str().to_string(),
+                ..Default::default()
+            },
+            Arc::new(CommitClock::new()),
+        )?;
         Loom::from_pager(Arc::new(pager), tenant)
     }
 
@@ -90,6 +168,7 @@ impl Loom {
         Ok(Loom {
             pager,
             branches: Mutex::new(BranchTree::rooted(MAIN, root)),
+            commits: Mutex::new(BTreeMap::new()),
             issuer: TokenIssuer::generate(),
             tenant,
             now_ms: Box::new(|| {
@@ -113,6 +192,21 @@ impl Loom {
 
     fn branches(&self) -> std::sync::MutexGuard<'_, BranchTree> {
         self.branches.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    fn commits(&self) -> std::sync::MutexGuard<'_, BTreeMap<CommitId, Vec<CommitId>>> {
+        self.commits.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// Record a commit's parents. A merge has two; everything else has one.
+    fn record_commit(&self, commit: CommitId, parents: Vec<CommitId>) {
+        // A no-op commit returns its own base — substrate refuses to append a duplicate manifest to
+        // history. Recording it as its own parent would make the ancestry walk loop forever.
+        let parents: Vec<CommitId> = parents.into_iter().filter(|p| *p != commit).collect();
+        if parents.is_empty() {
+            return;
+        }
+        self.commits().entry(commit).or_insert(parents);
     }
 
     /// Where a branch currently points.
@@ -216,7 +310,30 @@ impl Loom {
         tree.flush(&mut txn)?;
         let commit = store.commit(txn)?;
 
+        self.record_commit(commit, vec![head]);
         self.branches().set_head(branch.as_str(), commit)?;
+        Ok(commit)
+    }
+
+    /// Like `write_many`, but records a **second parent** — the merge edge.
+    fn write_merge(
+        &self,
+        token: &CapabilityToken,
+        branch: &BranchId,
+        records: Vec<(Key, Record)>,
+        envelope: &WriteEnvelope,
+        second_parent: CommitId,
+    ) -> Result<CommitId> {
+        let before = self.head(branch)?;
+        let commit = self.write_many(token, branch, records, envelope)?;
+
+        // THE SECOND PARENT. This is the whole reason merges are correct on the second pass.
+        self.record_commit(commit, vec![before, second_parent]);
+        if let Some(parents) = self.commits().get_mut(&commit) {
+            if !parents.contains(&second_parent) {
+                parents.push(second_parent);
+            }
+        }
         Ok(commit)
     }
 
@@ -351,7 +468,7 @@ impl Loom {
                     Record::Value(Value::Blob(source_head.as_bytes().to_vec())),
                 ));
 
-                let commit = self.write_many(token, target, writes, envelope)?;
+                let commit = self.write_merge(token, target, writes, envelope, source_head)?;
                 Ok(MergeResult::Merged {
                     commit,
                     records,
@@ -430,8 +547,7 @@ impl Loom {
         Ok(lowest)
     }
 
-    /// Every commit in a commit's history — following **both** the DAG's parent edge and the merge
-    /// edges the commit recorded in its own tree.
+    /// Every commit in a commit's history, over the **recorded multi-parent DAG**.
     fn full_ancestors(&self, head: &CommitId) -> Result<BTreeSet<CommitId>> {
         let mut seen: BTreeSet<CommitId> = BTreeSet::new();
         let mut stack = vec![*head];
@@ -441,45 +557,22 @@ impl Loom {
                 continue;
             }
 
-            // The DAG edge.
+            // The parents we recorded — including a merge's second parent, which substrate cannot
+            // store and which is the entire point of keeping this DAG.
+            if let Some(parents) = self.commits().get(&commit) {
+                stack.extend(parents.iter().copied());
+                continue;
+            }
+
+            // A commit we did not record (the root, or one made before this process started). Fall
+            // back to substrate's single parent edge.
             if let Ok(manifest) = self.pager.manifest(&commit) {
                 if let Some(parent) = manifest.parent {
                     stack.push(parent);
                 }
             }
-
-            // The merge edges — the second parents substrate cannot store.
-            for absorbed in self.absorbed_commits(&commit)? {
-                stack.push(absorbed);
-            }
         }
         Ok(seen)
-    }
-
-    /// Every commit this commit's tree records having absorbed from another branch.
-    fn absorbed_commits(&self, head: &CommitId) -> Result<Vec<CommitId>> {
-        let store = self.pager.fork(head)?;
-        let mut tree = Tree::open(&*store)?;
-
-        let prefix = merged_from_prefix();
-        let mut out = Vec::new();
-
-        for (key, record) in tree.scan()? {
-            if !key.starts_with(&prefix) {
-                continue;
-            }
-            let Record::Value(Value::Blob(bytes)) = record else {
-                continue;
-            };
-            let Ok(bytes) = <[u8; 32]>::try_from(bytes.as_slice()) else {
-                return Err(LoomError::CorruptNode {
-                    page: 0,
-                    detail: "merge bookkeeping record is not a 32-byte commit id".to_string(),
-                });
-            };
-            out.push(CommitId::from_bytes(bytes));
-        }
-        Ok(out)
     }
 
     /// **Rewind.** O(1) — a pointer move.
@@ -511,6 +604,13 @@ impl Loom {
     #[doc(hidden)]
     pub fn pager_for_debug(&self) -> &Arc<Pager> {
         &self.pager
+    }
+
+    /// How many merge bases two branches have. Diagnostics and the oracle.
+    #[doc(hidden)]
+    pub fn merge_base_count(&self, a: &BranchId, b: &BranchId) -> Result<usize> {
+        let (ah, bh) = (self.head(a)?, self.head(b)?);
+        Ok(self.merge_bases(&ah, &bh)?.len())
     }
 
     /// The tenant this database belongs to.

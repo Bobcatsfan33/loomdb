@@ -87,6 +87,21 @@ the two-parent ancestry substrate cannot store.
 
 The model oracle found this. It also found the two half-fixes that came before the real one.
 
+## What L1 does not persist yet
+
+**Branch refs and the commit DAG are in memory.**
+
+The *data* is durable: every commit is a substrate manifest, fsync'd and crash-safe, and every merge
+writes its `merged-from` bookkeeping into the tree. But the map from branch name to head, and the
+multi-parent merge edges, are rebuilt only for the life of the process.
+
+**A restart loses your branch names.** Every commit is still there and still readable by id; nothing
+is corrupted and nothing is lost. But you cannot yet ask *"where is branch h2"* after a restart.
+
+Persisting both is a prerequisite for L2 — the provenance layer has to walk history across restarts —
+and the DAG can be rebuilt from the `merged-from` records that are already in every tree. Written down
+here rather than discovered later.
+
 ## What is deliberately missing
 
 **Deletes do not free logical pages.** A removed key leaves its leaf; an emptied leaf is left empty

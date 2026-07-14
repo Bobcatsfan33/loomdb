@@ -84,6 +84,14 @@ impl Model {
             return;
         };
         let mut state = self.head_state(branch);
+
+        // A write that changes nothing produces NO COMMIT. The engine does the same (an idempotent
+        // retry must not grow history forever), and if the model invents a commit the engine did
+        // not, the two DAGs have different shapes and every merge base after it is suspect.
+        if state.get(&key) == Some(&record) {
+            return;
+        }
+
         state.insert(key, record);
         self.commit(branch, vec![head], state);
     }
@@ -126,6 +134,17 @@ impl Model {
             .collect()
     }
 
+    /// The engine records, in the target's own tree, the last commit it absorbed from each source.
+    /// The model carries the same record in its state — not for fidelity's own sake, but because it
+    /// is what makes "this merge changes nothing" mean the same thing in both. Without it the model
+    /// invents a merge commit the engine never made, the two DAGs drift apart, and every merge base
+    /// computed after that point is suspect.
+    fn merged_from_key(source: &str) -> Key {
+        let mut key = b"\x00loom/merged-from/".to_vec();
+        key.extend_from_slice(source.as_bytes());
+        key
+    }
+
     fn merge(&mut self, source: &str, target: &str) -> bool {
         let (Some(sh), Some(th)) = (
             self.heads.get(source).copied(),
@@ -147,8 +166,12 @@ impl Model {
         let t = self.head_state(target);
 
         let mut merged = t.clone();
-        let keys: std::collections::BTreeSet<&Key> =
-            base.keys().chain(s.keys()).chain(t.keys()).collect();
+        let keys: std::collections::BTreeSet<&Key> = base
+            .keys()
+            .chain(s.keys())
+            .chain(t.keys())
+            .filter(|k| !k.starts_with(b"\x00loom/"))
+            .collect();
 
         for key in keys {
             let (b, sv, tv) = (base.get(key), s.get(key), t.get(key));
@@ -190,6 +213,19 @@ impl Model {
                 }
                 _ => return false,
             }
+        }
+
+        // Record what we absorbed, exactly as the engine does.
+        merged.insert(
+            Self::merged_from_key(source),
+            Record::Value(Value::Blob(sh.to_le_bytes().to_vec())),
+        );
+
+        // If nothing changed — not the records, not even the bookkeeping — then there is no commit.
+        // substrate refuses to append a duplicate manifest to history, so the engine makes no commit
+        // either, and a model that invents one would give the DAG an edge that does not exist.
+        if merged == t {
+            return true;
         }
 
         // A MERGE COMMIT: two parents. This is the whole point of the model.
@@ -303,6 +339,21 @@ proptest! {
                         .merge(&token, &src, &tgt, &MergePolicy::Conflict, &envelope(&tgt))
                         .map_err(|e| TestCaseError::fail(format!("step {step}: merge: {e}")))?;
 
+                    let engine_bases = db
+                        .merge_base_count(&src, &tgt)
+                        .map_err(|e| TestCaseError::fail(e.to_string()))?;
+                    let model_bases = {
+                        let (sh, th) = (model.heads[&src_name], model.heads[&tgt_name]);
+                        model.merge_bases(sh, th).len()
+                    };
+                    prop_assert_eq!(
+                        engine_bases,
+                        model_bases,
+                        "step {}: engine sees {} merge base(s) between {:?} and {:?}, model sees {}. \
+                         The engine's reconstruction of two-parent ancestry is missing an edge.",
+                        step, engine_bases, src_name, tgt_name, model_bases
+                    );
+
                     let model_merged = model.merge(&src_name, &tgt_name);
 
                     // The engine and the model must agree about WHETHER it merged, not only about
@@ -331,7 +382,11 @@ proptest! {
                     .into_iter()
                     .collect();
 
-                let expected = model.head(&model_names[idx]);
+                let expected: BTreeMap<Key, Record> = model
+                    .head(&model_names[idx])
+                    .into_iter()
+                    .filter(|(k, _)| !k.starts_with(b"\x00loom/"))
+                    .collect();
 
                 prop_assert_eq!(
                     &engine,
