@@ -11,12 +11,17 @@ repository.workspace = true
 loom-core.workspace = true
 substrate-pager.workspace = true
 substrate-security.workspace = true
+substrate-store.workspace = true
 thiserror.workspace = true
 serde.workspace = true
 bincode.workspace = true
+serde_json.workspace = true
 blake3.workspace = true
 getrandom = "0.2"
 ed25519-dalek.workspace = true
+
+tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
+object_store = "0.11"
 
 [dev-dependencies]
 proptest.workspace = true

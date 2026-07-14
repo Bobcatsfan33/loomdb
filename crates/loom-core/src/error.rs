@@ -60,6 +60,16 @@ pub enum LoomError {
         actual: &'static str,
     },
 
+    /// A branch name is already taken.
+    #[error(
+        "branch {name:?} already exists. Moving it would discard whatever it points at; \
+         pick another name, or rewind the existing branch on purpose."
+    )]
+    BranchExists {
+        /// The name.
+        name: String,
+    },
+
     /// A page's bytes are not a valid node.
     #[error("corrupt node at logical page {page}: {detail}")]
     CorruptNode {

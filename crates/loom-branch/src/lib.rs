@@ -30,7 +30,9 @@
 #![cfg_attr(test, allow(clippy::unwrap_used, clippy::expect_used, clippy::panic))]
 
 pub mod merge;
+pub mod refs;
 pub mod session;
+pub mod sleep;
 pub mod token;
 pub mod tree;
 
@@ -38,6 +40,8 @@ pub use merge::{
     is_reserved, plan_merge, MergeConflict, MergeConflictReport, MergeOutcome, MergePolicy,
     Resolution, RESERVED_PREFIX,
 };
+pub use refs::{FileRefStore, MemRefStore, RefStore, Refs, REFS_FORMAT_VERSION};
 pub use session::{Loom, MergeResult, SessionHandle, DEFAULT_SESSION_TTL_MS, MAIN};
+pub use sleep::LoomWakeToken;
 pub use token::{CapabilityToken, TokenClaims, TokenIssuer};
 pub use tree::{Meta, Node, Tree, FORMAT_VERSION, META_PAGE};

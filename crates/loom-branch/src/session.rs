@@ -14,14 +14,16 @@
 //! A bypassable audit trail is worse than none, because it is believed.
 
 use crate::merge::{is_reserved, merged_from_key, plan_merge, MergeOutcome, MergePolicy};
+use crate::refs::{FileRefStore, MemRefStore, RefStore, Refs};
+use crate::sleep::LoomWakeToken;
 use crate::token::{CapabilityToken, TokenIssuer};
 use crate::tree::Tree;
 use loom_core::{
     BranchId, CommitId, Key, LoomError, Record, Result, SessionId, TenantId, Value, WriteEnvelope,
 };
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeSet;
 use std::sync::{Arc, Mutex};
-use substrate_pager::{BranchTree, Clock, ManifestId, PageStore, Pager, StoreConfig};
+use substrate_pager::{Clock, PageStore, Pager, StoreConfig};
 
 /// A commit clock that never hands out the same instant twice.
 ///
@@ -105,26 +107,16 @@ pub struct SessionHandle {
 /// a prerequisite for L2, because the provenance layer needs to walk history across restarts.
 pub struct Loom {
     pager: Arc<Pager>,
-    branches: Mutex<BranchTree>,
-    /// **The commit DAG, with real multi-parent merge edges.**
+    /// **Everything that must survive a restart, other than the data.**
     ///
-    /// substrate's manifests have exactly one parent. Git's merge commits have two, and that is not
-    /// a stylistic difference — it is what makes a merge base correct the *second* time you merge.
+    /// Branch heads, tags, and the commit DAG — including the *second parent* of every merge, which
+    /// substrate's single-parent manifests cannot store and which, if lost, silently restores the
+    /// double-counting merge bug the model oracle caught.
     ///
-    /// Without a second parent, asking the DAG for the merge base of two branches that have already
-    /// merged returns the **original fork point**, as though the merge never happened, and the merge
-    /// re-applies work the target already has. For a counter that is not a crash: a `+3` silently
-    /// becomes a `+6`, and the merge reports success.
-    ///
-    /// An earlier version tried to *reconstruct* the second parent from bookkeeping records in the
-    /// tree. It was clever, it was subtly wrong in ways that took three attempts to chase, and the
-    /// model oracle rejected every one of them. The lesson is the one CLAUDE.md rule 10 already
-    /// stated: **when there is a clever way and an obvious way, take the obvious one.** So we record
-    /// the parents. Both of them. At commit time.
-    ///
-    /// (In-memory for L1, alongside the branch refs. Persisting both is a prerequisite for L2 —
-    /// see the note in `docs/loom-format.md`.)
-    commits: Mutex<BTreeMap<CommitId, Vec<CommitId>>>,
+    /// Held in memory and written through to [`RefStore`] on every mutation. The ordering is not
+    /// negotiable: the manifest is durable **before** the ref that points at it (see `refs.rs`).
+    refs: Mutex<Refs>,
+    store: Arc<dyn RefStore>,
     issuer: TokenIssuer,
     tenant: TenantId,
     now_ms: Box<dyn Fn() -> u64 + Send + Sync>,
@@ -139,7 +131,7 @@ impl std::fmt::Debug for Loom {
 }
 
 impl Loom {
-    /// Open an in-memory database for a tenant.
+    /// Open an **in-memory** database. Nothing survives the process; for tests and ephemeral work.
     pub fn in_memory(tenant: TenantId) -> Result<Self> {
         let pager = Pager::in_memory_with_clock(
             StoreConfig {
@@ -148,27 +140,52 @@ impl Loom {
             },
             Arc::new(CommitClock::new()),
         )?;
-        Loom::from_pager(Arc::new(pager), tenant)
+        Loom::assemble(Arc::new(pager), Arc::new(MemRefStore::new()), tenant)
     }
 
-    /// Open a database on disk.
+    /// Open a **durable** database on disk.
+    ///
+    /// If it already exists, its branches, tags, and commit DAG are loaded — so *"where is branch
+    /// h2"* has an answer after a restart, which is the whole point of this constructor existing.
     pub fn open(path: impl AsRef<std::path::Path>, tenant: TenantId) -> Result<Self> {
-        let pager = Pager::open(
+        let path = path.as_ref();
+        let pager = Pager::open_with(
+            substrate_pager::std_vfs(),
             path,
             StoreConfig {
                 pool: tenant.as_str().to_string(),
                 ..Default::default()
             },
+            Arc::new(CommitClock::new()),
         )?;
-        Loom::from_pager(Arc::new(pager), tenant)
+        let refs = FileRefStore::open(path)?;
+        Loom::assemble(Arc::new(pager), Arc::new(refs), tenant)
     }
 
-    fn from_pager(pager: Arc<Pager>, tenant: TenantId) -> Result<Self> {
-        let root = pager.head();
+    /// Build a database over a caller-supplied pager and ref store.
+    ///
+    /// This is the seam a tiered (object-storage) LoomDB reaches through, and the seam the
+    /// kill-and-restart tests use to cut the power mid-write.
+    pub fn on(pager: Arc<Pager>, store: Arc<dyn RefStore>, tenant: TenantId) -> Result<Self> {
+        Loom::assemble(pager, store, tenant)
+    }
+
+    fn assemble(pager: Arc<Pager>, store: Arc<dyn RefStore>, tenant: TenantId) -> Result<Self> {
+        // Load what was there. A brand-new database gets a `main` at the root manifest.
+        let refs = match store.load()? {
+            Some(refs) => refs,
+            None => {
+                let root = pager.root_manifest()?;
+                let refs = Refs::rooted(MAIN, root);
+                store.save(&refs)?;
+                refs
+            }
+        };
+
         Ok(Loom {
             pager,
-            branches: Mutex::new(BranchTree::rooted(MAIN, root)),
-            commits: Mutex::new(BTreeMap::new()),
+            refs: Mutex::new(refs),
+            store,
             issuer: TokenIssuer::generate(),
             tenant,
             now_ms: Box::new(|| {
@@ -190,12 +207,19 @@ impl Loom {
         (self.now_ms)()
     }
 
-    fn branches(&self) -> std::sync::MutexGuard<'_, BranchTree> {
-        self.branches.lock().unwrap_or_else(|e| e.into_inner())
+    fn refs(&self) -> std::sync::MutexGuard<'_, Refs> {
+        self.refs.lock().unwrap_or_else(|e| e.into_inner())
     }
 
-    fn commits(&self) -> std::sync::MutexGuard<'_, BTreeMap<CommitId, Vec<CommitId>>> {
-        self.commits.lock().unwrap_or_else(|e| e.into_inner())
+    /// Persist the refs. **Called after the manifest is already durable, never before.**
+    ///
+    /// A crash between the two leaves the refs pointing at the old head and the new manifest
+    /// unreferenced — a lost commit, which GC sweeps. The other ordering would leave a ref pointing
+    /// at a manifest that does not exist, which is a corrupt database. Losing the last transaction
+    /// is recoverable; dangling into the void is not.
+    fn persist(&self) -> Result<()> {
+        let refs = self.refs().clone();
+        self.store.save(&refs)
     }
 
     /// Record a commit's parents. A merge has two; everything else has one.
@@ -206,17 +230,51 @@ impl Loom {
         if parents.is_empty() {
             return;
         }
-        self.commits().entry(commit).or_insert(parents);
+        self.refs().commits.entry(commit).or_insert(parents);
     }
 
     /// Where a branch currently points.
     pub fn head(&self, branch: &BranchId) -> Result<CommitId> {
-        self.branches()
-            .head(branch.as_str())
+        self.refs()
+            .branches
+            .get(branch.as_str())
+            .copied()
             .ok_or_else(|| LoomError::OutOfScope {
                 branch: branch.clone(),
                 scope: "no such branch".to_string(),
             })
+    }
+
+    /// Create a branch and persist it. Refuses to clobber an existing name.
+    ///
+    /// Silently moving an existing branch would discard whatever it pointed at, and `branch("main")`
+    /// on a database that already has a `main` is nearly always a mistake.
+    fn create_branch(&self, name: &str, at: CommitId) -> Result<()> {
+        {
+            let mut refs = self.refs();
+            if refs.branches.contains_key(name) {
+                return Err(LoomError::BranchExists {
+                    name: name.to_string(),
+                });
+            }
+            refs.branches.insert(name.to_string(), at);
+        }
+        self.persist()
+    }
+
+    /// Move a branch and persist it.
+    fn set_head(&self, branch: &BranchId, to: CommitId) -> Result<()> {
+        {
+            let mut refs = self.refs();
+            let Some(slot) = refs.branches.get_mut(branch.as_str()) else {
+                return Err(LoomError::OutOfScope {
+                    branch: branch.clone(),
+                    scope: "no such branch".to_string(),
+                });
+            };
+            *slot = to;
+        }
+        self.persist()
     }
 
     /// **Open a session.** Forks the tenant's `main` — O(1), copies nothing.
@@ -233,7 +291,7 @@ impl Loom {
         let base = self.head(&BranchId::new(MAIN))?;
         let branch = BranchId::new(session.as_str());
 
-        self.branches().branch(branch.as_str(), base)?;
+        self.create_branch(branch.as_str(), base)?;
 
         let scope: BTreeSet<BranchId> = [branch.clone()].into_iter().collect();
         let token =
@@ -250,6 +308,36 @@ impl Loom {
         ))
     }
 
+    /// **Mint a capability for branches that already exist.**
+    ///
+    /// This is how a caller reaches a branch after a restart, or after a session's token expired. The
+    /// branches must exist; you cannot mint authority over something that is not there.
+    ///
+    /// # What this deliberately does not decide
+    ///
+    /// **Who is allowed to ask.** The database can issue a capability; deciding *whether this caller
+    /// should get one* is an authorization question, and authorization over data — read, influence,
+    /// disclosure, action — is `loom-policy`'s job (docs/03 §5), which is L3.5.
+    ///
+    /// Until it exists, this is an unguarded door, and it is one **on purpose and in writing** rather
+    /// than by accident. `loomd` (L4) must not expose it to an agent, and the MCP surface will not.
+    /// A capability system whose issuing endpoint is open to anyone is not a capability system.
+    pub fn issue_capability(
+        &self,
+        session: SessionId,
+        branches: &[BranchId],
+        ttl_ms: u64,
+    ) -> Result<CapabilityToken> {
+        for branch in branches {
+            // Minting authority over a branch that does not exist would hand out a capability that
+            // becomes valid the moment someone creates a branch with that name — a name-squatting
+            // hole, and exactly the kind of thing that looks harmless until it is not.
+            self.head(branch)?;
+        }
+        let scope: BTreeSet<BranchId> = branches.iter().cloned().collect();
+        self.issuer.issue(session, scope, self.now() + ttl_ms)
+    }
+
     /// Branch from a branch the token already covers, and get a **new** token that covers both.
     ///
     /// The old token is not retroactively widened. A capability means exactly what it meant when it
@@ -264,7 +352,7 @@ impl Loom {
 
         let head = self.head(from)?;
         let new_branch = BranchId::new(name);
-        self.branches().branch(new_branch.as_str(), head)?;
+        self.create_branch(new_branch.as_str(), head)?;
 
         let token = self.issuer.extend(token, new_branch.clone())?;
         Ok((new_branch, token))
@@ -311,7 +399,7 @@ impl Loom {
         let commit = store.commit(txn)?;
 
         self.record_commit(commit, vec![head]);
-        self.branches().set_head(branch.as_str(), commit)?;
+        self.set_head(branch, commit)?;
         Ok(commit)
     }
 
@@ -327,13 +415,19 @@ impl Loom {
         let before = self.head(branch)?;
         let commit = self.write_many(token, branch, records, envelope)?;
 
-        // THE SECOND PARENT. This is the whole reason merges are correct on the second pass.
+        // THE SECOND PARENT. This is the whole reason merges are correct on the second pass — and
+        // why it must be durable: losing it across a restart silently restores the double-counting
+        // bug (merge twice, and a +3 becomes a +6, and the merge reports success).
         self.record_commit(commit, vec![before, second_parent]);
-        if let Some(parents) = self.commits().get_mut(&commit) {
-            if !parents.contains(&second_parent) {
-                parents.push(second_parent);
+        {
+            let mut refs = self.refs();
+            if let Some(parents) = refs.commits.get_mut(&commit) {
+                if !parents.contains(&second_parent) {
+                    parents.push(second_parent);
+                }
             }
         }
+        self.persist()?;
         Ok(commit)
     }
 
@@ -559,7 +653,7 @@ impl Loom {
 
             // The parents we recorded — including a merge's second parent, which substrate cannot
             // store and which is the entire point of keeping this DAG.
-            if let Some(parents) = self.commits().get(&commit) {
+            if let Some(parents) = self.refs().commits.get(&commit) {
                 stack.extend(parents.iter().copied());
                 continue;
             }
@@ -587,7 +681,8 @@ impl Loom {
         to: &CommitId,
     ) -> Result<CommitId> {
         self.issuer.authorize(token, branch, self.now())?;
-        let previous = self.branches().set_head(branch.as_str(), *to)?;
+        let previous = self.head(branch)?;
+        self.set_head(branch, *to)?;
         Ok(previous)
     }
 
@@ -596,7 +691,9 @@ impl Loom {
     /// Roots come from the branch tree — every branch and every tag. Handing GC an incomplete set of
     /// roots is how you delete a customer's data, so we never assemble one by hand.
     pub fn gc(&self) -> Result<substrate_pager::GcStats> {
-        let roots: Vec<ManifestId> = self.branches().roots();
+        // Roots come from the refs — every branch AND every tag. Handing GC an incomplete set of
+        // roots is how you delete a customer's data, so we never assemble one by hand.
+        let roots = self.refs().roots();
         Ok(self.pager.gc(&roots)?)
     }
 
@@ -613,6 +710,50 @@ impl Loom {
         Ok(self.merge_bases(&ah, &bh)?.len())
     }
 
+    /// **Sleep the whole tenant** into object storage.
+    ///
+    /// Every branch is a head, and every head's pages *and its full manifest ancestry* must be durable
+    /// before a single local byte is dropped. Putting a tenant to sleep must not quietly discard the
+    /// branches nobody happened to be looking at.
+    ///
+    /// The returned token carries the refs — branch heads, tags, and the commit DAG. A token that
+    /// carried only data would restore the database and lose the branch names, and *"where is branch
+    /// h2"* is exactly the question this has to answer.
+    pub async fn sleep(&self, tiered: &substrate_store::TieredStore) -> Result<LoomWakeToken> {
+        let refs = self.refs().clone();
+
+        // EVERY branch head, not just one. And `ensure_durable` uploads each head's whole manifest
+        // ancestry — the overlay bases it needs to be readable, and the parents that are its history.
+        let heads = refs.roots();
+        tiered
+            .ensure_durable(&heads)
+            .await
+            .map_err(|e| LoomError::CorruptNode {
+                page: 0,
+                detail: format!("cannot make the tenant durable: {e}"),
+            })?;
+
+        // Only now is it safe to throw the local copy away. If anything above failed we drop nothing
+        // and the tenant stays awake — a sleep that loses data is a bug with good marketing.
+        tiered.drop_local().map_err(|e| LoomError::CorruptNode {
+            page: 0,
+            detail: format!("cannot drop local state: {e}"),
+        })?;
+
+        Ok(LoomWakeToken {
+            tenant: self.tenant.clone(),
+            page_size: self.pager.page_size(),
+            refs,
+        })
+    }
+
+    /// **Wake a sleeping tenant.** Branch names and all.
+    pub fn wake(tiered: &substrate_store::TieredStore, token: &LoomWakeToken) -> Result<Self> {
+        let store = Arc::new(MemRefStore::new());
+        store.save(&token.refs)?;
+        Loom::assemble(Arc::clone(tiered.pager()), store, token.tenant.clone())
+    }
+
     /// The tenant this database belongs to.
     pub fn tenant(&self) -> &TenantId {
         &self.tenant
@@ -620,10 +761,7 @@ impl Loom {
 
     /// Every branch that exists.
     pub fn branch_names(&self) -> Vec<String> {
-        self.branches()
-            .branches()
-            .map(|(name, _)| name.to_string())
-            .collect()
+        self.refs().branches.keys().cloned().collect()
     }
 }
 
