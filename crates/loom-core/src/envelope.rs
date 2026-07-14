@@ -13,8 +13,10 @@
 //!
 //! A bypassable audit trail is worse than no audit trail, because it is **believed**.
 
+use crate::error::{LoomError, Result};
 use crate::ids::{ActorId, BranchId, PolicyDecisionId, SessionId};
 use crate::value::SourceRef;
+use ed25519_dalek::{Signature, Signer, SigningKey, Verifier, VerifyingKey};
 use serde::{Deserialize, Serialize};
 
 /// Everything we record about *why* a write happened.
@@ -94,10 +96,90 @@ impl WriteEnvelope {
         self
     }
 
+    /// **The bytes a signature covers.**
+    ///
+    /// # Why this is a separate, canonical encoding and not just `bincode(self)`
+    ///
+    /// A signature is a promise about *what was said*. If the bytes that get signed can vary while the
+    /// meaning stays the same — field order, a serde flag, a version bump — then a signature that
+    /// verified yesterday fails today, and the natural fix is to stop checking it. So the signed bytes
+    /// are pinned here, explicitly, length-prefixed so that no two different envelopes can produce the
+    /// same input (`actor="ab", intent="c"` must not collide with `actor="a", intent="bc"`).
+    ///
+    /// **The signature must not cover itself**, so `signature` is excluded. Everything else that
+    /// changes the *meaning* of the write is in: who, where, why, the chain of authority, and what it
+    /// claims to be derived from. Leaving `intent` out would let an attacker keep a valid signature
+    /// while rewriting the stated purpose of the write, which is precisely the field an auditor reads.
+    pub fn signing_bytes(&self) -> Vec<u8> {
+        fn field(out: &mut Vec<u8>, bytes: &[u8]) {
+            out.extend_from_slice(&(bytes.len() as u64).to_le_bytes());
+            out.extend_from_slice(bytes);
+        }
+
+        let mut out = Vec::new();
+
+        field(&mut out, b"loom-envelope-v1");
+        field(&mut out, self.actor.as_str().as_bytes());
+        field(&mut out, self.session.as_str().as_bytes());
+        field(&mut out, self.branch.as_str().as_bytes());
+        field(&mut out, &self.context_hash);
+        field(&mut out, self.intent.as_bytes());
+
+        out.extend_from_slice(&(self.delegation.len() as u64).to_le_bytes());
+        for actor in &self.delegation {
+            field(&mut out, actor.as_str().as_bytes());
+        }
+
+        out.extend_from_slice(&(self.derived_from.len() as u64).to_le_bytes());
+        for source in &self.derived_from {
+            field(&mut out, source.to_string().as_bytes());
+        }
+
+        out
+    }
+
+    /// Sign this envelope.
+    pub fn signed_by(mut self, key: &SigningKey) -> Self {
+        let sig: Signature = key.sign(&self.signing_bytes());
+        self.signature = sig.to_bytes().to_vec();
+        self
+    }
+
+    /// **Verify that this envelope was signed by the key the actor is registered with.**
+    ///
+    /// The lookup is by the actor the envelope *claims to be*. That is the point: sign as `agent-a`,
+    /// claim to be `agent-b`, and verification is performed against `agent-b`'s key — which will not
+    /// verify. An actor cannot be impersonated by anyone who does not hold its key.
+    pub fn verify(&self, key: &VerifyingKey) -> Result<()> {
+        if self.signature.is_empty() {
+            return Err(LoomError::EnvelopeUnsigned {
+                actor: self.actor.as_str().to_string(),
+            });
+        }
+
+        let bytes: [u8; 64] = self.signature.as_slice().try_into().map_err(|_| {
+            LoomError::EnvelopeSignatureInvalid {
+                actor: self.actor.as_str().to_string(),
+                detail: format!(
+                    "an ed25519 signature is 64 bytes; this one is {}",
+                    self.signature.len()
+                ),
+            }
+        })?;
+
+        key.verify_strict(&self.signing_bytes(), &Signature::from_bytes(&bytes))
+            .map_err(|e| LoomError::EnvelopeSignatureInvalid {
+                actor: self.actor.as_str().to_string(),
+                detail: e.to_string(),
+            })
+    }
+
     /// Whether this envelope is structurally complete.
     ///
     /// Deliberately shallow: it checks that the fields that make a write *attributable* are present.
-    /// It does not check the signature — that is L2's, and it is a different question.
+    /// It does not check the signature — that is `verify`, and it is a different question. A
+    /// structurally complete envelope tells you what the write *claims*; only a signature tells you
+    /// the claim is true.
     pub fn is_valid(&self) -> bool {
         !self.actor.as_str().is_empty()
             && !self.session.as_str().is_empty()

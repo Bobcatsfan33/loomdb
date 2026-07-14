@@ -13,6 +13,43 @@ pub type Result<T> = std::result::Result<T, LoomError>;
 #[derive(Debug, thiserror::Error)]
 #[non_exhaustive]
 pub enum LoomError {
+    /// The envelope carries no signature, and this database requires one.
+    #[error(
+        "the write envelope for actor {actor} is not signed, and this database has an actor \
+         registry, which means every write must be signed. Sign the envelope with that actor's \
+         key before writing: WriteEnvelope::new(..).signed_by(&signing_key)."
+    )]
+    EnvelopeUnsigned {
+        /// The actor the envelope claims.
+        actor: String,
+    },
+
+    /// The signature does not verify against the key the claimed actor is registered with.
+    #[error(
+        "the write envelope claims to be from actor {actor}, but its signature does not verify \
+         against that actor's registered key ({detail}). Either the envelope was altered after it \
+         was signed, or it was signed by a different key than the one {actor} is registered with. \
+         Do not retry this write: re-sign it with the correct key, or register the key you actually \
+         hold under the actor you actually are."
+    )]
+    EnvelopeSignatureInvalid {
+        /// The actor the envelope claims.
+        actor: String,
+        /// What the verifier said.
+        detail: String,
+    },
+
+    /// The envelope claims an actor this database has never heard of.
+    #[error(
+        "no verifying key is registered for actor {actor}, so this write cannot be authenticated. \
+         Register the actor's public key with Loom::with_actor_keys before it writes. An \
+         unregistered actor is refused rather than trusted."
+    )]
+    UnknownActor {
+        /// The actor the envelope claims.
+        actor: String,
+    },
+
     /// The capability token does not cover the branch being touched.
     #[error(
         "branch {branch} is not covered by your capability token (which covers {scope}). \

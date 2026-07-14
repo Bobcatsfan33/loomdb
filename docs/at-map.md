@@ -7,7 +7,10 @@
 > A capability is not done when it works. It is done when the test that would have caught it failing
 > is green. Anything else on this page is not a claim, it is a plan.
 
-Status as of **L1 + persistence + L2 (provenance, taint, staleness) complete**.
+Status as of **L1 + persistence + L2 (provenance, taint, staleness, signatures) complete**.
+
+> The rules that must not be "optimized" away later are in [invariants.md](./invariants.md). Each one
+> is there because breaking it produced a bug that **did not fail loudly**.
 
 ---
 
@@ -31,6 +34,7 @@ Status as of **L1 + persistence + L2 (provenance, taint, staleness) complete**.
 | **AT-023** | Invalidated evidence makes a claim **`Stale`, not gone**. The scalpel, not the sledgehammer: it stays readable and auditable, and stops being action-eligible. | `at_023_invalidated_evidence_makes_a_claim_stale_not_gone` |
 | **AT-024** | `taint()` **proposes and never acts.** It returns a dry run. Nothing is mutated. | `at_024_taint_proposes_and_never_acts` |
 | **AT-025** | A pathological derivation graph is **refused, not chased** — the walk is bounded at depth 64. | `at_025_a_pathological_derivation_graph_is_refused_not_chased` |
+| **AT-026** | **Envelope signatures verify.** An unsigned write is refused; an actor **cannot impersonate another actor** (the key is looked up by the actor the envelope *claims to be*); rewriting `intent` after signing invalidates the write; an **unregistered actor is refused, not trusted**. | `at_026_an_unsigned_write_is_refused_when_the_database_authenticates_writers`, `at_026_an_actor_cannot_impersonate_another_actor`, `at_026_tampering_with_the_intent_breaks_the_signature`, `at_026_an_unregistered_actor_is_refused_rather_than_trusted` |
 
 **AT-019 — token scope is inescapable.** Green **for the surfaces that exist today**: `read`, `write`,
 `scan`, `rewind`, `branch`, and `merge` (both sides — a merge reads the source and writes the target,
@@ -38,10 +42,30 @@ and forgetting the source would let a session merge in a branch it was never all
 be **re-asserted when the MCP server and the CLI land in L4**, because the catalog's wording is "through
 every surface", and two of those surfaces do not exist yet. Tracked, not closed.
 
-**AT-001 — the shape, not the signature.** The envelope's *presence and structural completeness* are
-enforced (actor, session, branch, and intent are all required — a write whose author or purpose is
-unknown is a write nobody can audit). The `signature` field exists and is **empty**. Verifying it is
-**AT-026**, and it is deferred to L2 along with the rest of the provenance engine.
+**AT-001 — the shape. AT-026 — the signature. Both now green, and they are different claims.**
+AT-001 makes a write **attributable**: actor, session, branch and intent are all required, because a
+write whose author or purpose is unknown is a write nobody can audit. That is *what the write claims*.
+AT-026 makes it **authentic** — it checks the claim is true.
+
+**AT-026 — LANDED in L2.** Ed25519. `Loom::with_actor_keys(..)` turns it on, and then **every write
+must be signed** and verifies against the registered key of the actor the envelope claims to be.
+
+Two honest notes on its limits:
+- **It is opt-in.** A database with *no* actor registry does not check signatures at all — envelopes are
+  attributable but not authenticated. That is the right default for a single-process embedded database
+  where the only writer is the process itself, and the **wrong** default the moment two agents can reach
+  the same database. It is documented at the field, not hidden.
+- **Key distribution is not solved here.** LoomDB verifies against keys you hand it. Where those keys
+  come from, how they rotate, and how a compromised one is revoked is **not built** (see L3.5).
+
+**AT-022 — SHAPED, and deliberately empty.** The `RecallPlan`'s `irreversible` section is **built and
+wired**: it is the first field of the struct and the first section of the report, always, and the report
+already says out loud that *rewinding a branch reverts writes — it does not un-suspend an account*. A
+test asserts the byte offset of `"CANNOT BE UNDONE"` precedes `"CAN be reverted"`, so it cannot be
+quietly reordered.
+
+**It stays empty until the action gateway lands in L3.5**, because there is nothing irreversible in the
+system yet to put in it. The shape is honest. The content is not there. **Not claimed as green.**
 
 ---
 
@@ -68,7 +92,6 @@ need does not exist yet.
 | **AT-007** — unsupported claim cannot act | **storage half green; action half L3.5** | `Claim::is_action_eligible()` and `ineligibility_reason()` exist and are unit-tested, and the message tells a model what to *do*. But **there is no action path to refuse**, so the half that matters is untested. |
 | **AT-009** — as-of is reproducible | **L2/L3** | Same reason as AT-004: no as-of API. |
 | **AT-016** — merge re-evaluates policy | **L3.5** | There is no policy engine. The merge already *replays as new writes on the target* rather than transplanting pages, which is the structural precondition — the hook exists, the policy does not. |
-| **AT-026** — envelope signatures verify | **L2** | Signature field present, empty, unverified. |
 | **AT-022** — taint names what it *cannot* undo | **L3.5** | The **shape is built and the report already leads with it** — every plan opens with the irreversible section and says out loud that rewinding a branch does not un-suspend an account. But the section stays **empty** until the action gateway exists to put anything in it. The scaffolding is honest; the content is not there yet. |
 | **AT-027 – AT-039** | **L3.5** | Action gateway and influence policy. |
 | **AT-040 – AT-044** | **L3** | Memory and retrieval. |

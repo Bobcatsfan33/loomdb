@@ -3,6 +3,7 @@
 //! Each test names the `AT-` id it discharges. A capability is not done when it works — it is done
 //! when the test that would have caught it failing is green.
 
+use ed25519_dalek::{SigningKey, VerifyingKey};
 use loom_branch::{Loom, MergePolicy, MergeResult};
 use loom_core::{
     ActorId, BranchId, Claim, ClaimId, ClaimStatus, Confidence, Interval, LoomError, Method,
@@ -671,5 +672,211 @@ fn a_criss_cross_history_is_refused_rather_than_guessed() -> Result<()> {
              produces a number nobody can justify. Expected a refusal, got {other:?}"
         ),
     }
+    Ok(())
+}
+
+// ── AT-026 — envelope signatures verify ─────────────────────────────────────────────────────────
+//
+// AT-001 gets the envelope's *shape*: a write with no actor, session, branch, or intent is refused.
+// That makes a write **attributable**. It does not make it **true**. Until something checks the
+// signature, "who wrote this" is a field the writer fills in about itself, and an audit trail built
+// on it is a work of fiction the moment two agents can reach the same database.
+
+fn keypair(seed: u8) -> (SigningKey, VerifyingKey) {
+    let signing = SigningKey::from_bytes(&[seed; 32]);
+    let verifying = signing.verifying_key();
+    (signing, verifying)
+}
+
+/// **A signed write from a registered actor is accepted; an unsigned one is refused.**
+#[test]
+fn at_026_an_unsigned_write_is_refused_when_the_database_authenticates_writers() -> Result<()> {
+    let (signing, verifying) = keypair(1);
+    let actor = ActorId::new("agent-1");
+
+    let db = Loom::in_memory(TenantId::new("acme"))?
+        .with_clock(|| NOW)
+        .with_actor_keys([(actor.clone(), verifying)]);
+
+    let (session, token) = db.open_session()?;
+
+    let unsigned = WriteEnvelope::new(
+        actor.clone(),
+        session.id.clone(),
+        session.branch.clone(),
+        "write without signing",
+    );
+
+    let refused = db.write(
+        &token,
+        &session.branch,
+        b"k".to_vec(),
+        Record::Value(Value::Counter(1)),
+        &unsigned,
+    );
+
+    assert!(
+        matches!(refused, Err(LoomError::EnvelopeUnsigned { .. })),
+        "an unsigned write must be refused by a database that authenticates its writers: {refused:?}"
+    );
+
+    // Nothing was written. A refused write must not leave a trace, or "refused" is a lie.
+    assert!(db.read(&token, &session.branch, b"k")?.is_none());
+
+    // The same write, signed, goes through.
+    let signed = WriteEnvelope::new(
+        actor,
+        session.id.clone(),
+        session.branch.clone(),
+        "write without signing",
+    )
+    .signed_by(&signing);
+
+    db.write(
+        &token,
+        &session.branch,
+        b"k".to_vec(),
+        Record::Value(Value::Counter(1)),
+        &signed,
+    )?;
+    assert!(db.read(&token, &session.branch, b"k")?.is_some());
+
+    Ok(())
+}
+
+/// **You cannot write as somebody else.** This is the one that matters.
+///
+/// An agent holding its own valid key signs an envelope, then claims to be a different actor — the
+/// compliance bot, the human reviewer, whoever is trusted. Verification is performed against the key
+/// of the actor the envelope *claims to be*, not the one that signed it, so it fails.
+///
+/// If this test ever goes green by accident — say, by looking up the key by the signature instead of
+/// by the claimed actor — then every agent can write as every other agent, and provenance is theatre.
+#[test]
+fn at_026_an_actor_cannot_impersonate_another_actor() -> Result<()> {
+    let (attacker_key, attacker_pub) = keypair(2);
+    let (_, victim_pub) = keypair(3);
+
+    let attacker = ActorId::new("scraper-bot");
+    let victim = ActorId::new("compliance-officer");
+
+    let db = Loom::in_memory(TenantId::new("acme"))?
+        .with_clock(|| NOW)
+        .with_actor_keys([
+            (attacker.clone(), attacker_pub),
+            (victim.clone(), victim_pub),
+        ]);
+
+    let (session, token) = db.open_session()?;
+
+    // Signed with the attacker's own, perfectly valid, registered key — but claiming to be the
+    // compliance officer.
+    let forged = WriteEnvelope::new(
+        victim,
+        session.id.clone(),
+        session.branch.clone(),
+        "approved by compliance",
+    )
+    .signed_by(&attacker_key);
+
+    let refused = db.write(
+        &token,
+        &session.branch,
+        b"approval".to_vec(),
+        Record::Value(Value::Bool(true)),
+        &forged,
+    );
+
+    assert!(
+        matches!(refused, Err(LoomError::EnvelopeSignatureInvalid { .. })),
+        "an actor signed with its OWN valid key but claimed to be someone else, and the write was \
+         not refused. Every agent can now write as every other agent: {refused:?}"
+    );
+    assert!(db.read(&token, &session.branch, b"approval")?.is_none());
+
+    Ok(())
+}
+
+/// **The signature covers the intent.** Altering *why* a write happened invalidates it.
+///
+/// `intent` is the field an auditor actually reads. A signature that covered the actor but not the
+/// stated purpose would let an attacker keep a valid signature while rewriting the reason — the write
+/// would verify, and the audit trail would say whatever the attacker wanted it to say.
+#[test]
+fn at_026_tampering_with_the_intent_breaks_the_signature() -> Result<()> {
+    let (signing, verifying) = keypair(4);
+    let actor = ActorId::new("agent-1");
+
+    let db = Loom::in_memory(TenantId::new("acme"))?
+        .with_clock(|| NOW)
+        .with_actor_keys([(actor.clone(), verifying)]);
+
+    let (session, token) = db.open_session()?;
+
+    let mut envelope = WriteEnvelope::new(
+        actor,
+        session.id.clone(),
+        session.branch.clone(),
+        "routine refresh of a cached value",
+    )
+    .signed_by(&signing);
+
+    // Same signature. Different story.
+    envelope.intent = "authorized by the customer over the phone".into();
+
+    let refused = db.write(
+        &token,
+        &session.branch,
+        b"k".to_vec(),
+        Record::Value(Value::Counter(1)),
+        &envelope,
+    );
+
+    assert!(
+        matches!(refused, Err(LoomError::EnvelopeSignatureInvalid { .. })),
+        "the intent was rewritten after signing and the write was accepted. The signature does not \
+         cover the field the auditor reads: {refused:?}"
+    );
+
+    Ok(())
+}
+
+/// **An actor nobody registered is refused, not trusted.** Fail closed.
+///
+/// Failing open here is the interesting bug: an attacker picks an actor name that has never been
+/// registered — `"acme-compliance-bot"` — and, because there is no key to check against, the write
+/// sails through and the audit trail records a ghost as its author.
+#[test]
+fn at_026_an_unregistered_actor_is_refused_rather_than_trusted() -> Result<()> {
+    let (signing, verifying) = keypair(5);
+
+    let db = Loom::in_memory(TenantId::new("acme"))?
+        .with_clock(|| NOW)
+        .with_actor_keys([(ActorId::new("agent-1"), verifying)]);
+
+    let (session, token) = db.open_session()?;
+
+    let ghost = WriteEnvelope::new(
+        ActorId::new("acme-compliance-bot"), // never registered
+        session.id.clone(),
+        session.branch.clone(),
+        "approved",
+    )
+    .signed_by(&signing);
+
+    let refused = db.write(
+        &token,
+        &session.branch,
+        b"k".to_vec(),
+        Record::Value(Value::Counter(1)),
+        &ghost,
+    );
+
+    assert!(
+        matches!(refused, Err(LoomError::UnknownActor { .. })),
+        "an actor with no registered key must be REFUSED, not trusted. Failing open here lets an \
+         attacker invent an authoritative-sounding name and write as it: {refused:?}"
+    );
+
     Ok(())
 }

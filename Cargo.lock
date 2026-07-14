@@ -928,6 +928,7 @@ version = "0.1.0"
 dependencies = [
  "bincode",
  "blake3",
+ "ed25519-dalek",
  "getrandom 0.2.17",
  "serde",
  "substrate-pager",

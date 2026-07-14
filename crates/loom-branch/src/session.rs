@@ -18,9 +18,10 @@ use crate::refs::{FileRefStore, MemRefStore, RefStore, Refs};
 use crate::sleep::LoomWakeToken;
 use crate::token::{CapabilityToken, TokenIssuer};
 use crate::tree::Tree;
+use ed25519_dalek::VerifyingKey;
 use loom_core::{
-    is_provenance, latest_node_key, source_index_key, BranchId, CommitId, DerivationNode, Key,
-    LoomError, NodeId, Record, Result, SessionId, SourceRef, TenantId, Value, WriteEnvelope,
+    is_provenance, latest_node_key, source_index_key, ActorId, BranchId, CommitId, DerivationNode,
+    Key, LoomError, NodeId, Record, Result, SessionId, SourceRef, TenantId, Value, WriteEnvelope,
 };
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::{Arc, Mutex};
@@ -108,6 +109,21 @@ pub struct SessionHandle {
 /// a prerequisite for L2, because the provenance layer needs to walk history across restarts.
 pub struct Loom {
     pager: Arc<Pager>,
+    /// The public keys of the actors allowed to write, if this database authenticates its writers.
+    ///
+    /// # Why this is optional, and what it costs to leave it empty
+    ///
+    /// `None` means envelopes are **attributable but not authenticated**: a write says who it came
+    /// from, and nothing checks that it is telling the truth. That is the right default for an
+    /// embedded, single-process database where the only writer is the process itself — and it is the
+    /// wrong default the moment more than one agent can reach the same database, because then any
+    /// agent can write as any other, and the audit trail becomes a work of fiction.
+    ///
+    /// `Some(registry)` means **every write must be signed**, and the signature is verified against
+    /// the key of the actor the envelope *claims to be*. An actor with no registered key is refused
+    /// rather than trusted (`UnknownActor`) — fail closed, because failing open here means an attacker
+    /// picks an actor name nobody has registered and writes as a ghost.
+    actor_keys: Option<BTreeMap<ActorId, VerifyingKey>>,
     /// **Everything that must survive a restart, other than the data.**
     ///
     /// Branch heads, tags, and the commit DAG — including the *second parent* of every merge, which
@@ -196,6 +212,7 @@ impl Loom {
 
         Ok(Loom {
             pager,
+            actor_keys: None,
             refs: Mutex::new(refs),
             store,
             read_sets: Mutex::new(BTreeMap::new()),
@@ -383,6 +400,42 @@ impl Loom {
         self.write_many(token, branch, vec![(key, record)], envelope)
     }
 
+    /// **Require every write to be signed, and verify it against the writer's registered key.**
+    ///
+    /// Turns AT-026 on. Without it, an envelope names its author and nothing checks the name.
+    ///
+    /// An actor that is not in this registry cannot write at all. That is deliberate: an unknown
+    /// actor is refused, not trusted. The alternative — accept unsigned writes from actors we have
+    /// never heard of — means an attacker writes as `"acme-compliance-bot"`, a name nobody registered,
+    /// and the audit trail records it as gospel.
+    pub fn with_actor_keys(
+        mut self,
+        keys: impl IntoIterator<Item = (ActorId, VerifyingKey)>,
+    ) -> Self {
+        self.actor_keys = Some(keys.into_iter().collect());
+        self
+    }
+
+    /// Is this envelope actually from who it says it is?
+    ///
+    /// A no-op when the database has no actor registry — see the field docs for what that costs.
+    fn authenticate(&self, envelope: &WriteEnvelope) -> Result<()> {
+        let Some(keys) = &self.actor_keys else {
+            return Ok(());
+        };
+
+        // Looked up by the actor the envelope CLAIMS to be. Sign as A, claim to be B, and we verify
+        // against B's key — which fails. That is the whole mechanism: you cannot impersonate an actor
+        // whose key you do not hold.
+        let key = keys
+            .get(&envelope.actor)
+            .ok_or_else(|| LoomError::UnknownActor {
+                actor: envelope.actor.as_str().to_string(),
+            })?;
+
+        envelope.verify(key)
+    }
+
     /// Write several records in one commit.
     pub fn write_many(
         &self,
@@ -423,6 +476,7 @@ impl Loom {
         if !envelope.is_valid() {
             return Err(LoomError::MissingEnvelope);
         }
+        self.authenticate(envelope)?;
 
         // 2. THE TOKEN. No code path below this line touches a page outside the token's scope.
         self.issuer.authorize(token, branch, self.now())?;
