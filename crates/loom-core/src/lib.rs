@@ -32,6 +32,7 @@
 mod envelope;
 mod error;
 mod ids;
+mod recall;
 mod time;
 mod value;
 
@@ -40,6 +41,7 @@ pub use error::{LoomError, Result};
 pub use ids::{
     ActorId, BranchId, ClaimId, CommitId, ObservationId, PolicyDecisionId, SessionId, TenantId,
 };
+pub use recall::{Compensation, IrreversibleItem, RecallPlan, ReversibleItem};
 pub use time::{Interval, Timestamp};
 pub use value::{
     Claim, ClaimStatus, Confidence, Method, Observation, Record, SourceRef, TrustClass, Value,
