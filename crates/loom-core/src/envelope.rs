@@ -16,7 +16,7 @@
 use crate::error::{LoomError, Result};
 use crate::ids::{ActorId, BranchId, PolicyDecisionId, SessionId};
 use crate::value::SourceRef;
-use ed25519_dalek::{Signature, Signer, SigningKey, Verifier, VerifyingKey};
+use ed25519_dalek::{Signature, Signer, SigningKey, VerifyingKey};
 use serde::{Deserialize, Serialize};
 
 /// Everything we record about *why* a write happened.
