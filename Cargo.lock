@@ -935,6 +935,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "loom-provenance"
+version = "0.1.0"
+dependencies = [
+ "bincode",
+ "blake3",
+ "loom-branch",
+ "loom-core",
+ "proptest",
+ "serde",
+ "substrate-pager",
+ "tempfile",
+ "thiserror",
+]
+
+[[package]]
 name = "lru-slab"
 version = "0.1.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"

@@ -7,7 +7,7 @@
 > A capability is not done when it works. It is done when the test that would have caught it failing
 > is green. Anything else on this page is not a claim, it is a plan.
 
-Status as of **L1 + persistence complete**.
+Status as of **L1 + persistence + L2 (provenance, taint, staleness) complete**.
 
 ---
 
@@ -25,6 +25,12 @@ Status as of **L1 + persistence complete**.
 | **AT-018** | Rewind abandons without destroying — the discarded hypothesis stays readable. | `at_018_a_rewound_branch_is_still_auditable` |
 | **AT-046** | A restart finds the branches, the data, **and the merge edges**. Re-merging after a restart is a no-op, not a double-count. | `at_046_a_restart_finds_the_branches_the_data_and_the_merge_edges`, `at_046_reopening_twice_is_idempotent` |
 | **AT-047** | Sleep the tenant, **wipe the disk**, wake elsewhere. Identical results, and the branch names come back with the data. | `at_047_sleep_wipe_wake_and_the_branches_come_back` |
+| **AT-002** | **The read-set is captured by the engine.** A caller cannot launder a derivation by omitting it from the envelope — what it *read* is what it is derived from, whatever it declares. | `at_002_a_caller_cannot_launder_a_derivation_by_omission` |
+| **AT-020** | Taint reaches **both children of a fork** — a poisoned write inherited before the fork contaminates every branch that descends from it. And it **crosses a merge**: a conclusion merged into `main` is still downstream. | `at_020_taint_reaches_both_children_of_a_fork`, `at_020_taint_survives_a_merge_into_main` |
+| **AT-021** | The plan is **exact** — completeness *and* precision. Verified against a naive flood-fill model over 10,000 randomized runs. | `at_021_taint_names_exactly_what_is_downstream_and_nothing_else`, `taint_names_exactly_the_contaminated_set` (oracle) |
+| **AT-023** | Invalidated evidence makes a claim **`Stale`, not gone**. The scalpel, not the sledgehammer: it stays readable and auditable, and stops being action-eligible. | `at_023_invalidated_evidence_makes_a_claim_stale_not_gone` |
+| **AT-024** | `taint()` **proposes and never acts.** It returns a dry run. Nothing is mutated. | `at_024_taint_proposes_and_never_acts` |
+| **AT-025** | A pathological derivation graph is **refused, not chased** — the walk is bounded at depth 64. | `at_025_a_pathological_derivation_graph_is_refused_not_chased` |
 
 **AT-019 — token scope is inescapable.** Green **for the surfaces that exist today**: `read`, `write`,
 `scan`, `rewind`, `branch`, and `merge` (both sides — a merge reads the source and writes the target,
@@ -57,19 +63,45 @@ need does not exist yet.
 
 | ID | Deferred to | Why |
 |---|---|---|
-| **AT-002** — read-set is engine-captured | **L2** (the next task after persistence) | This is the invariant that a caller **cannot launder a derivation by omission**. It needs read-set tracking on the session transaction, which is the heart of the provenance engine. The `derived_from` field exists and is caller-supplied today — which is exactly the weak version AT-002 exists to eliminate. |
 | **AT-004** — late arrival | **L2/L3** | `Interval` is bitemporal and unit-tested, but there is **no as-of query API**. Nothing can be asked "what did you believe last week", so nothing can be tested. |
 | **AT-005** — correction preserves history | **L2** | Needs the correction path: closing a `known` interval and opening a new one. Not built. |
 | **AT-007** — unsupported claim cannot act | **storage half green; action half L3.5** | `Claim::is_action_eligible()` and `ineligibility_reason()` exist and are unit-tested, and the message tells a model what to *do*. But **there is no action path to refuse**, so the half that matters is untested. |
 | **AT-009** — as-of is reproducible | **L2/L3** | Same reason as AT-004: no as-of API. |
 | **AT-016** — merge re-evaluates policy | **L3.5** | There is no policy engine. The merge already *replays as new writes on the target* rather than transplanting pages, which is the structural precondition — the hook exists, the policy does not. |
 | **AT-026** — envelope signatures verify | **L2** | Signature field present, empty, unverified. |
-| **AT-020 – AT-025** — taint, staleness, recall | **L2** | The whole provenance layer. AT-022 (taint names what it *cannot* undo) additionally needs the action layer to be non-trivial — the `RecallPlan`'s `irreversible` section is designed now and stays empty until L3.5. |
+| **AT-022** — taint names what it *cannot* undo | **L3.5** | The **shape is built and the report already leads with it** — every plan opens with the irreversible section and says out loud that rewinding a branch does not un-suspend an account. But the section stays **empty** until the action gateway exists to put anything in it. The scaffolding is honest; the content is not there yet. |
 | **AT-027 – AT-039** | **L3.5** | Action gateway and influence policy. |
 | **AT-040 – AT-044** | **L3** | Memory and retrieval. |
 | **AT-045** — crash at any byte | **later** | Inherited from substrate (50,000 crash cycles there), but **not yet re-driven with LoomDB-shaped workloads**. The ref write is a second durable object with its own ordering, and it deserves its own crash injection. Named so it is tracked. |
 
 ---
+
+## What L2 changed, and the two bugs it found
+
+**AT-002 is the one that matters.** The read-set is captured **by the engine**, on the session, at
+`Loom::read`. The envelope's `derived_from` can only ever make the set *bigger* — a caller that omits
+what it read does not thereby un-derive it. This is the difference between provenance and a comment.
+
+Two real bugs, both silent, both caught by tests rather than by reading the code:
+
+**The commit-ordering bug.** Provenance was written in a commit *before* the data commit, so the data
+commit's `set_head` overwrote it. Every derivation node, on every write, was discarded. `taint()`
+cheerfully reported that nothing was contaminated. The fix is not "commit in the other order" — it is
+to stop needing two commits: a node now records the commit its write was **based on**, so provenance
+goes into the *same* transaction as the data, and a crash can no longer separate the two.
+
+**The merge boundary.** The merge engine reads through the tree, not through `Loom::read`, so the
+read-set never saw what a merge merged — and a merged record landed in `main` with **no parents at
+all**, looking like a clean, freshly-authored fact. Every taint stopped dead at the first merge, which
+is the path an agent takes on *every run*. A merged record is now derived from the node that produced
+it on each side, **per key** (the first fix gave every record the union of every parent, which made the
+taint over-report *and* blew past the page size on a 2,000-key merge — the oracle caught it as
+`PageTooLarge`).
+
+**The taint oracle disagreed with the engine, and the engine was right.** The model unioned a key's
+parents across writes; but a key can be *overwritten*, and a conclusion built on a re-derived, clean
+version of a claim is genuinely clean. The model was rebuilt per-write. Worth recording because the
+temptation was to "fix" the engine to match a wrong model.
 
 ## What persistence changed
 

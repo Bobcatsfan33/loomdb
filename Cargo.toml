@@ -3,6 +3,7 @@ resolver = "2"
 members = [
     "crates/loom-core",
     "crates/loom-branch",
+    "crates/loom-provenance",
 ]
 
 [workspace.package]
@@ -27,6 +28,7 @@ substrate-security = { git = "https://github.com/Bobcatsfan33/substrate", tag = 
 # --- internal ---
 loom-core = { path = "crates/loom-core", version = "0.1.0" }
 loom-branch = { path = "crates/loom-branch", version = "0.1.0" }
+loom-provenance = { path = "crates/loom-provenance", version = "0.1.0" }
 
 # --- deps ---
 thiserror = "2.0"

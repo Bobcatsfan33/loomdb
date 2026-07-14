@@ -32,6 +32,7 @@
 mod envelope;
 mod error;
 mod ids;
+mod provenance;
 mod recall;
 mod time;
 mod value;
@@ -40,6 +41,10 @@ pub use envelope::WriteEnvelope;
 pub use error::{LoomError, Result};
 pub use ids::{
     ActorId, BranchId, ClaimId, CommitId, ObservationId, PolicyDecisionId, SessionId, TenantId,
+};
+pub use provenance::{
+    is_provenance, latest_node_key, node_from_index_key, source_index_key, source_index_prefix,
+    DerivationNode, NodeId, PROV_PREFIX, RESERVED_LATEST_PREFIX, SRC_PREFIX,
 };
 pub use recall::{Compensation, IrreversibleItem, RecallPlan, ReversibleItem};
 pub use time::{Interval, Timestamp};

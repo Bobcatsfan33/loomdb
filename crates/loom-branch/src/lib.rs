@@ -41,6 +41,7 @@ pub use merge::{
     Resolution, RESERVED_PREFIX,
 };
 pub use refs::{FileRefStore, MemRefStore, RefStore, Refs, REFS_FORMAT_VERSION};
+pub use session::ReadSet;
 pub use session::{Loom, MergeResult, SessionHandle, DEFAULT_SESSION_TTL_MS, MAIN};
 pub use sleep::LoomWakeToken;
 pub use token::{CapabilityToken, TokenClaims, TokenIssuer};

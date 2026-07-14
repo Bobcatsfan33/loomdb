@@ -70,6 +70,20 @@ pub enum LoomError {
         name: String,
     },
 
+    /// A derivation walk ran past its depth bound.
+    ///
+    /// A derivation chain in a real agent is shallow — an observation, a claim, a conclusion. A chain
+    /// this long is a cycle or a bug, and chasing it is a denial of service against ourselves (AT-025).
+    #[error(
+        "the derivation graph is not acyclic: a walk exceeded {depth} hops. \
+         Some write claims to be derived from something downstream of itself. \
+         Inspect the derivation DAG with `loom audit` before trusting any taint result."
+    )]
+    DerivationCycle {
+        /// The bound that was exceeded.
+        depth: usize,
+    },
+
     /// A page's bytes are not a valid node.
     #[error("corrupt node at logical page {page}: {detail}")]
     CorruptNode {

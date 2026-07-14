@@ -19,9 +19,10 @@ use crate::sleep::LoomWakeToken;
 use crate::token::{CapabilityToken, TokenIssuer};
 use crate::tree::Tree;
 use loom_core::{
-    BranchId, CommitId, Key, LoomError, Record, Result, SessionId, TenantId, Value, WriteEnvelope,
+    is_provenance, latest_node_key, source_index_key, BranchId, CommitId, DerivationNode, Key,
+    LoomError, NodeId, Record, Result, SessionId, SourceRef, TenantId, Value, WriteEnvelope,
 };
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::sync::{Arc, Mutex};
 use substrate_pager::{Clock, PageStore, Pager, StoreConfig};
 
@@ -117,6 +118,17 @@ pub struct Loom {
     /// negotiable: the manifest is durable **before** the ref that points at it (see `refs.rs`).
     refs: Mutex<Refs>,
     store: Arc<dyn RefStore>,
+    /// **The engine-captured read-set** (AT-002).
+    ///
+    /// Everything a session has read since its last write. The *next* write is derived from all of
+    /// it, whether the caller mentions it or not.
+    ///
+    /// This is the difference between a provenance system and a provenance *claim*. If
+    /// `derived_from` were caller-supplied, an agent — or an attacker steering one — could launder a
+    /// derivation simply by declining to mention what it read. The engine watches instead.
+    ///
+    /// Callers may still ADD external sources. They may not OMIT what they read.
+    read_sets: Mutex<BTreeMap<SessionId, ReadSet>>,
     issuer: TokenIssuer,
     tenant: TenantId,
     now_ms: Box<dyn Fn() -> u64 + Send + Sync>,
@@ -186,6 +198,7 @@ impl Loom {
             pager,
             refs: Mutex::new(refs),
             store,
+            read_sets: Mutex::new(BTreeMap::new()),
             issuer: TokenIssuer::generate(),
             tenant,
             now_ms: Box::new(|| {
@@ -378,6 +391,34 @@ impl Loom {
         records: Vec<(Key, Record)>,
         envelope: &WriteEnvelope,
     ) -> Result<CommitId> {
+        self.write_many_derived(token, branch, records, envelope, &BTreeMap::new())
+    }
+
+    /// `write_many`, plus derivation parents the caller *knows about* but did not read.
+    ///
+    /// The only caller is `merge`. A merged record genuinely **is** derived from both sides — that is
+    /// what merging means — but the merge engine reads through the tree rather than through
+    /// `Loom::read`, so the read-set never sees it. Without this, every merge would silently sever the
+    /// provenance of everything it merged, and a taint on a source would stop dead at the first merge
+    /// boundary. That is not a corner case: merging the winning hypothesis back into main is the
+    /// *normal* path.
+    ///
+    /// The parents are **per key**, and that is load-bearing. The first version handed every record in
+    /// the write the union of every parent, which is wrong twice over: record `K` is not derived from
+    /// record `J`'s ancestors, so the taint over-reports — and the node blob grows with the size of the
+    /// merge, so a 2,000-key merge produced an 18KB derivation node *per record* and blew past the
+    /// page size. The oracle caught it as `PageTooLarge`. Precision and size are the same bug here.
+    ///
+    /// It is `pub(crate)` on purpose. This is the one seam that lets a caller add a derivation edge it
+    /// did not read, and it is not for agents.
+    pub(crate) fn write_many_derived(
+        &self,
+        token: &CapabilityToken,
+        branch: &BranchId,
+        records: Vec<(Key, Record)>,
+        envelope: &WriteEnvelope,
+        extra_parents: &BTreeMap<Key, Vec<NodeId>>,
+    ) -> Result<CommitId> {
         // 1. THE ENVELOPE. Before anything else, and with no way around it.
         if !envelope.is_valid() {
             return Err(LoomError::MissingEnvelope);
@@ -386,21 +427,146 @@ impl Loom {
         // 2. THE TOKEN. No code path below this line touches a page outside the token's scope.
         self.issuer.authorize(token, branch, self.now())?;
 
-        // 3. The write itself, against this branch's head — and *only* this branch's head.
+        // 3. THE READ-SET. Engine-captured, and consumed here (AT-002).
+        //
+        //    This is the difference between a provenance system and a provenance *claim*. The caller
+        //    supplied `envelope.derived_from`; we take that as an ADDITION, not as the truth. What
+        //    the session actually read goes in regardless.
+        //
+        //    An agent — or an attacker steering one — must not be able to launder a derivation by
+        //    declining to mention what it read.
+        let captured = self.take_read_set(&envelope.session);
+
+        // 4. The write, and its provenance, **in one commit**.
+        //
+        // # Why one commit and not two
+        //
+        // The first version wrote the data, then wrote the derivation nodes in a *second* commit —
+        // because a node names the commit it describes and therefore, it seemed, could not be inside
+        // it. Two bugs followed immediately.
+        //
+        // The ordering bug: writing provenance first produced a commit on the *old* head, which the
+        // data commit's `set_head` then overwrote — silently discarding every derivation node, on
+        // every write. `taint()` cheerfully reported that nothing was contaminated.
+        //
+        // And a subtler one: two commits per write means two nodes in the commit DAG per write, and
+        // the branch model oracle caught the divergence within seconds.
+        //
+        // The fix is to stop needing the commit id. A node records the commit its write was **based
+        // on** — the head it was derived against — which is *more* useful anyway: it is exactly the
+        // rewind boundary a recall plan wants ("move the branch back to before this write"). So
+        // provenance goes in the same transaction as the data, atomically, and a crash can no longer
+        // separate a write from its provenance.
         let head = self.head(branch)?;
         let store = self.pager.fork(&head)?;
 
         let mut txn = store.begin()?;
         let mut tree = Tree::open(&*store)?;
+
+        let written: Vec<(Key, Record)> = records.clone();
         for (key, record) in records {
             tree.insert(key, record)?;
         }
+
+        if written
+            .iter()
+            .any(|(k, _)| !is_provenance(k) && !is_reserved(k))
+        {
+            let nodes =
+                self.derivation_nodes(branch, head, &written, envelope, &captured, extra_parents);
+            for node in &nodes {
+                tree.insert(node.id.key(), Record::Value(Value::Blob(node.encode()?)))?;
+
+                // "Which node last wrote this key" — one lookup instead of a scan of the whole DAG.
+                // Reserved, and therefore never merged: it is mutable per-branch bookkeeping, not
+                // history, and handing it to the merge engine produced a conflict on an opaque blob
+                // with a report asking the caller to pick one. Nobody can answer that.
+                tree.insert(
+                    latest_node_key(&node.key),
+                    Record::Value(Value::Blob(node.id.as_bytes().to_vec())),
+                )?;
+
+                // "Which nodes cite this source" — so `taint()` has somewhere to start without
+                // reading every node in every branch. A taint too slow to run is a taint nobody runs.
+                for source in &node.sources {
+                    tree.insert(
+                        source_index_key(source, node.id),
+                        Record::Value(Value::Blob(vec![])),
+                    )?;
+                }
+            }
+        }
+
         tree.flush(&mut txn)?;
         let commit = store.commit(txn)?;
 
         self.record_commit(commit, vec![head]);
         self.set_head(branch, commit)?;
         Ok(commit)
+    }
+
+    /// Take a session's read-set, clearing it. The next write starts fresh.
+    fn take_read_set(&self, session: &SessionId) -> ReadSet {
+        self.read_sets
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(session)
+            .unwrap_or_default()
+    }
+
+    /// Build one derivation node per key written.
+    fn derivation_nodes(
+        &self,
+        branch: &BranchId,
+        commit: CommitId,
+        written: &[(Key, Record)],
+        envelope: &WriteEnvelope,
+        captured: &ReadSet,
+        extra_parents: &BTreeMap<Key, Vec<NodeId>>,
+    ) -> Vec<DerivationNode> {
+        // The union of what the ENGINE saw and what the CALLER declared. The caller can only ever
+        // make this set bigger.
+        let mut base_sources: Vec<SourceRef> = captured.sources.iter().cloned().collect();
+        base_sources.extend(envelope.derived_from.iter().cloned());
+
+        let base_parents: Vec<NodeId> = captured.nodes.iter().copied().collect();
+
+        written
+            .iter()
+            .filter(|(key, _)| !is_provenance(key))
+            .map(|(key, record)| {
+                let mut sources = base_sources.clone();
+
+                // What the engine saw this session read, plus — for a merge, and only a merge — the
+                // node that produced *this key* on each side. See `write_many_derived`.
+                let mut derived_from = base_parents.clone();
+                if let Some(extra) = extra_parents.get(key) {
+                    derived_from.extend(extra.iter().copied());
+                }
+                derived_from.sort();
+                derived_from.dedup();
+
+                // **An observation IS the arrival of a source.** Its node must cite it, or the DAG
+                // has no bottom: `taint("that scraped page")` would have nothing to match against and
+                // would confidently report that nothing is contaminated.
+                //
+                // This is not the caller telling us where it came from. It is the record itself.
+                if let Record::Observation(obs) = record {
+                    sources.push(obs.source.clone());
+                }
+
+                DerivationNode::new(
+                    branch.clone(),
+                    commit,
+                    key.clone(),
+                    envelope.actor.clone(),
+                    envelope.delegation.clone(),
+                    envelope.intent.clone(),
+                    derived_from.clone(),
+                    sources,
+                )
+            })
+            .collect()
     }
 
     /// Like `write_many`, but records a **second parent** — the merge edge.
@@ -411,9 +577,11 @@ impl Loom {
         records: Vec<(Key, Record)>,
         envelope: &WriteEnvelope,
         second_parent: CommitId,
+        derivation_parents: &BTreeMap<Key, Vec<NodeId>>,
     ) -> Result<CommitId> {
         let before = self.head(branch)?;
-        let commit = self.write_many(token, branch, records, envelope)?;
+        let commit =
+            self.write_many_derived(token, branch, records, envelope, derivation_parents)?;
 
         // THE SECOND PARENT. This is the whole reason merges are correct on the second pass — and
         // why it must be durable: losing it across a restart silently restores the double-counting
@@ -432,6 +600,10 @@ impl Loom {
     }
 
     /// Read a record from a branch.
+    ///
+    /// **The read is captured.** Whatever this returns becomes part of the session's read-set, and the
+    /// session's next write will be recorded as derived from it — whether the caller says so or not
+    /// (AT-002).
     pub fn read(
         &self,
         token: &CapabilityToken,
@@ -443,7 +615,70 @@ impl Loom {
         let head = self.head(branch)?;
         let store = self.pager.fork(&head)?;
         let mut tree = Tree::open(&*store)?;
-        tree.get(key)
+        let record = tree.get(key)?;
+
+        if let Some(record) = &record {
+            self.capture_read(token.session(), branch, key, record)?;
+        }
+        Ok(record)
+    }
+
+    /// Record what a read saw, into the session's read-set.
+    ///
+    /// Two things get captured, and they are different in kind:
+    ///
+    /// - the **derivation node** that produced this record, if one exists — so the DAG links write to
+    ///   write, and taint can walk downstream through conclusions built on conclusions;
+    /// - the **external source**, if the record is an `Observation` — so the DAG bottoms out somewhere
+    ///   real, and `taint("that scraped page")` has something to match against.
+    fn capture_read(
+        &self,
+        session: &SessionId,
+        branch: &BranchId,
+        key: &[u8],
+        record: &Record,
+    ) -> Result<()> {
+        // The provenance layer's own records are not evidence. Reading a derivation node while
+        // walking the DAG must not make the walker a derivation of everything it inspected.
+        if is_provenance(key) {
+            return Ok(());
+        }
+
+        let mut sets = self.read_sets.lock().unwrap_or_else(|e| e.into_inner());
+        let set = sets.entry(session.clone()).or_default();
+
+        // Which node produced this key on this branch?
+        if let Some(node) = self.node_for_key(branch, key)? {
+            set.nodes.insert(node);
+        }
+
+        // An observation's source is where the DAG bottoms out.
+        if let Record::Observation(obs) = record {
+            set.sources.insert(obs.source.clone());
+        }
+        Ok(())
+    }
+
+    /// The derivation node that most recently wrote this key on this branch, if any.
+    fn node_for_key(&self, branch: &BranchId, key: &[u8]) -> Result<Option<NodeId>> {
+        let head = self.head(branch)?;
+        let store = self.pager.fork(&head)?;
+        let mut tree = Tree::open(&*store)?;
+
+        let Some(Record::Value(Value::Blob(bytes))) = tree.get(&latest_node_key(key))? else {
+            return Ok(None);
+        };
+        Ok(NodeId::from_bytes(&bytes))
+    }
+
+    /// The current read-set for a session. Diagnostics, and the tests that prove AT-002.
+    pub fn read_set(&self, session: &SessionId) -> ReadSet {
+        self.read_sets
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(session)
+            .cloned()
+            .unwrap_or_default()
     }
 
     /// Read a record as of a specific commit — the past, exactly as it was.
@@ -469,11 +704,15 @@ impl Loom {
         let store = self.pager.fork(&head)?;
         let mut tree = Tree::open(&*store)?;
 
-        // The engine's bookkeeping is not the caller's data.
+        // Neither the engine's bookkeeping nor the provenance layer is the caller's data.
+        //
+        // Note the asymmetry, and it is deliberate: reserved keys are hidden AND excluded from merge;
+        // provenance keys are hidden but **merged**. Merging a branch without carrying its provenance
+        // would be a hole you could drive a poisoned document through.
         Ok(tree
             .scan()?
             .into_iter()
-            .filter(|(k, _)| !is_reserved(k))
+            .filter(|(k, _)| !is_reserved(k) && !is_provenance(k))
             .collect())
     }
 
@@ -552,7 +791,14 @@ impl Loom {
                 mut writes,
                 automatic,
             } => {
-                let records = writes.len();
+                // The caller's facts, not the engine's bookkeeping. Provenance nodes ride along in
+                // the merge — they must, or a taint would stop dead at the first merge boundary — but
+                // nobody asked for a count of them, and reporting "we merged 3 records" when the user
+                // wrote 1 fact is a number that means nothing.
+                let records = writes
+                    .iter()
+                    .filter(|(k, _)| !is_reserved(k) && !is_provenance(k))
+                    .count();
 
                 // Record what we merged, in the same commit as the merge itself. If this were a
                 // separate commit, a crash between the two would leave a branch that had applied the
@@ -562,7 +808,28 @@ impl Loom {
                     Record::Value(Value::Blob(source_head.as_bytes().to_vec())),
                 ));
 
-                let commit = self.write_merge(token, target, writes, envelope, source_head)?;
+                // Carry the provenance across. Every key this merge writes is derived from the
+                // node that produced it on the SOURCE (and, where it existed, on the TARGET) — and
+                // saying so is the difference between a taint that crosses a merge and one that
+                // stops dead at it.
+                let mut parents: BTreeMap<Key, Vec<NodeId>> = BTreeMap::new();
+                for (key, _) in &writes {
+                    if is_reserved(key) || is_provenance(key) {
+                        continue;
+                    }
+                    let mut per_key = Vec::new();
+                    for from in [source, target] {
+                        if let Ok(Some(node)) = self.node_for_key(from, key) {
+                            per_key.push(node);
+                        }
+                    }
+                    if !per_key.is_empty() {
+                        parents.insert(key.clone(), per_key);
+                    }
+                }
+
+                let commit =
+                    self.write_merge(token, target, writes, envelope, source_head, &parents)?;
                 Ok(MergeResult::Merged {
                     commit,
                     records,
@@ -793,5 +1060,25 @@ impl MergeResult {
     /// True if the merge went through.
     pub fn is_merged(&self) -> bool {
         matches!(self, MergeResult::Merged { .. })
+    }
+}
+
+/// What a session has read since its last write.
+///
+/// Two kinds, because they are two kinds of thing: **derivation nodes** (things this database
+/// produced, which have their own upstream) and **external sources** (things the world told us,
+/// which are where the DAG bottoms out).
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct ReadSet {
+    /// Derivation nodes whose output this session has read.
+    pub nodes: BTreeSet<NodeId>,
+    /// External sources this session has read — the `source` of every `Observation` it touched.
+    pub sources: BTreeSet<SourceRef>,
+}
+
+impl ReadSet {
+    /// True if nothing has been read.
+    pub fn is_empty(&self) -> bool {
+        self.nodes.is_empty() && self.sources.is_empty()
     }
 }
