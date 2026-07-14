@@ -26,3 +26,7 @@ object_store = "0.11"
 [dev-dependencies]
 proptest.workspace = true
 tempfile.workspace = true
+
+[[bench]]
+name = "branching"
+harness = false

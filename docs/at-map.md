@@ -120,25 +120,90 @@ overlay did not hold. The old lifecycle test never caught it because it wrote ev
 commit, so everything *was* in the top overlay. Fixed in `substrate-v1.2.1`; manifests now tier to
 object storage, and `sleep` uploads the head's whole ancestry over both edges.
 
-## Held: AT-011 (branch creation is cheap)
+## AT-011 — branch creation is cheap. **Measured, and it holds.**
 
-There is a test, and it passes. **The number it produces is not worth publishing yet, and it is not
-being published.**
+Held until persistence landed, because branching now writes a durable ref, and any figure taken before
+that would have been a figure for a different operation. It has landed, so here are the numbers.
 
-The property is *"cost is independent of baseline size"*, and a single measurement against a single
-3,000-record in-memory database cannot demonstrate independence of anything. Worse, the figure would
-**regress the moment durable writes exist**, because branching will then involve persisting a ref —
-and we do not ship numbers we cannot reproduce.
+**200 branch operations per baseline, on-disk (real ref write, real fsync).** Reproduce with:
 
-So the current test is a **guard against catastrophic regression** (it asserts branching stays under
-100 ms and that nothing has started copying the database), and it is labelled as such.
+```
+cargo bench -p loom-branch --bench branching
+LOOM_SEED_BATCH=1000000 LOOM_BENCH_SIZES=1000000 cargo bench -p loom-branch --bench branching
+```
 
-**Still held, and now for a sharper reason.** Persistence has landed, and branching now writes a ref —
-so the figure would have changed anyway, exactly as predicted. The real measurement — **p95 and p99
-across 1K / 1M / 10M-record baselines**, because "independent of baseline size" is a claim one number
-cannot support — is a benchmark, not a test, and it goes in only when it can be reproduced.
+| baseline | p50 | p95 | p99 | db on disk |
+|---:|---:|---:|---:|---:|
+| 1 000 | 8.00 ms | 9.99 ms | 11.01 ms | <1 MB |
+| 10 000 | 5.99 ms | 6.95 ms | 7.33 ms | 4 MB |
+| 100 000 | 5.99 ms | 7.01 ms | 8.00 ms | 37 MB |
+| 1 000 000 | 5.91 ms | 7.39 ms | 8.01 ms | 370 MB |
 
-There is also a **known cost to be honest about**: the refs file is rewritten in full on every commit.
-That is O(branches), not O(1), and on a tenant with a million sleeping sessions it will matter. It does
-not affect correctness, it has not been optimised, and it is written down here rather than discovered
-in a benchmark later.
+**The claim AT-011 makes is not "6 ms". It is "the column does not move."** A thousand-fold increase in
+the size of the database does not change the cost of forking it, because forking does not read it — it
+writes a ref and takes a manifest id. If p95 climbed with the baseline, something would be copying the
+database, and the claim would be false. Across 1K → 1M, p95 moves from 9.99 ms to 7.39 ms; it does not
+climb.
+
+The absolute figure is ~6 ms, and it is **dominated by one fsync of the refs file** — not by anything to
+do with the size of the data. It is not 6 µs, and we are not going to call it instant.
+
+*(Figures from one developer machine. The thing that should reproduce on yours is the flatness of the
+column, not the millisecond.)*
+
+### 10 000 000 — **not measured, and not estimated**
+
+The 10M baseline **did not run.** It failed with `StorageFull`: the host had 3.5 GiB free, and a 10M-record
+LoomDB needs about **3.7 GB**.
+
+That is not a guess — it falls straight out of the table above. The footprint is linear at **~370 bytes
+per record** (37 MB at 100K, 370 MB at 1M), because pages are content-addressed and stored **at full page
+size**, and LoomDB writes **four records for every one you write** (the data, its derivation node, a
+latest-node pointer, a source-index entry).
+
+So: an environment limit, not a LoomDB limit, and it will run on a machine with ~10 GB free. But **the
+number is not in this table, because we did not take it.** We are not going to extrapolate a p99 from
+three other rows and print it as a measurement.
+
+---
+
+## Where we are weak — the write path, and we found it before a customer did
+
+Running the AT-011 sweep surfaced the **largest known problem in LoomDB**. It is not AT-011.
+
+**Write cost grows with the size of the database.** The same 100,000 records cost:
+
+| how it was written | time |
+|---|---|
+| ten commits of 10,000 | **36.9 s** |
+| one commit of 100,000 | **9.4 s** |
+
+Same data, same tree, same records. The only variable is the *number of commits* — so the cost of a
+commit is scaling with **the size of the tree**, not with the size of the batch.
+
+**The cause.** Three of LoomDB's four records per write have **content-addressed keys**, which is to say
+**random** ones. Once the tree holds more leaves than a commit holds records, a commit's random keys
+touch nearly *every leaf* — so nearly every leaf is dirtied, re-encoded, re-hashed and written. **Each
+commit rewrites a large fraction of the database.**
+
+This is the price of provenance, and provenance is the product. But the current price is too high, and
+this is the first thing to fix — probably by giving derivation nodes an append-ordered storage key and
+keeping the content-addressed id as an index, so that writes go to the tail of the tree instead of all
+over it.
+
+**It is not a correctness bug, and it does not affect AT-011** — which is exactly why the branch column
+above is flat and can be trusted.
+
+**Two real bugs were fixed while measuring:**
+- `is_full()` bincode-serialised the **entire leaf on every insert** — O(leaf) work per record, making a
+  leaf fill in O(leaf²). Now tracked incrementally, with one real encode at the fullness boundary.
+- The insert path **deep-cloned every node it descended through** — a fresh heap allocation for *every
+  key in the leaf*, in order to insert one record. Now moved, not cloned.
+
+Together those took the 10,000-record seed from **3.8 s to 0.9 s**. The remaining cost is the random-key
+problem above, which is architectural rather than a hot-loop mistake, and no amount of micro-optimising
+will remove it.
+
+**The known O(branches) cost is still here too:** the refs file is rewritten in full on every commit.
+It does not show up against baseline *size* — which is what AT-011 claims — but it will show up on a
+tenant with a great many branches. Not optimised, and not hidden.

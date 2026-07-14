@@ -110,11 +110,6 @@ impl Node {
             detail: e.to_string(),
         })
     }
-
-    /// Whether this node has outgrown its page.
-    fn is_full(&self, page_size: usize) -> Result<bool> {
-        Ok(self.encode()?.len() as f64 > page_size as f64 * FILL_FACTOR)
-    }
 }
 
 /// The working context for one transaction against the tree.
@@ -131,6 +126,22 @@ impl Node {
 pub struct Tree<'a> {
     store: &'a dyn PageStore,
     dirty: BTreeMap<LogicalPageNo, Node>,
+    /// Roughly how many bytes each node encodes to.
+    ///
+    /// # Why this exists
+    ///
+    /// `is_full` used to answer "does this node still fit in a page?" by bincode-serialising the
+    /// **entire node**, on **every insert**. That is O(node) work per record, which makes filling a
+    /// leaf O(leaf²) — and the AT-011 benchmark found it immediately: seeding 10,000 records took
+    /// 3.8 seconds, and the 1M and 10M baselines were simply unreachable. The numbers we could not
+    /// produce were the ones that mattered.
+    ///
+    /// So the size is tracked **incrementally**: an insert adds its own cost, a replace adds the
+    /// difference. The estimate deliberately **over-counts**, so it can only ever trigger the
+    /// fullness check *early*, never late — and when it does trigger, we pay for one real encode to
+    /// get the truth, and resync. A cheap estimate that could under-count would let a node quietly
+    /// grow past the page size, and the pager would reject the write at commit.
+    sizes: BTreeMap<LogicalPageNo, usize>,
     meta: Meta,
     meta_dirty: bool,
     page_size: usize,
@@ -156,6 +167,7 @@ impl<'a> Tree<'a> {
         Ok(Tree {
             store,
             dirty: BTreeMap::new(),
+            sizes: BTreeMap::new(),
             meta,
             meta_dirty: false,
             page_size,
@@ -178,7 +190,12 @@ impl<'a> Tree<'a> {
             return Ok(node.clone());
         }
         match self.store.read_head(page) {
-            Ok(bytes) => Node::decode(bytes.as_bytes(), page),
+            Ok(bytes) => {
+                // The encoded length, for free. This is the only place a node's true size is known
+                // without paying to serialise it.
+                self.sizes.insert(page, bytes.as_bytes().len());
+                Node::decode(bytes.as_bytes(), page)
+            }
             // A page the tree references but that has never been written is an empty leaf. This is
             // the state of a brand-new tree's root, and it is not an error.
             Err(substrate_pager::PagerError::PageNotFound { .. }) => {
@@ -188,8 +205,57 @@ impl<'a> Tree<'a> {
         }
     }
 
+    /// Take a node **by value**, without cloning it.
+    ///
+    /// `node()` clones, and a clone of a leaf is a fresh heap allocation for *every key in it* — a
+    /// thousand allocations to insert one record. The insert path does not need a copy; it needs the
+    /// node itself, and it always puts one back.
+    ///
+    /// The contract: **every path that takes a node must set one back**, including early returns.
+    /// Forgetting to would silently drop a whole page of records from the transaction.
+    fn take_node(&mut self, page: LogicalPageNo) -> Result<Node> {
+        if let Some(node) = self.dirty.remove(&page) {
+            return Ok(node);
+        }
+        self.node(page)
+    }
+
     fn set(&mut self, page: LogicalPageNo, node: Node) {
+        self.sizes.remove(&page);
         self.dirty.insert(page, node);
+    }
+
+    /// Set a node whose encoded size we already know.
+    fn set_sized(&mut self, page: LogicalPageNo, node: Node, size: usize) {
+        self.sizes.insert(page, size);
+        self.dirty.insert(page, node);
+    }
+
+    /// The known-or-computed encoded size of a node.
+    fn size_of(&mut self, page: LogicalPageNo, node: &Node) -> Result<usize> {
+        match self.sizes.get(&page) {
+            Some(size) => Ok(*size),
+            None => {
+                let size = node.encode()?.len();
+                self.sizes.insert(page, size);
+                Ok(size)
+            }
+        }
+    }
+
+    /// Has this node outgrown its page?
+    ///
+    /// Consults the running estimate first. Only when the estimate says "possibly" do we pay for a
+    /// real encode — and then we resync the estimate to the truth. Because the estimate over-counts,
+    /// this can fire early and be told no; it cannot fire late.
+    fn overflowed(&self, node: &Node, est: &mut usize) -> Result<bool> {
+        let limit = (self.page_size as f64 * FILL_FACTOR) as usize;
+        if *est <= limit {
+            return Ok(false);
+        }
+        let real = node.encode()?.len();
+        *est = real;
+        Ok(real > limit)
     }
 
     fn alloc(&mut self) -> LogicalPageNo {
@@ -245,11 +311,27 @@ impl<'a> Tree<'a> {
         key: Key,
         record: Record,
     ) -> Result<Option<(Key, LogicalPageNo)>> {
-        match self.node(page)? {
+        match self.take_node(page)? {
             Node::Leaf { mut entries } => {
+                let mut est = {
+                    let node = Node::Leaf { entries };
+                    let size = self.size_of(page, &node)?;
+                    let Node::Leaf { entries: e } = node else {
+                        unreachable!("just constructed a leaf")
+                    };
+                    entries = e;
+                    size
+                };
+
                 match entries.binary_search_by(|(k, _)| k.cmp(&key)) {
-                    Ok(i) => entries[i].1 = record, // replace; the count does not move
+                    Ok(i) => {
+                        // A replace: the node grows by the difference, which may be negative.
+                        est = est.saturating_sub(entry_cost(&entries[i].0, &entries[i].1)?);
+                        est += entry_cost(&key, &record)?;
+                        entries[i].1 = record; // replace; the count does not move
+                    }
                     Err(i) => {
+                        est += entry_cost(&key, &record)?;
                         entries.insert(i, (key, record));
                         self.meta.count += 1;
                         self.meta_dirty = true;
@@ -257,8 +339,8 @@ impl<'a> Tree<'a> {
                 }
 
                 let node = Node::Leaf { entries };
-                if !node.is_full(self.page_size)? {
-                    self.set(page, node);
+                if !self.overflowed(&node, &mut est)? {
+                    self.set_sized(page, node, est);
                     return Ok(None);
                 }
 
@@ -282,13 +364,16 @@ impl<'a> Tree<'a> {
                 };
 
                 let right_page = self.alloc();
-                self.set(page, Node::Leaf { entries });
-                self.set(
-                    right_page,
-                    Node::Leaf {
-                        entries: right_entries,
-                    },
-                );
+                let left = Node::Leaf { entries };
+                let right = Node::Leaf {
+                    entries: right_entries,
+                };
+                // One real encode per half, once per split — not once per insert. This is the whole
+                // point of the exercise.
+                let left_size = left.encode()?.len();
+                let right_size = right.encode()?.len();
+                self.set_sized(page, left, left_size);
+                self.set_sized(right_page, right, right_size);
                 Ok(Some((separator, right_page)))
             }
 
@@ -299,7 +384,13 @@ impl<'a> Tree<'a> {
                 let idx = child_index(&keys, &key);
                 let child = children[idx];
 
-                let Some((separator, right)) = self.insert_into(child, key, record)? else {
+                let split = self.insert_into(child, key, record)?;
+
+                let Some((separator, right)) = split else {
+                    // The child absorbed it. **Put the node back** — `take_node` removed it from the
+                    // dirty map, and an early return that does not restore it drops a whole page of
+                    // records from the transaction.
+                    self.dirty.insert(page, Node::Internal { keys, children });
                     return Ok(None);
                 };
 
@@ -307,8 +398,9 @@ impl<'a> Tree<'a> {
                 children.insert(idx + 1, right);
 
                 let node = Node::Internal { keys, children };
-                if !node.is_full(self.page_size)? {
-                    self.set(page, node);
+                let mut est = node.encode()?.len();
+                if !self.overflowed(&node, &mut est)? {
+                    self.set_sized(page, node, est);
                     return Ok(None);
                 }
 
@@ -430,6 +522,24 @@ impl<'a> Tree<'a> {
         }
         Ok(())
     }
+}
+
+/// What one leaf entry costs, in encoded bytes — **over-counted on purpose**.
+///
+/// The estimate that drives the fullness check may fire early and be corrected by a real encode. It
+/// must never fire *late*, because a node that grows past the page size is rejected by the pager at
+/// commit, and the caller sees a `PageTooLarge` for a write that looked fine. So this rounds up: the
+/// bincode length prefixes are 8 bytes each, and `SLACK` covers the enum tags and any discrepancy
+/// between `serialized_size` and the real thing.
+const SLACK: usize = 24;
+
+fn entry_cost(key: &[u8], record: &Record) -> Result<usize> {
+    let record_bytes = bincode::serialized_size(record).map_err(|source| LoomError::Codec {
+        op: "size",
+        what: "record",
+        source,
+    })? as usize;
+    Ok(key.len() + record_bytes + SLACK)
 }
 
 /// Which child of an internal node a key belongs under.
