@@ -74,3 +74,17 @@ jobs:
         env: { ISOLATION_CASES: "1000" }
       - run: cargo test -p loom-policy --release --test oracle
         env: { POLICY_CASES: "4000" }
+
+  # AT-045 — crash at every byte boundary, under a LoomDB-shaped workload, with one CrashVfs under both
+  # the pager and the ref store. The exhaustive every-byte sweep (AT045_STRIDE=1); the in-suite default
+  # samples ~200 points. This is the LoomDB-granularity crash re-assertion — substrate's 50,000-cycle
+  # suite covers the engine; this covers the second durable object (the ref write, invariant I-8).
+  crash:
+    name: AT-045 crash sweep (every byte)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo test -p loom-branch --release --test crash
+        env: { AT045_STRIDE: "1" }

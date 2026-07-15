@@ -111,11 +111,20 @@ AT-007 (the gateway refuses a no-evidence claim, naming the missing evidence).
 
 ---
 
-## Deferred to v0.2 — one, named, with the reason in writing
+## AT-045 — closed in v0.2. The one asterisk is gone.
 
-| ID | Deferred to | Why |
-|---|---|---|
-| **AT-045** — crash at any byte, LoomDB-shaped | **v0.2** | Substrate's crash suite drives **50,000 randomized crash-and-recover cycles** at every byte boundary (doc 02 §10), and LoomDB's data commits go through that exact path. What is **not** yet done is re-driving that harness with *LoomDB-shaped* workloads specifically — the durable **ref write** is a second object with its own ordering (invariant I-8), and it deserves its own crash injection rather than inheriting substrate's confidence. This is the single acceptance test not green at v0.1. It is a test-harness build, not a missing capability: the ordering it would check (manifest durable before ref) is already enforced and unit-tested; what is missing is the 50,000-cycle proof of it under LoomDB workloads. Tagged so it is tracked, not assumed. |
+**AT-045 — crash at any byte, LoomDB-shaped.** GREEN. `at_045_crash_at_any_byte_recovers_to_a_prefix`
+puts **one `CrashVfs` under both the pager and the ref store** and sweeps the byte budget from zero past
+a full loom workload (observe · claim · branch · claims · merge), crashing the write path at **every byte
+boundary**. At each crash point the rebooted database must **reopen** (no ref pointing at a non-durable
+manifest — invariant I-8) and every **acknowledged** write (one whose call returned `Ok`, i.e. after its
+ref fsync'd) must still be present and decode cleanly — nothing acknowledged is lost, nothing torn. The
+default run samples ~200 crash points in ~2 s; `AT045_STRIDE=1` runs the exhaustive every-byte sweep
+(~5 min), and CI runs it in its own job.
+
+This is what makes the v0.1 board's credibility complete rather than asterisked: the ref-write ordering
+was enforced and unit-tested before, and it is now proven under crash injection at LoomDB granularity,
+not merely inherited from substrate's engine-level suite.
 
 ---
 
