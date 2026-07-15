@@ -47,6 +47,13 @@ pub trait Connector: Send + Sync {
         false
     }
 
+    /// A registered compensating action that could undo (or make right) this action's effect, if one
+    /// exists. `None` means nothing here can undo it — which taint reports honestly rather than
+    /// inventing a fix (AT-022). `"reinstate_account"` for a suspension, say.
+    fn compensating_action(&self) -> Option<String> {
+        None
+    }
+
     /// Do the thing. `idempotency_key` is stable across retries of the *same* logical action, so a
     /// connector that supports it can deduplicate on its own side too.
     fn execute(&self, target: &str, idempotency_key: &str) -> ConnectorOutcome;

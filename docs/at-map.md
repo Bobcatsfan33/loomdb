@@ -7,7 +7,7 @@
 > A capability is not done when it works. It is done when the test that would have caught it failing
 > is green. Anything else on this page is not a claim, it is a plan.
 
-Status as of **L1 + persistence + L2 (provenance, taint, staleness, signatures) + L3 (memory & retrieval) complete**.
+Status as of **L1 + persistence + L2 + L3 (memory & retrieval) + L3.5 (policy, influence, action gateway) complete**.
 
 > The rules that must not be "optimized" away later are in [invariants.md](./invariants.md). Each one
 > is there because breaking it produced a bug that **did not fail loudly**.
@@ -40,6 +40,19 @@ Status as of **L1 + persistence + L2 (provenance, taint, staleness, signatures) 
 | **AT-042** | **Adversarial budgets.** A well-formed `PackedContext` under any budget × any candidate count — 50 tokens vs 100,000 candidates, unbounded vs 3, zero vs 1 — with no panic, no item truncated mid-evidence, no uncited item. A 2,000-case property test proves the invariant, not two examples. | `at_042_a_tiny_budget_against_a_huge_candidate_set`, `..._a_huge_budget_against_a_tiny_candidate_set`, `..._a_zero_budget_is_empty_not_a_crash`, `pack_is_always_well_formed` |
 | **AT-043** | **Stale claims are down-ranked and marked.** A stale claim that matches *better* than a fresh one still loses to it (penalty applied to the whole score), and arrives in the context flagged `stale` so the model knows not to lean on it — penalised, never silently dropped or silently trusted. | `at_043_a_stale_claim_is_penalised_and_flagged` |
 | **AT-044** | **Forgetting propagates.** Forget a source and every governed representation derived from it (index entries carrying the embedding/text/summary) is removed and every dependent claim is `Invalidated` — in one commit, via the same taint walk L2 uses. The record stays readable; only the derived representation goes. The completion report accounts for all of it and **leads with what it cannot undo** (empty until L3.5, honestly). | `at_044_forgetting_a_source_removes_everything_derived_from_it`, `at_044_the_report_is_shaped_to_lead_with_the_irreversible` |
+| **AT-022** | **Taint names the action it cannot undo — first.** `taint_with_actions` fills the `RecallPlan`'s IRREVERSIBLE section: the account already suspended, its receipt, and either a registered compensating action or an explicit human escalation. Listed ahead of the reversible writes, and the report leads with it. When there is no compensation, the plan says so rather than inventing one. **This is demo step 10.** | `at_022_taint_lists_the_suspended_account_first_with_its_receipt`, `at_022_no_compensation_is_stated_not_faked` |
+| **AT-027** | **Agents cannot act — structurally.** `AgentStore` has `propose` and no `execute`. A `compile_fail` doctest (run in CI) proves `agent.execute(..)` does not compile; if someone adds the method, the build goes red. Proposing calls no connector. | `at_027_proposing_does_nothing_by_itself` + the `compile_fail` doctest on `AgentStore` |
+| **AT-028** | **Idempotency.** 100 concurrent retries of one idempotency key → the connector is invoked **once**; every caller gets the same `ActionId`. | `at_028_idempotent_under_concurrent_retries` |
+| **AT-029** | **`Indeterminate` is honest.** A connector timeout is `Indeterminate` — not a guessed success or failure — and blocks nothing else. | `at_029_a_timeout_is_indeterminate` |
+| **AT-030** | **Stale evidence cannot authorize.** A proposal citing a `Stale` claim is refused, and nothing executes. | `at_030_stale_evidence_cannot_authorize` |
+| **AT-031** | **Simulation containment.** A proposal from a simulation branch may not reach a production connector; the branch context travels with the proposal to the gateway. | `at_031_simulation_cannot_touch_production` |
+| **AT-032** | **No terminal success without a receipt.** A connector that reports success but returns no receipt does **not** reach `Succeeded` — it is `Indeterminate`. `is_success()` is true only for `Succeeded{receipt}`. | `at_032_success_carries_a_receipt`, `at_032_success_without_a_receipt_is_not_terminal_success` |
+| **AT-033** | **The kill switch** disables new actions (global + per-tenant) while reads, writes, and audit stay fully available — the refused action is itself recorded and auditable. | `at_033_kill_switch_disables_actions` |
+| **AT-034** | **The injection is refused.** `Untrusted`-labeled evidence may not authorize `identity.suspend_account`, even at 0.99 confidence; a `VerifiedSystem`-backed equivalent is allowed, proving it is the *label* being refused. **Demo step 8.** | `at_034_untrusted_evidence_cannot_authorize_a_suspension` |
+| **AT-035** | **Labels propagate through derivations.** A claim derived from an `Untrusted` scrape is itself `Untrusted` — the effective label is the most-restrictive of everything read, carried through the read-set, cheap and transitive. | `at_034_...` (asserts the derived claim's label) |
+| **AT-036** | **Influence is filtered *before* packing.** `retrieve_filtered` drops a restricted candidate before scoring, so it never reaches the packer or the window. Scrubbing the model's output afterward is the architecture this forbids, and this is not it. | `at_036_restricted_data_is_filtered_before_packing` |
+| **AT-037** | **Policy fails closed.** No applicable rule → deny. Verified as an invariant by the policy oracle (engine allows ⇒ some allow truly applied), 10,000 cases. | `no_applicable_rule_always_denies`, `engine_agrees_with_the_truth_table` (policy oracle) |
+| **AT-038** | **Decisions are versioned and recorded.** Every `PolicyDecision` carries the policy version, the request evaluated, and a one-line rationale — "what allowed/forbade this" has an exact answer. | `a_decision_records_the_version_and_request` + carried on every gateway `ActionRecord` |
 
 **AT-019 — token scope is inescapable.** Green **for the surfaces that exist today**: `read`, `write`,
 `scan`, `rewind`, `branch`, `merge` (both sides — a merge reads the source and writes the target, and
@@ -65,14 +78,17 @@ Two honest notes on its limits:
 - **Key distribution is not solved here.** LoomDB verifies against keys you hand it. Where those keys
   come from, how they rotate, and how a compromised one is revoked is **not built** (see L3.5).
 
-**AT-022 — SHAPED, and deliberately empty.** The `RecallPlan`'s `irreversible` section is **built and
-wired**: it is the first field of the struct and the first section of the report, always, and the report
-already says out loud that *rewinding a branch reverts writes — it does not un-suspend an account*. A
-test asserts the byte offset of `"CANNOT BE UNDONE"` precedes `"CAN be reverted"`, so it cannot be
-quietly reordered.
+**AT-022 — FILLED in L3.5, and now green.** The `RecallPlan`'s `irreversible` section was shaped in L2
+(first field, first rendered, `"CANNOT BE UNDONE"` before `"CAN be reverted"`, guarded by byte offset).
+L3.5 pours real content into it: `Provenance::taint_with_actions(source, &executed)` matches every
+executed action against the contaminated set and lists the ones downstream — the suspended account, its
+receipt, and either the connector's registered compensating action or an explicit escalation to a human.
+When there is no compensation, it says so rather than inventing one. This is demo step 10, and it is
+green (`at_022_taint_lists_the_suspended_account_first_with_its_receipt`).
 
-**It stays empty until the action gateway lands in L3.5**, because there is nothing irreversible in the
-system yet to put in it. The shape is honest. The content is not there. **Not claimed as green.**
+The dependency direction stayed clean: taint (`loom-provenance`) and the gateway (`loom-action`) are
+siblings and neither depends on the other. The fact taint needs — `loom_core::ExecutedAction` — is a
+plain value both can name; the gateway produces it, taint consumes it.
 
 ---
 
@@ -98,9 +114,9 @@ need does not exist yet.
 | **AT-005** — correction preserves history | **L2** | Needs the correction path: closing a `known` interval and opening a new one. Not built. |
 | **AT-007** — unsupported claim cannot act | **storage half green; action half L3.5** | `Claim::is_action_eligible()` and `ineligibility_reason()` exist and are unit-tested, and the message tells a model what to *do*. But **there is no action path to refuse**, so the half that matters is untested. |
 | **AT-009** — as-of is reproducible | **L2/L3** | Same reason as AT-004: no as-of API. |
-| **AT-016** — merge re-evaluates policy | **L3.5** | There is no policy engine. The merge already *replays as new writes on the target* rather than transplanting pages, which is the structural precondition — the hook exists, the policy does not. |
+| **AT-016** — merge re-evaluates policy | **L4** | The policy engine now exists (L3.5), and the merge already *replays as new writes on the target* rather than transplanting pages — both preconditions are met. What remains is wiring the merge path to call the policy at merge time and refuse a write the current policy forbids. A focused follow-on, tracked. |
 | **AT-022** — taint names what it *cannot* undo | **L3.5** | The **shape is built and the report already leads with it** — every plan opens with the irreversible section and says out loud that rewinding a branch does not un-suspend an account. But the section stays **empty** until the action gateway exists to put anything in it. The scaffolding is honest; the content is not there yet. |
-| **AT-027 – AT-039** | **L3.5** | Action gateway and influence policy. |
+| **AT-039** — cross-tenant identifiers | **L3.5 remainder / L4** | Not found *without revealing existence* — a different error for "exists but forbidden" is an oracle. LoomDB is one-tenant-per-store today (the tenant IS the substrate pool, so cross-tenant reads are structurally impossible — a different pool, different pages). The *distinguishable-error* test needs the multi-tenant query surface that lands with the MCP server in L4. Tracked. |
 | **AT-045** — crash at any byte | **later** | Inherited from substrate (50,000 crash cycles there), but **not yet re-driven with LoomDB-shaped workloads**. The ref write is a second durable object with its own ordering, and it deserves its own crash injection. Named so it is tracked. |
 
 ---

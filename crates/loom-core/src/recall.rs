@@ -353,3 +353,30 @@ mod tests {
         assert!(plan.to_string().contains("DRY RUN"));
     }
 }
+
+/// **An action that already executed** — the input taint needs to fill a plan's irreversible section.
+///
+/// Defined here, in `loom-core`, on purpose: taint lives in `loom-provenance` and the action gateway
+/// in `loom-action`, and neither may depend on the other (they are siblings). So the fact taint needs
+/// to know — "this action happened, it was justified by these records, here is its receipt and its
+/// compensating action" — is a plain value both can name. The gateway produces it; taint consumes it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ExecutedAction {
+    /// The action's id.
+    pub action_id: String,
+    /// What it was. `"identity.suspend_account"`.
+    pub action_type: String,
+    /// What it acted on.
+    pub target: String,
+    /// Who asked for it.
+    pub actor: ActorId,
+    /// The **record keys** of the claims that justified it. Taint checks these against the contaminated
+    /// set: if any justifying claim is downstream of the tainted source, the action is downstream too.
+    pub justified_by: Vec<Vec<u8>>,
+    /// The proof it happened. An irreversible action without a receipt is one we cannot even point to,
+    /// which is its own kind of problem — but it is still irreversible, so it is still listed.
+    pub receipt: Option<String>,
+    /// A registered compensating action, if the connector offered one. `None` means **nothing can undo
+    /// this from here** — a human has to decide, and the plan says so rather than inventing a fix.
+    pub compensating_action: Option<String>,
+}

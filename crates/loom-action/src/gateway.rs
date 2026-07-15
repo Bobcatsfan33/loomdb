@@ -33,6 +33,9 @@ pub struct Proposal {
     /// The claims justifying it. Each must be action-eligible (cites evidence, not stale) or the whole
     /// proposal is refused (AT-007, AT-030).
     pub evidence: Vec<Claim>,
+    /// The **record keys** of those justifying claims, so a later `taint` can tell whether this action
+    /// was justified by something it just found to be poisoned (AT-022). Parallel to `evidence`.
+    pub evidence_keys: Vec<Vec<u8>>,
     /// The effective trust label of that evidence — the most restrictive over the cited claims. The
     /// policy check reads this (AT-034): `Untrusted` evidence cannot authorize a destructive action.
     pub evidence_label: TrustClass,
@@ -75,12 +78,14 @@ impl AgentStore {
 
     /// **Propose an action.** Returns inert data. Nothing happens until a gateway — which the agent
     /// does not hold — executes it.
+    #[allow(clippy::too_many_arguments)]
     pub fn propose(
         &self,
         action_type: impl Into<String>,
         target: impl Into<String>,
         idempotency_key: impl Into<String>,
         evidence: Vec<Claim>,
+        evidence_keys: Vec<Vec<u8>>,
         evidence_label: TrustClass,
     ) -> Proposal {
         Proposal {
@@ -91,6 +96,7 @@ impl AgentStore {
             branch: self.branch.clone(),
             simulation: self.simulation,
             evidence,
+            evidence_keys,
             evidence_label,
         }
     }
@@ -219,6 +225,8 @@ impl ActionGateway {
             actor: proposal.actor.clone(),
             branch: proposal.branch.clone(),
             policy_version: String::new(),
+            justified_by: proposal.evidence_keys.clone(),
+            compensating_action: None,
             status: ActionStatus::Refused { reason },
         };
 
@@ -269,6 +277,8 @@ impl ActionGateway {
                 actor: proposal.actor.clone(),
                 branch: proposal.branch.clone(),
                 policy_version,
+                justified_by: proposal.evidence_keys.clone(),
+                compensating_action: None,
                 status: ActionStatus::Refused {
                     reason: format!(
                         "policy refused this action: {}. This is the injection boundary — {:?}-labeled \
@@ -283,11 +293,13 @@ impl ActionGateway {
         //    connector. There is no production effect from a what-if.
         let connector = match self.connectors.get(&proposal.action_type) {
             Some(c) => c,
-            None => return refuse(format!(
+            None => {
+                return refuse(format!(
                 "no connector is registered for action '{}'. Register one, or this action cannot \
                      be performed.",
                 proposal.action_type
-            )),
+            ))
+            }
         };
         if proposal.simulation && !connector.is_simulated() {
             return refuse(format!(
@@ -298,7 +310,9 @@ impl ActionGateway {
             ));
         }
 
-        // 5. Execute, and translate the outcome honestly.
+        // 5. Execute, and translate the outcome honestly. Capture the connector's compensating action
+        //    now, so a later taint can offer it (AT-022) — or, if there is none, say so honestly.
+        let compensating_action = connector.compensating_action();
         let status = match connector.execute(&proposal.target, &proposal.idempotency_key) {
             ConnectorOutcome::Succeeded { receipt } => ActionStatus::Succeeded { receipt },
             // AT-032: success without a receipt is not terminal success. We do not know it happened in
@@ -321,6 +335,8 @@ impl ActionGateway {
             actor: proposal.actor.clone(),
             branch: proposal.branch.clone(),
             policy_version,
+            justified_by: proposal.evidence_keys.clone(),
+            compensating_action,
             status,
         }
     }

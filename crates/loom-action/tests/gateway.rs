@@ -98,6 +98,7 @@ fn at_032_success_carries_a_receipt() {
         "user-1",
         "key-1",
         vec![good_claim()],
+        vec![b"claim/x".to_vec()],
         TrustClass::VerifiedSystem,
     );
     let rec = gw.execute(&p);
@@ -116,6 +117,7 @@ fn at_032_success_without_a_receipt_is_not_terminal_success() {
         "user-1",
         "key-1",
         vec![good_claim()],
+        vec![b"claim/x".to_vec()],
         TrustClass::VerifiedSystem,
     ));
     assert!(!rec.status.is_success(), "no receipt => not Succeeded");
@@ -137,6 +139,7 @@ fn at_029_a_timeout_is_indeterminate() {
         "u",
         "k",
         vec![good_claim()],
+        vec![b"claim/x".to_vec()],
         TrustClass::VerifiedSystem,
     ));
     assert!(matches!(rec.status, ActionStatus::Indeterminate { .. }));
@@ -163,6 +166,7 @@ fn at_028_idempotent_under_concurrent_retries() {
                 "user-1",
                 "same-key", // the SAME idempotency key across all 100
                 vec![good_claim()],
+                vec![b"claim/x".to_vec()],
                 TrustClass::VerifiedSystem,
             ))
         }));
@@ -200,6 +204,7 @@ fn at_030_stale_evidence_cannot_authorize() {
         "u",
         "k",
         vec![stale],
+        vec![b"claim/x".to_vec()],
         TrustClass::VerifiedSystem,
     ));
     assert!(
@@ -235,6 +240,7 @@ fn at_033_kill_switch_disables_actions() {
         "u",
         "k",
         vec![good_claim()],
+        vec![b"claim/x".to_vec()],
         TrustClass::VerifiedSystem,
     ));
     assert!(matches!(rec.status, ActionStatus::Refused { .. }));
@@ -270,6 +276,7 @@ fn at_031_simulation_cannot_touch_production() {
         "u",
         "k",
         vec![good_claim()],
+        vec![b"claim/x".to_vec()],
         TrustClass::VerifiedSystem,
     ));
     assert!(
@@ -306,6 +313,7 @@ fn at_027_proposing_does_nothing_by_itself() {
         "user-1",
         "key-1",
         vec![good_claim()],
+        vec![b"claim/x".to_vec()],
         TrustClass::VerifiedSystem,
     );
 

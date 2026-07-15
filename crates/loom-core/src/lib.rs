@@ -51,7 +51,7 @@ pub use provenance::{
     source_index_key, source_index_prefix, DerivationNode, NodeId, PROV_PREFIX,
     RESERVED_LATEST_PREFIX, SRC_PREFIX,
 };
-pub use recall::{Compensation, IrreversibleItem, RecallPlan, ReversibleItem};
+pub use recall::{Compensation, ExecutedAction, IrreversibleItem, RecallPlan, ReversibleItem};
 pub use time::{Interval, Timestamp};
 pub use value::{
     Claim, ClaimStatus, Confidence, Method, Observation, Record, SourceRef, TrustClass, Value,

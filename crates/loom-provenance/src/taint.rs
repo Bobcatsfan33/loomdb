@@ -24,8 +24,8 @@
 use loom_branch::{CapabilityToken, Loom, Tree};
 use loom_core::{
     node_from_index_value, source_index_prefix, BranchId, ClaimStatus, Compensation,
-    DerivationNode, LoomError, NodeId, RecallPlan, Record, Result, ReversibleItem, SourceRef,
-    Value,
+    DerivationNode, IrreversibleItem, LoomError, NodeId, RecallPlan, Record, Result,
+    ReversibleItem, SourceRef, Value,
 };
 use std::collections::{BTreeMap, BTreeSet};
 use substrate_pager::PageStore;
@@ -112,9 +112,86 @@ impl<'a> Provenance<'a> {
         Ok(seeds)
     }
 
+    /// **Taint, and name the actions it cannot undo (AT-022).**
+    ///
+    /// The same walk as [`Provenance::taint`], plus the second section of a `RecallPlan`: for every
+    /// executed action justified by a claim downstream of the source, an [`IrreversibleItem`] — the
+    /// account we already suspended, its receipt, and either a registered compensating action or an
+    /// explicit escalation to a human. **Listed first.**
+    ///
+    /// This is demo step 10, and it is the difference between an audit and a liability. A plan that
+    /// shows the reverted writes and silently omits the suspended account tells an operator the
+    /// contamination is contained when a real person is still locked out of their account. The
+    /// irreversible section is populated here, ordered ahead of the reversible one, and the report
+    /// leads with it whether or not anyone remembered to look.
+    ///
+    /// Still a **dry run**. Nothing is mutated. Executing a compensation is a separate, token-gated call.
+    pub fn taint_with_actions(
+        &self,
+        source: &SourceRef,
+        actions: &[loom_core::ExecutedAction],
+    ) -> Result<(RecallPlan, TaintStats)> {
+        let (mut plan, stats) = self.taint(source)?;
+
+        // The full contaminated set, by key, across every branch — the same walk, unioned.
+        let mut contaminated: BTreeSet<Vec<u8>> = BTreeSet::new();
+        for branch_name in self.db.branch_names() {
+            let branch = BranchId::new(branch_name.as_str());
+            contaminated.extend(self.contaminated_keys_on(&branch, source)?);
+        }
+
+        for action in actions {
+            // An action is downstream of the source iff any claim that justified it is contaminated.
+            let downstream = action.justified_by.iter().any(|k| contaminated.contains(k));
+            if !downstream {
+                continue;
+            }
+
+            let escalation = match &action.compensating_action {
+                Some(comp) => format!(
+                    "run the registered compensating action ({comp}) for {} on {}, then confirm with \
+                     the affected party.",
+                    action.action_type, action.target
+                ),
+                None => format!(
+                    "there is NO registered compensating action for {} on {}. A human must decide how \
+                     to make this right — rewinding the branch will not un-{} it.",
+                    action.action_type,
+                    action.target,
+                    action.action_type.rsplit('.').next().unwrap_or(&action.action_type),
+                ),
+            };
+
+            plan.irreversible.push(IrreversibleItem {
+                action_id: action.action_id.clone(),
+                action_type: action.action_type.clone(),
+                target: action.target.clone(),
+                actor: action.actor.clone(),
+                receipt: action.receipt.clone(),
+                justified_by: Vec::new(),
+                derived_via: Vec::new(),
+                compensating_action: action.compensating_action.clone(),
+                escalation,
+            });
+        }
+
+        // Deterministic order, like the reversible section — an incident responder diffs these.
+        plan.irreversible.sort_by(|a, b| {
+            (&a.action_type, &a.target, &a.action_id).cmp(&(
+                &b.action_type,
+                &b.target,
+                &b.action_id,
+            ))
+        });
+
+        Ok((plan, stats))
+    }
+
     /// **Everything downstream of a source, across every branch of the tenant.**
     ///
-    /// Returns a dry-run [`RecallPlan`]. **Nothing is mutated.**
+    /// Returns a dry-run [`RecallPlan`] with the **reversible** section filled. For the irreversible
+    /// section — the actions that already happened — use [`Provenance::taint_with_actions`].
+    /// **Nothing is mutated.**
     pub fn taint(&self, source: &SourceRef) -> Result<(RecallPlan, TaintStats)> {
         let mut stats = TaintStats::default();
         let mut plan = RecallPlan {

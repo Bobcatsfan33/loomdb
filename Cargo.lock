@@ -906,8 +906,10 @@ name = "loom-action"
 version = "0.1.0"
 dependencies = [
  "blake3",
+ "loom-branch",
  "loom-core",
  "loom-policy",
+ "loom-provenance",
 ]
 
 [[package]]

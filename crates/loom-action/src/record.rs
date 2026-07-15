@@ -74,6 +74,12 @@ pub struct ActionRecord {
     pub branch: String,
     /// The policy version that decided.
     pub policy_version: String,
+    /// The record keys of the claims that justified it — so taint can match it against a contaminated
+    /// set (AT-022).
+    pub justified_by: Vec<Vec<u8>>,
+    /// The connector's registered compensating action, if any. Captured at execution time so a later
+    /// taint can offer it — or, when `None`, say honestly that nothing here can undo the effect.
+    pub compensating_action: Option<String>,
     /// Where it ended up.
     pub status: ActionStatus,
 }
@@ -86,6 +92,24 @@ impl ActionRecord {
             ActionStatus::Succeeded { receipt } => Some(receipt),
             _ => None,
         }
+    }
+
+    /// Convert to the [`loom_core::ExecutedAction`] taint consumes — but **only for actions that
+    /// actually happened**. A refused or failed action did not touch the world, so it does not belong
+    /// in an irreversible section. Returns `None` for anything but terminal success.
+    pub fn to_executed(&self) -> Option<loom_core::ExecutedAction> {
+        if !self.status.is_success() {
+            return None;
+        }
+        Some(loom_core::ExecutedAction {
+            action_id: self.id.0.clone(),
+            action_type: self.action_type.clone(),
+            target: self.target.clone(),
+            actor: self.actor.clone(),
+            justified_by: self.justified_by.clone(),
+            receipt: self.receipt().map(|s| s.to_string()),
+            compensating_action: self.compensating_action.clone(),
+        })
     }
 }
 
