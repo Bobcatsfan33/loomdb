@@ -325,3 +325,37 @@ fn at_027_proposing_does_nothing_by_itself() {
         "AT-027: proposing must have NO external effect — only the gateway acts"
     );
 }
+
+/// **AT-007 — an unsupported claim (no evidence) cannot authorize an action.**
+#[test]
+fn at_007_a_claim_with_no_evidence_cannot_act() {
+    let calls = Arc::new(AtomicUsize::new(0));
+    let gw = gateway(
+        ConnectorOutcome::Succeeded {
+            receipt: "R".into(),
+        },
+        calls.clone(),
+    );
+
+    let mut unsupported = good_claim();
+    unsupported.evidence.clear(); // asserted, but cites nothing
+
+    let rec = gw.execute(&agent().propose(
+        "identity.suspend_account",
+        "u",
+        "k",
+        vec![unsupported],
+        vec![b"claim/x".to_vec()],
+        TrustClass::VerifiedSystem,
+    ));
+    match rec.status {
+        ActionStatus::Refused { reason } => {
+            assert!(
+                reason.contains("evidence") || reason.contains("unsupported"),
+                "AT-007: the refusal must NAME the missing evidence: {reason}"
+            );
+        }
+        other => panic!("AT-007: an unsupported claim must be refused, got {other:?}"),
+    }
+    assert_eq!(calls.load(Ordering::SeqCst), 0, "and nothing executed");
+}

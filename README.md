@@ -6,7 +6,7 @@
 
 [![CI](https://github.com/Bobcatsfan33/loomdb/actions/workflows/ci.yml/badge.svg)](https://github.com/Bobcatsfan33/loomdb/actions/workflows/ci.yml)
 [![License: Apache 2.0](https://img.shields.io/badge/license-Apache--2.0-blue.svg)](LICENSE)
-[![Built on substrate](https://img.shields.io/badge/engine-substrate%20v1.1-purple.svg)](https://github.com/Bobcatsfan33/substrate)
+[![Built on substrate](https://img.shields.io/badge/engine-substrate%20v1.2.1-purple.svg)](https://github.com/Bobcatsfan33/substrate)
 
 </div>
 
@@ -65,17 +65,53 @@ This was written fast, largely by an AI. That should worry you. Enthusiasm is no
 
 **And it caught a broken test.** The prefilter test accused the engine of dropping records; the engine was right and the *test* was wrong (`n as i8` wrapped at 256 and wrote the seed value back). We would rather find that here.
 
-## Status
+## Status — **loomdb-v0.1**
 
-**L1 complete** — sessions-as-branches, capability tokens, the record-level merge engine, and the B+tree record store. 59 tests, clippy clean, model oracle green over 24,000 randomized sessions.
+L1 → L4 complete: sessions-as-branches, the record-level merge engine, durable refs + commit DAG,
+provenance and taint-and-recall, memory and retrieval, the policy/influence/action layer, bitemporal
+as-of queries (AQL v0), and **loomd — the MCP server**. **148 tests, clippy `-D warnings` clean, four
+model oracles** (branch/merge, taint, retrieval isolation, policy) holding under fuzzing.
 
-**Known gap, stated plainly:** branch refs and the commit DAG are held in memory. The *data* is durable — every commit is a crash-safe substrate manifest — but a restart loses your branch *names*. Persisting them is a prerequisite for L2. Written down here rather than discovered later.
+**The Q3 demo (docs/04 §3.1) runs verbatim in CI** — no LLM, a scripted agent drives the MCP surface —
+and two moments are asserted as the bar: the influence policy **refuses the injected "suspend every
+account"**, and `taint(S)` returns a two-section plan that **names the account it already suspended, with
+its receipt, first.** The scoreboard is in [`docs/at-map.md`](docs/at-map.md): **AT-001–047 green, with
+exactly one exception (AT-045) deferred to v0.2 with a reason in writing.**
 
-Next: **L2** provenance and taint-and-recall · **L3** memory and retrieval · **L3.5** the action gateway and influence policy · **L4** the MCP server.
+## The action layer — the point, and now real
 
-## The action layer is coming, and it's the point
+Taint-and-recall reverts *writes*. It cannot un-suspend an account. So the `RecallPlan` has two sections,
+and the **irreversible** one is listed first: the actions already taken, their receipts, and either a
+registered compensating action or an explicit escalation to a human. A report that shows six reverted
+writes and quietly omits the account it suspended is not an audit tool — it's a liability. Agents
+**cannot act** — structurally: the agent handle has a `propose` method and no `execute`, enforced by a
+`compile_fail` test the CI runs. The gateway acts, after policy, evidence, and a human approval.
 
-Taint-and-recall reverts *writes*. It cannot un-suspend an account. So the `RecallPlan` will have two sections, and the **irreversible** one is listed first: the actions already taken, their receipts, and either a registered compensating action or an explicit escalation to a human. A taint report that shows six reverted writes and quietly omits the account it suspended is not an audit tool — it's a liability.
+## Known limits — read this before a POC
+
+We would rather you find these here than in an evaluation. None affects correctness; each is a cost or a
+bound stated plainly.
+
+- **Retrieval is O(entries on the branch)**, a scan, not a sub-linear ANN lookup. It is *correct* and
+  branch-isolated (that is the load-bearing property, oracle-checked); it is not yet *fast* at scale. The
+  sub-linear follow-on is a per-branch HNSW — kept **in the branch**, never a shared index, because a
+  shared ANN index would reintroduce the exact cross-branch leak the isolation was designed out
+  ([invariant I-11](docs/invariants.md)).
+- **The refs file is rewritten in full on every commit** — O(branches), not O(1). Invisible against
+  database *size*; it will show on a tenant with a great many branches.
+- **AT-045 (crash-at-any-byte, LoomDB-shaped) is deferred to v0.2.** Data commits already ride
+  substrate's 50,000-cycle crash suite; what is not yet done is re-driving that harness with
+  LoomDB-shaped workloads including the second durable object (the ref write). The ordering it would
+  check is enforced and unit-tested; the 50,000-cycle proof under LoomDB workloads is the gap.
+- **Signature verification is opt-in, and key distribution is not solved here.** With an actor registry,
+  every write is signed and verified (AT-026); without one, writes are attributable but not
+  authenticated. Where keys come from, how they rotate, and how a compromised one is revoked is out of
+  scope for v0.1.
+- **One tenant per store.** Cross-tenant isolation is structural (the tenant *is* the substrate pool),
+  which is *why* AT-039 holds — but a multi-tenant query surface, and its own isolation proofs, is v0.2.
+
+The security posture, and what LoomDB does **not** defend against, is in [the threat
+model](docs/threat-model.md).
 
 ## Reading order
 
@@ -83,6 +119,9 @@ The architecture of record lives in the substrate repository:
 
 1. [`docs/03`](https://github.com/Bobcatsfan33/substrate/blob/main/docs/03-agent-native-database-architecture.md) — the architecture
 2. [`docs/05`](https://github.com/Bobcatsfan33/substrate/blob/main/docs/05-loomdb-test-spec.md) — the acceptance catalog (AT-001…AT-047) and the integrity invariants
+4. [`docs/at-map.md`](docs/at-map.md) — which AT-IDs are green, and the one deferred, with reasons
+5. [`docs/invariants.md`](docs/invariants.md) — the rules that must not be "optimized" away
+6. [`docs/threat-model.md`](docs/threat-model.md) — the security posture, and what LoomDB does not defend against
 3. [`docs/loom-format.md`](docs/loom-format.md) — the on-page record format
 
 ## License

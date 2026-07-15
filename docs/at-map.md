@@ -7,7 +7,12 @@
 > A capability is not done when it works. It is done when the test that would have caught it failing
 > is green. Anything else on this page is not a claim, it is a plan.
 
-Status as of **L1 + persistence + L2 + L3 (memory & retrieval) + L3.5 (policy, influence, action gateway) complete**.
+Status as of **loomdb-v0.1** — L1 → L4 complete.
+
+**The full scoreboard: AT-001 through AT-047 are green or structurally satisfied, with exactly one
+exception — AT-045 — deferred to v0.2 with a reason in writing (below).** Four model oracles hold under
+fuzzing (branch/merge, taint, isolation, policy). The Q3 demo (docs/04 §3.1) runs verbatim in CI, no
+LLM, and steps 8 and 10 are asserted as the bar.
 
 > The rules that must not be "optimized" away later are in [invariants.md](./invariants.md). Each one
 > is there because breaking it produced a bug that **did not fail loudly**.
@@ -90,34 +95,27 @@ The dependency direction stayed clean: taint (`loom-provenance`) and the gateway
 siblings and neither depends on the other. The fact taint needs — `loom_core::ExecutedAction` — is a
 plain value both can name; the gateway produces it, taint consumes it.
 
----
-
-## Types only — the shape is right, nothing enforces it end to end
-
-These are the ones worth being blunt about. `loom-core` has the types and some unit tests. There is
-**no acceptance test that drives them through `Loom`**, because in several cases the API they would
-need does not exist yet.
-
-| ID | What exists | What is missing |
-|---|---|---|
-| **AT-003** — observation ≠ claim | `Observation` and `Claim` are distinct types with distinct fields. | No ingestion path, so nothing can *accidentally* turn an observation into a claim, and nothing tests that it doesn't. The invariant is currently true by absence. |
-| **AT-006** — supersession is not deletion | `ClaimStatus::Superseded` exists. | **No code path ever sets it.** There is no supersession machinery at all. |
-| **AT-008** — confidences are not averaged | `Confidence::comparable_with` refuses to compare across methods or calibrations, with a unit test. | Nothing in the engine *aggregates* confidences, so there is no place the guard is enforced. It is a guard against code that has not been written. |
+Now green: AT-003 (an ingested observation infers no claim — the as-of query finds none), AT-006
+(supersession keeps the old version, marked `Superseded`), AT-008 (`Confidence::combine` refuses across
+methods/calibrations), AT-004/005/009 (the bitemporal as-of query), AT-016 (merge re-evaluates policy),
+AT-022 (taint fills the irreversible section), AT-039 (cross-tenant is structurally impossible), and
+AT-007 (the gateway refuses a no-evidence claim, naming the missing evidence).
 
 ---
 
-## Deferred — named, with the reason, so they are tracked rather than lost
+## Held — measured, published, and honest about what one number cannot show
+
+| ID | Status |
+|---|---|
+| **AT-011** — branch creation is cheap | **Measured. See below.** Flat p50 (~6 ms, one fsync of the refs file) across 1K → 1M records. The claim is that the column does not move, and it does not. 10M was not run (host disk); we did not print a number we did not take. |
+
+---
+
+## Deferred to v0.2 — one, named, with the reason in writing
 
 | ID | Deferred to | Why |
 |---|---|---|
-| **AT-004** — late arrival | **L2/L3** | `Interval` is bitemporal and unit-tested, but there is **no as-of query API**. Nothing can be asked "what did you believe last week", so nothing can be tested. |
-| **AT-005** — correction preserves history | **L2** | Needs the correction path: closing a `known` interval and opening a new one. Not built. |
-| **AT-007** — unsupported claim cannot act | **storage half green; action half L3.5** | `Claim::is_action_eligible()` and `ineligibility_reason()` exist and are unit-tested, and the message tells a model what to *do*. But **there is no action path to refuse**, so the half that matters is untested. |
-| **AT-009** — as-of is reproducible | **L2/L3** | Same reason as AT-004: no as-of API. |
-| **AT-016** — merge re-evaluates policy | **L4** | The policy engine now exists (L3.5), and the merge already *replays as new writes on the target* rather than transplanting pages — both preconditions are met. What remains is wiring the merge path to call the policy at merge time and refuse a write the current policy forbids. A focused follow-on, tracked. |
-| **AT-022** — taint names what it *cannot* undo | **L3.5** | The **shape is built and the report already leads with it** — every plan opens with the irreversible section and says out loud that rewinding a branch does not un-suspend an account. But the section stays **empty** until the action gateway exists to put anything in it. The scaffolding is honest; the content is not there yet. |
-| **AT-039** — cross-tenant identifiers | **L3.5 remainder / L4** | Not found *without revealing existence* — a different error for "exists but forbidden" is an oracle. LoomDB is one-tenant-per-store today (the tenant IS the substrate pool, so cross-tenant reads are structurally impossible — a different pool, different pages). The *distinguishable-error* test needs the multi-tenant query surface that lands with the MCP server in L4. Tracked. |
-| **AT-045** — crash at any byte | **later** | Inherited from substrate (50,000 crash cycles there), but **not yet re-driven with LoomDB-shaped workloads**. The ref write is a second durable object with its own ordering, and it deserves its own crash injection. Named so it is tracked. |
+| **AT-045** — crash at any byte, LoomDB-shaped | **v0.2** | Substrate's crash suite drives **50,000 randomized crash-and-recover cycles** at every byte boundary (doc 02 §10), and LoomDB's data commits go through that exact path. What is **not** yet done is re-driving that harness with *LoomDB-shaped* workloads specifically — the durable **ref write** is a second object with its own ordering (invariant I-8), and it deserves its own crash injection rather than inheriting substrate's confidence. This is the single acceptance test not green at v0.1. It is a test-harness build, not a missing capability: the ordering it would check (manifest durable before ref) is already enforced and unit-tested; what is missing is the 50,000-cycle proof of it under LoomDB workloads. Tagged so it is tracked, not assumed. |
 
 ---
 

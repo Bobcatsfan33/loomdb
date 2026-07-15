@@ -1,6 +1,5 @@
 //! **AT-003, AT-016, AT-039 — the remaining scoreboard entries for the tag.**
 
-
 use loom_branch::{Loom, MergePolicy, MergeResult};
 use loom_core::{
     ActorId, BranchId, Claim, ClaimId, ClaimStatus, Confidence, IndexHint, Interval, Key, Method,
