@@ -153,6 +153,25 @@ impl Confidence {
     pub fn comparable_with(&self, other: &Confidence) -> bool {
         self.method == other.method && self.calibration == other.calibration
     }
+
+    /// **Combine two confidences — or refuse (AT-008).**
+    ///
+    /// The refusal is the feature. A `Rule` confidence of 0.8 and a `LanguageModel` confidence of 0.8
+    /// are not "0.8" in the same units; averaging them to 0.8 produces a number that looks authoritative
+    /// and means nothing. So combining across methods or calibrations returns `None` — the caller must
+    /// declare an aggregation rule, not have one silently invented. Within the *same* method and
+    /// calibration, the more cautious (lower) value wins, because two measurements of the same kind
+    /// disagreeing should not increase our confidence.
+    pub fn combine(&self, other: &Confidence) -> Option<Confidence> {
+        if !self.comparable_with(other) {
+            return None;
+        }
+        Some(Confidence::new(
+            self.value.min(other.value),
+            self.method,
+            self.calibration.clone(),
+        ))
+    }
 }
 
 /// Where a claim is in its life.
@@ -334,6 +353,35 @@ impl Record {
 mod tests {
     use super::*;
     use crate::ids::ClaimId;
+
+    /// **AT-008 — confidences from different methods are not silently combined.**
+    #[test]
+    fn at_008_confidence_across_methods_refuses_to_combine() {
+        let rule = Confidence::new(0.8, Method::Rule, "cal-v1");
+        let llm = Confidence::new(0.8, Method::LanguageModel, "cal-v1");
+        assert_eq!(
+            rule.combine(&llm),
+            None,
+            "AT-008: a Rule 0.8 and a LanguageModel 0.8 are not the same number; combining must be refused"
+        );
+
+        // Same method + calibration: it combines, and the more cautious value wins.
+        let a = Confidence::new(0.9, Method::Rule, "cal-v1");
+        let b = Confidence::new(0.6, Method::Rule, "cal-v1");
+        assert_eq!(
+            a.combine(&b).map(|c| c.value),
+            Some(0.6),
+            "the lower value wins — agreement of kind, not inflation"
+        );
+
+        // Different calibration of the same method: still refused.
+        let c = Confidence::new(0.9, Method::Rule, "cal-v2");
+        assert_eq!(
+            a.combine(&c),
+            None,
+            "different calibrations are different scales"
+        );
+    }
 
     fn claim(evidence: Vec<SourceRef>, status: ClaimStatus) -> Claim {
         Claim {

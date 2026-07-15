@@ -1016,6 +1016,27 @@ impl Loom {
         policy: &MergePolicy,
         envelope: &WriteEnvelope,
     ) -> Result<MergeResult> {
+        // No information-flow policy check — every merged write is permitted.
+        self.merge_checked(token, source, target, policy, envelope, &|_, _| None)
+    }
+
+    /// `merge`, but each merged write is re-evaluated against a policy **at merge time** (AT-016).
+    ///
+    /// `forbids(key, record)` returns `Some(reason)` if the *current* policy forbids this write landing
+    /// on the target. It is called for every caller-facing write the merge would make — a merge is a
+    /// new write on the target, and it is evaluated against the world as it is *now*, not as it was
+    /// when the source branched. If any write is forbidden, the whole merge is refused and **nothing is
+    /// written** (a partial merge would be its own kind of corruption). The predicate is injected so
+    /// this crate stays free of the policy engine, exactly as retrieval's filter is.
+    pub fn merge_checked(
+        &self,
+        token: &CapabilityToken,
+        source: &BranchId,
+        target: &BranchId,
+        policy: &MergePolicy,
+        envelope: &WriteEnvelope,
+        forbids: &dyn Fn(&Key, &Record) -> Option<String>,
+    ) -> Result<MergeResult> {
         if !envelope.is_valid() {
             return Err(LoomError::MissingEnvelope);
         }
@@ -1086,6 +1107,22 @@ impl Loom {
                     .iter()
                     .filter(|(k, _)| !is_reserved(k) && !is_provenance(k))
                     .count();
+
+                // POLICY, RE-EVALUATED AT MERGE TIME (AT-016). Each caller-facing write the merge would
+                // make is checked against the CURRENT policy. If one is now forbidden, refuse the whole
+                // merge — a merge that applied some writes and refused others would leave the target in
+                // a state neither branch ever had.
+                for (key, record) in &writes {
+                    if is_reserved(key) || is_provenance(key) {
+                        continue;
+                    }
+                    if let Some(reason) = forbids(key, record) {
+                        return Ok(MergeResult::PolicyRefused {
+                            key: String::from_utf8_lossy(key).to_string(),
+                            reason,
+                        });
+                    }
+                }
 
                 // Record what we merged, in the same commit as the merge itself. If this were a
                 // separate commit, a crash between the two would leave a branch that had applied the
@@ -1340,6 +1377,16 @@ pub enum MergeResult {
         bases: usize,
         /// What the caller should do about it.
         detail: String,
+    },
+    /// **Policy, re-evaluated at merge time, forbids one of the writes (AT-016).** The branch's write
+    /// was allowed when it forked, but the policy has changed since, and a merge is a *new* write on
+    /// the target evaluated against the world as it is *now* — not as it was when the branch forked.
+    /// Nothing is written.
+    PolicyRefused {
+        /// The key whose merge the current policy forbids.
+        key: String,
+        /// Why, in words the caller can act on.
+        reason: String,
     },
 }
 
