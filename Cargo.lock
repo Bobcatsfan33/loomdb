@@ -973,6 +973,7 @@ name = "loom-memory"
 version = "0.1.0"
 dependencies = [
  "bincode",
+ "blake3",
  "loom-branch",
  "loom-core",
  "loom-policy",

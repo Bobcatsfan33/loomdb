@@ -21,10 +21,12 @@
 //!   derived from it, and reports what it could not undo.
 
 mod forget;
+mod hnsw;
 mod retrieval;
 mod tokens;
 
 pub use forget::{ForgetReport, Forgetter, IrreversibleEffect};
+pub use hnsw::{Hnsw, ItemId, EF_DEFAULT, M};
 pub use retrieval::{
     pack, score_candidate, PackedContext, PackedItem, RetrievalQuery, Retriever, ScoredCandidate,
 };

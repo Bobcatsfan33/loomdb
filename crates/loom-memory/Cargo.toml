@@ -10,6 +10,7 @@ loom-provenance = { path = "../loom-provenance" }
 substrate-pager = { git = "https://github.com/Bobcatsfan33/substrate", tag = "substrate-v1.2.1" }
 serde = { version = "1", features = ["derive"] }
 bincode = "1.3"
+blake3 = "1"
 
 [dev-dependencies]
 proptest = "1.5"
