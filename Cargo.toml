@@ -5,6 +5,7 @@ members = [
     "crates/loom-branch",
     "crates/loom-provenance",
     "crates/loom-bench",
+    "crates/loom-memory",
 ]
 
 [workspace.package]

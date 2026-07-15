@@ -160,6 +160,30 @@ auditor actually reads).
 
 ---
 
+## I-11. The index lives **in the branch's tree**, never in a global store
+
+**The rule.** An index entry is written to a reserved key *in the branch it belongs to*, and retrieval
+scans that branch's tree through `pager.fork(head)` — the same path `read` takes. There is no global
+index keyed by branch id.
+
+**Why.** AT-040 calls an index leak "a correctness bug wearing a performance costume." A single global
+vector/FTS index is faster to build and comes with a `WHERE branch = ?` — which is exactly the thing
+that gets forgotten, mis-scoped, or reordered by a query planner, and then one hypothesis branch (or
+one tenant) retrieves another's data. Storing entries in the branch tree makes isolation **structural**:
+a sibling branch has a different head manifest and literally cannot address the bytes. It is inherited
+from substrate's content-addressed forks, not enforced by a filter this crate has to remember.
+
+**The cost, stated:** retrieval is a scan of the branch's index range, not a global ANN lookup. That is
+O(entries on the branch), and when it needs to be sub-linear the answer is a per-branch HNSW built over
+the same reserved range — *still in the branch*, never a shared index. The boring, obviously-isolated
+version ships first.
+
+**Guarded by.** `retrieval_sees_exactly_the_branch_and_never_a_sibling` (the AT-040 oracle, 3,000 runs)
+and `at_040_a_siblings_write_is_never_retrieved`. A mutation that reads the wrong branch's tree fails
+both immediately.
+
+---
+
 ## I-10. A test that passes with the fix reverted is **not a test**
 
 **The rule.** Every capability names the AT-IDs it turns green, and the test must **fail before** the

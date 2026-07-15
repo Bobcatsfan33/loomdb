@@ -944,6 +944,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "loom-memory"
+version = "0.1.0"
+dependencies = [
+ "bincode",
+ "loom-branch",
+ "loom-core",
+ "loom-provenance",
+ "proptest",
+ "serde",
+ "substrate-pager",
+]
+
+[[package]]
 name = "loom-provenance"
 version = "0.1.0"
 dependencies = [

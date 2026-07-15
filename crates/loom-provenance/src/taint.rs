@@ -180,6 +180,33 @@ impl<'a> Provenance<'a> {
 
     /// **Mark everything downstream of an invalidated source as `Stale`.**
     ///
+    /// **The record keys downstream of a source on a branch** — the contaminated set, by key.
+    ///
+    /// This is the walk `mark_stale` and `taint` do, exposed so the memory layer's `forget` can find
+    /// every representation it must remove or rebuild (AT-044) without re-implementing the flood. It
+    /// excludes the provenance layer's own keys — forgetting must not eat the audit trail it runs on.
+    pub fn contaminated_keys_on(
+        &self,
+        branch: &BranchId,
+        source: &SourceRef,
+    ) -> Result<Vec<Vec<u8>>> {
+        let nodes = self.nodes_on(branch)?;
+        let seeds = self.seeds_on(branch, source)?;
+        let contaminated = flood_downstream(&nodes, &seeds)?;
+
+        let mut keys = Vec::new();
+        for id in &contaminated {
+            let Some(node) = nodes.get(id) else { continue };
+            if loom_core::is_provenance(&node.key) {
+                continue;
+            }
+            keys.push(node.key.clone());
+        }
+        keys.sort();
+        keys.dedup();
+        Ok(keys)
+    }
+
     /// The scalpel, not the sledgehammer (AT-023). Stale claims remain readable and auditable — but
     /// they are **not action-eligible** until re-derived. Most of the time the right answer to "an
     /// input changed" is not "revert history", it is "stop letting that conclusion authorize anything

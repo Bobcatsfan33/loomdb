@@ -7,7 +7,7 @@
 > A capability is not done when it works. It is done when the test that would have caught it failing
 > is green. Anything else on this page is not a claim, it is a plan.
 
-Status as of **L1 + persistence + L2 (provenance, taint, staleness, signatures) complete**.
+Status as of **L1 + persistence + L2 (provenance, taint, staleness, signatures) + L3 (memory & retrieval) complete**.
 
 > The rules that must not be "optimized" away later are in [invariants.md](./invariants.md). Each one
 > is there because breaking it produced a bug that **did not fail loudly**.
@@ -35,12 +35,19 @@ Status as of **L1 + persistence + L2 (provenance, taint, staleness, signatures) 
 | **AT-024** | `taint()` **proposes and never acts.** It returns a dry run. Nothing is mutated. | `at_024_taint_proposes_and_never_acts` |
 | **AT-025** | A pathological derivation graph is **refused, not chased** — the walk is bounded at depth 64. | `at_025_a_pathological_derivation_graph_is_refused_not_chased` |
 | **AT-026** | **Envelope signatures verify.** An unsigned write is refused; an actor **cannot impersonate another actor** (the key is looked up by the actor the envelope *claims to be*); rewriting `intent` after signing invalidates the write; an **unregistered actor is refused, not trusted**. | `at_026_an_unsigned_write_is_refused_when_the_database_authenticates_writers`, `at_026_an_actor_cannot_impersonate_another_actor`, `at_026_tampering_with_the_intent_breaks_the_signature`, `at_026_an_unregistered_actor_is_refused_rather_than_trusted` |
+| **AT-040** | **Branch-aware indexes — isolation is structural.** A sibling branch's write is never retrieved, because index entries live in the branch's own tree and a sibling has a different head manifest. Verified by a model oracle at 3,000 randomized runs: what a branch retrieves equals what the model says is visible there, **and never a sibling's fact**. | `at_040_a_siblings_write_is_never_retrieved`, `retrieval_sees_exactly_the_branch_and_never_a_sibling` (oracle) |
+| **AT-041** | **Every packed item is cited.** An uncited entry cannot be *constructed* (the only constructor refuses it), so no retrieval can pack one. The citation is the record's own `SourceRef` — the same one the provenance DAG holds — derived at write time, not a caller's assertion. | `IndexEntry::new` unit tests + asserted in every retrieval test |
+| **AT-042** | **Adversarial budgets.** A well-formed `PackedContext` under any budget × any candidate count — 50 tokens vs 100,000 candidates, unbounded vs 3, zero vs 1 — with no panic, no item truncated mid-evidence, no uncited item. A 2,000-case property test proves the invariant, not two examples. | `at_042_a_tiny_budget_against_a_huge_candidate_set`, `..._a_huge_budget_against_a_tiny_candidate_set`, `..._a_zero_budget_is_empty_not_a_crash`, `pack_is_always_well_formed` |
+| **AT-043** | **Stale claims are down-ranked and marked.** A stale claim that matches *better* than a fresh one still loses to it (penalty applied to the whole score), and arrives in the context flagged `stale` so the model knows not to lean on it — penalised, never silently dropped or silently trusted. | `at_043_a_stale_claim_is_penalised_and_flagged` |
+| **AT-044** | **Forgetting propagates.** Forget a source and every governed representation derived from it (index entries carrying the embedding/text/summary) is removed and every dependent claim is `Invalidated` — in one commit, via the same taint walk L2 uses. The record stays readable; only the derived representation goes. The completion report accounts for all of it and **leads with what it cannot undo** (empty until L3.5, honestly). | `at_044_forgetting_a_source_removes_everything_derived_from_it`, `at_044_the_report_is_shaped_to_lead_with_the_irreversible` |
 
 **AT-019 — token scope is inescapable.** Green **for the surfaces that exist today**: `read`, `write`,
-`scan`, `rewind`, `branch`, and `merge` (both sides — a merge reads the source and writes the target,
-and forgetting the source would let a session merge in a branch it was never allowed to see). It must
-be **re-asserted when the MCP server and the CLI land in L4**, because the catalog's wording is "through
-every surface", and two of those surfaces do not exist yet. Tracked, not closed.
+`scan`, `rewind`, `branch`, `merge` (both sides — a merge reads the source and writes the target, and
+forgetting the source would let a session merge in a branch it was never allowed to see), and now
+**retrieval and forget** (both authorise through the *same* issuer as `read`, rather than a second,
+weaker check). It must be **re-asserted when the MCP server and the CLI land in L4**, because the
+catalog's wording is "through every surface", and those two surfaces do not exist yet. Tracked, not
+closed.
 
 **AT-001 — the shape. AT-026 — the signature. Both now green, and they are different claims.**
 AT-001 makes a write **attributable**: actor, session, branch and intent are all required, because a
@@ -94,7 +101,6 @@ need does not exist yet.
 | **AT-016** — merge re-evaluates policy | **L3.5** | There is no policy engine. The merge already *replays as new writes on the target* rather than transplanting pages, which is the structural precondition — the hook exists, the policy does not. |
 | **AT-022** — taint names what it *cannot* undo | **L3.5** | The **shape is built and the report already leads with it** — every plan opens with the irreversible section and says out loud that rewinding a branch does not un-suspend an account. But the section stays **empty** until the action gateway exists to put anything in it. The scaffolding is honest; the content is not there yet. |
 | **AT-027 – AT-039** | **L3.5** | Action gateway and influence policy. |
-| **AT-040 – AT-044** | **L3** | Memory and retrieval. |
 | **AT-045** — crash at any byte | **later** | Inherited from substrate (50,000 crash cycles there), but **not yet re-driven with LoomDB-shaped workloads**. The ref write is a second durable object with its own ordering, and it deserves its own crash injection. Named so it is tracked. |
 
 ---

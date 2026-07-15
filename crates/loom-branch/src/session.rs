@@ -21,8 +21,8 @@ use crate::tree::Tree;
 use ed25519_dalek::VerifyingKey;
 use loom_core::{
     is_provenance, latest_node_key, node_storage_key, prov_seq_key, source_index_key, ActorId,
-    BranchId, CommitId, DerivationNode, Key, LoomError, NodeId, Record, Result, SessionId,
-    SourceRef, TenantId, Value, WriteEnvelope,
+    BranchId, ClaimStatus, CommitId, DerivationNode, IndexEntry, IndexHint, Key, LoomError, NodeId,
+    Record, Result, SessionId, SourceRef, TenantId, Value, WriteEnvelope,
 };
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::{Arc, Mutex};
@@ -265,6 +265,17 @@ impl Loom {
     }
 
     /// Where a branch currently points.
+    /// Authorise a read against a branch, exactly as `read`/`scan` do.
+    ///
+    /// Public so the memory layer (a separate crate) enforces capability scope through the *same*
+    /// issuer, rather than inventing a second, weaker check. AT-019 is "no code path touches a page
+    /// outside the token's scope, through every surface" — retrieval is a surface, so it authorises
+    /// here.
+    pub fn authorize_read(&self, token: &CapabilityToken, branch: &BranchId) -> Result<()> {
+        self.issuer.authorize(token, branch, self.now())
+    }
+
+    /// The commit a branch currently points at.
     pub fn head(&self, branch: &BranchId) -> Result<CommitId> {
         self.refs()
             .branches
@@ -448,6 +459,103 @@ impl Loom {
         self.write_many_derived(token, branch, records, envelope, &BTreeMap::new())
     }
 
+    /// **Write a record and make it retrievable, in one commit.**
+    ///
+    /// The record, its provenance, and its index entry all land in the *same* transaction (invariant
+    /// I-1) — a crash cannot leave a fact searchable but unprovenanced, or written but unsearchable.
+    ///
+    /// The index entry's **citations are derived from the record**, not from the hint: an observation
+    /// cites its source, a claim cites its evidence. That is what makes AT-041 true by construction —
+    /// a packed item's citation is the same `SourceRef` the provenance DAG holds, not a caller's
+    /// assertion. A record with nothing to cite (a claim with empty evidence, a bare value) is written
+    /// but **not indexed**, because an uncited item could never be packed anyway.
+    pub fn write_indexed(
+        &self,
+        token: &CapabilityToken,
+        branch: &BranchId,
+        key: Key,
+        record: Record,
+        hint: IndexHint,
+        envelope: &WriteEnvelope,
+    ) -> Result<CommitId> {
+        let mut hints = BTreeMap::new();
+        hints.insert(key.clone(), hint);
+        self.write_indexed_many(token, branch, vec![(key, record)], &hints, envelope)
+    }
+
+    /// **Forget a set of records: invalidate the claims, remove their index entries — in one commit.**
+    ///
+    /// The mutating half of AT-044. For each key, in a single transaction:
+    /// - its index entry is **removed**, so it can no longer be retrieved. The embedding, the text, the
+    ///   summary — the *governed representations* — go with it.
+    /// - if it is a claim, its status becomes **`Invalidated`**. Not `Stale`: stale says "re-derive me
+    ///   when you can", and forgetting is stronger than that — the input it rested on is gone, so the
+    ///   conclusion is withdrawn, not merely paused.
+    ///
+    /// The record itself is **not deleted**. History is not rewritten; the claim remains readable and
+    /// auditable with an honest `Invalidated` status, exactly as supersession and staleness do. What is
+    /// removed is only the *derived representation* that made it retrievable.
+    ///
+    /// Returns `(invalidated, deindexed)` counts. This is a real mutation and it is token-gated — unlike
+    /// `taint`, which is a dry run. Forgetting is the execution, and the caller asked for it.
+    pub fn invalidate_and_deindex(
+        &self,
+        token: &CapabilityToken,
+        branch: &BranchId,
+        keys: &[Key],
+        envelope: &WriteEnvelope,
+    ) -> Result<(usize, usize)> {
+        if !envelope.is_valid() {
+            return Err(LoomError::MissingEnvelope);
+        }
+        self.authenticate(envelope)?;
+        self.issuer.authorize(token, branch, self.now())?;
+
+        let head = self.head(branch)?;
+        let store = self.pager.fork(&head)?;
+        let mut txn = store.begin()?;
+        let mut tree = Tree::open(&*store)?;
+
+        let mut invalidated = 0usize;
+        let mut deindexed = 0usize;
+
+        for key in keys {
+            // Remove the representation. `remove` returns whether anything was there, which is exactly
+            // the deindexed count — a key that was never indexed is not double-counted.
+            if tree.remove(&IndexEntry::storage_key(key))? {
+                deindexed += 1;
+            }
+
+            // Withdraw the claim, if it is one and still standing.
+            if let Some(Record::Claim(mut claim)) = tree.get(key)? {
+                if matches!(claim.status, ClaimStatus::Asserted | ClaimStatus::Stale) {
+                    claim.status = ClaimStatus::Invalidated;
+                    tree.insert(key.clone(), Record::Claim(claim))?;
+                    invalidated += 1;
+                }
+            }
+        }
+
+        tree.flush(&mut txn)?;
+        let commit = store.commit(txn)?;
+        self.record_commit(commit, vec![head]);
+        self.set_head(branch, commit)?;
+
+        Ok((invalidated, deindexed))
+    }
+
+    /// `write_many`, with an index hint per key. Keys without a hint are written but not indexed.
+    pub fn write_indexed_many(
+        &self,
+        token: &CapabilityToken,
+        branch: &BranchId,
+        records: Vec<(Key, Record)>,
+        hints: &BTreeMap<Key, IndexHint>,
+        envelope: &WriteEnvelope,
+    ) -> Result<CommitId> {
+        self.write_all(token, branch, records, envelope, &BTreeMap::new(), hints)
+    }
+
     /// `write_many`, plus derivation parents the caller *knows about* but did not read.
     ///
     /// The only caller is `merge`. A merged record genuinely **is** derived from both sides — that is
@@ -472,6 +580,26 @@ impl Loom {
         records: Vec<(Key, Record)>,
         envelope: &WriteEnvelope,
         extra_parents: &BTreeMap<Key, Vec<NodeId>>,
+    ) -> Result<CommitId> {
+        self.write_all(
+            token,
+            branch,
+            records,
+            envelope,
+            extra_parents,
+            &BTreeMap::new(),
+        )
+    }
+
+    /// The one write path. Everything else is a convenience over this.
+    fn write_all(
+        &self,
+        token: &CapabilityToken,
+        branch: &BranchId,
+        records: Vec<(Key, Record)>,
+        envelope: &WriteEnvelope,
+        extra_parents: &BTreeMap<Key, Vec<NodeId>>,
+        index_hints: &BTreeMap<Key, IndexHint>,
     ) -> Result<CommitId> {
         // 1. THE ENVELOPE. Before anything else, and with no way around it.
         if !envelope.is_valid() {
@@ -577,6 +705,37 @@ impl Loom {
             tree.insert(
                 prov_seq_key(branch.as_str()),
                 Record::Value(Value::Counter(seq as i64)),
+            )?;
+        }
+
+        // Index entries — in this same commit, so a fact is never searchable before it is durable, or
+        // durable before it is searchable. The entry's citations are derived from the record, never
+        // from the hint (AT-041): a record with nothing to cite is written but not indexed.
+        for (key, record) in &written {
+            let Some(hint) = index_hints.get(key) else {
+                continue;
+            };
+            let citations = citations_of(record);
+            let Some(entry) = IndexEntry::new(
+                key.clone(),
+                hint.text.clone(),
+                hint.embedding.clone(),
+                citations,
+                is_stale(record),
+            ) else {
+                // No citation to be had — a bare value, or a claim with empty evidence. It is written,
+                // but it does not enter the index, because an uncited item could never be packed.
+                continue;
+            };
+            tree.insert(
+                IndexEntry::storage_key(key),
+                Record::Value(Value::Blob(entry.encode().map_err(|source| {
+                    LoomError::Codec {
+                        op: "encode",
+                        what: "index entry",
+                        source,
+                    }
+                })?)),
             )?;
         }
 
@@ -1164,4 +1323,24 @@ impl ReadSet {
     pub fn is_empty(&self) -> bool {
         self.nodes.is_empty() && self.sources.is_empty()
     }
+}
+
+/// The sources a record cites — the same `SourceRef`s the provenance DAG records.
+///
+/// This is what makes an index entry's citation *real* (AT-041) rather than a caller's claim: an
+/// observation is the arrival of a source and cites it; a claim cites its evidence. A bare value cites
+/// nothing, and a claim with empty evidence cites nothing — both are stored, neither is retrievable,
+/// because an item that cannot say where it came from must never appear in a packed context.
+fn citations_of(record: &Record) -> Vec<SourceRef> {
+    match record {
+        Record::Observation(obs) => vec![obs.source.clone()],
+        Record::Claim(claim) => claim.evidence.clone(),
+        Record::Value(_) => Vec::new(),
+    }
+}
+
+/// Whether a record is a claim whose evidence has been invalidated. Cached into the index entry so the
+/// ranker can penalise it (AT-043) without re-reading the record.
+fn is_stale(record: &Record) -> bool {
+    matches!(record, Record::Claim(c) if c.status == ClaimStatus::Stale)
 }

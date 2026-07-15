@@ -29,19 +29,23 @@
 #![warn(rust_2018_idioms)]
 #![cfg_attr(test, allow(clippy::unwrap_used, clippy::expect_used, clippy::panic))]
 
+mod embedding;
 mod envelope;
 mod error;
 mod ids;
+mod index;
 mod provenance;
 mod recall;
 mod time;
 mod value;
 
+pub use embedding::Embedding;
 pub use envelope::WriteEnvelope;
 pub use error::{LoomError, Result};
 pub use ids::{
     ActorId, BranchId, ClaimId, CommitId, ObservationId, PolicyDecisionId, SessionId, TenantId,
 };
+pub use index::{IndexEntry, IndexHint, RESERVED_INDEX_PREFIX};
 pub use provenance::{
     is_provenance, latest_node_key, node_from_index_value, node_storage_key, prov_seq_key,
     source_index_key, source_index_prefix, DerivationNode, NodeId, PROV_PREFIX,
