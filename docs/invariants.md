@@ -127,9 +127,11 @@ believe the contamination is undone when the part that reached the world is not.
 `"CANNOT BE UNDONE"` precedes `"CAN be reverted"`. It is a crude test on purpose: it fails if anyone
 reorders the report for aesthetics.
 
-**Status:** the section is **built and wired, and stays empty until the action gateway lands in L3.5**
-— there is nothing irreversible in the system yet to put in it. The shape is honest; the content is not
-there. That is AT-022, and it is tracked, not claimed.
+**Status: FILLED (L3.5).** `Provenance::taint_with_actions` now pours real content into the section —
+every executed action justified by a contaminated claim, with its receipt and either a compensating
+action or a human escalation. The shape from L2 was the promise; AT-022 is now green. When there is no
+compensation, the plan escalates rather than inventing one — you cannot un-send an email, and it does
+not pretend you can.
 
 ---
 
@@ -157,6 +159,38 @@ claimant would let any registered agent write as any other.
 `at_026_an_unregistered_actor_is_refused_rather_than_trusted`,
 `at_026_tampering_with_the_intent_breaks_the_signature` (the signature covers `intent` — the field an
 auditor actually reads).
+
+---
+
+## I-12. An agent has no method that acts (AT-027)
+
+**The rule.** `AgentStore` exposes `propose` and nothing that reaches a connector. Executing takes an
+`ActionGateway`, which an agent does not hold. The separation is by *type*, not by a runtime guard.
+
+**Why.** The strongest way to guarantee an agent cannot perform an external effect is for there to be
+no method it could call — so a prompt injection that says "call execute_action" is asking for a
+function that does not exist. A runtime check can be bypassed, mis-ordered, or disabled; an absent
+method cannot. This is the same move as I-11's structural isolation.
+
+**Guarded by.** A `compile_fail` doctest on `AgentStore` that CI runs: `agent.execute(...)` must fail
+to compile. If someone adds `AgentStore::execute`, the doctest starts compiling, fails, and the build
+goes red. The guarantee cannot be quietly removed.
+
+---
+
+## I-13. Every gate before an action fails **closed** (AT-037)
+
+**The rule.** The policy engine denies when no rule applies. The gateway refuses when the kill switch
+is on, when evidence is stale, when a simulation would touch production, when no connector is
+registered. There is no configuration in which an external action fails *open*.
+
+**Why.** An authorization engine that fails open is worse than none, because it is trusted. The policy
+oracle states this as a sharper invariant than mere agreement: whenever the engine *allows*, some allow
+rule genuinely applied — it never allows by falling through. 10,000 randomized policy sets try to break
+it. Mutating deny-overrides into allow-overrides fails it immediately with "failing open".
+
+**Guarded by.** `no_applicable_rule_always_denies` and `engine_agrees_with_the_truth_table` (the policy
+oracle), plus the gateway's `at_030`/`at_031`/`at_033` refusal tests.
 
 ---
 
