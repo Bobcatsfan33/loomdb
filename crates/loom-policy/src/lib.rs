@@ -23,11 +23,14 @@
 //! impossible by construction.
 
 mod engine;
+mod influence;
 
 pub use engine::{
     Decision, Effect, Engine, Match, PolicyDecision, PolicyRule, PolicySet, Request,
     RequestSnapshot,
 };
+
+pub use influence::{may_authorize_action, may_pack, permitted, ACTION_PACK, PURPOSE_AUTHORIZE};
 
 /// Re-exported: the trust of the data being acted on is its policy label.
 pub use loom_core::TrustClass;

@@ -22,7 +22,7 @@ use ed25519_dalek::VerifyingKey;
 use loom_core::{
     is_provenance, latest_node_key, node_storage_key, prov_seq_key, source_index_key, ActorId,
     BranchId, ClaimStatus, CommitId, DerivationNode, IndexEntry, IndexHint, Key, LoomError, NodeId,
-    Record, Result, SessionId, SourceRef, TenantId, Value, WriteEnvelope,
+    Record, Result, SessionId, SourceRef, TenantId, TrustClass, Value, WriteEnvelope,
 };
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::{Arc, Mutex};
@@ -273,6 +273,25 @@ impl Loom {
     /// here.
     pub fn authorize_read(&self, token: &CapabilityToken, branch: &BranchId) -> Result<()> {
         self.issuer.authorize(token, branch, self.now())
+    }
+
+    /// The index entry for a key on a branch, if the record was indexed. Used by `capture_read` to
+    /// inherit a read record's label, and available to the memory layer.
+    pub fn index_entry_for(&self, branch: &BranchId, key: &[u8]) -> Result<Option<IndexEntry>> {
+        let head = self.head(branch)?;
+        let store = self.pager.fork(&head)?;
+        let mut tree = Tree::open(&*store)?;
+        match tree.get(&IndexEntry::storage_key(key))? {
+            Some(Record::Value(Value::Blob(bytes))) => {
+                let entry = IndexEntry::decode(&bytes).map_err(|source| LoomError::Codec {
+                    op: "decode",
+                    what: "index entry",
+                    source,
+                })?;
+                Ok(Some(entry))
+            }
+            _ => Ok(None),
+        }
     }
 
     /// The commit a branch currently points at.
@@ -716,12 +735,17 @@ impl Loom {
                 continue;
             };
             let citations = citations_of(record);
+            // The effective label: the most restrictive of what this write READ (captured.min_label)
+            // and what it IS (an observation's own trust; a claim contributes only the identity, so it
+            // inherits its evidence's label). This is AT-035 — the restriction rides the derivation.
+            let label = captured.min_label.most_restrictive(own_trust(record));
             let Some(entry) = IndexEntry::new(
                 key.clone(),
                 hint.text.clone(),
                 hint.embedding.clone(),
                 citations,
                 is_stale(record),
+                label,
             ) else {
                 // No citation to be had — a bare value, or a claim with empty evidence. It is written,
                 // but it does not enter the index, because an uncited item could never be packed.
@@ -894,9 +918,20 @@ impl Loom {
             set.nodes.insert(node);
         }
 
-        // An observation's source is where the DAG bottoms out.
+        // An observation's source is where the DAG bottoms out — and its trust is where the label
+        // does. Reading an `Untrusted` scrape makes the reader's read-set `Untrusted`, and anything it
+        // then writes inherits that (AT-035).
         if let Record::Observation(obs) = record {
             set.sources.insert(obs.source.clone());
+            set.min_label = set.min_label.most_restrictive(obs.trust);
+        }
+
+        // Reading a *derived* record carries its label forward too, so a restriction propagates through
+        // a summary or a re-derived claim, not only through a directly-read observation. The label was
+        // cached on the record's index entry when it was written; if it was never indexed there is
+        // nothing to inherit, which is correct — an un-indexed value carries no evidence.
+        if let Some(entry) = self.index_entry_for(branch, key)? {
+            set.min_label = set.min_label.most_restrictive(entry.label);
         }
         Ok(())
     }
@@ -1310,12 +1345,29 @@ impl MergeResult {
 /// Two kinds, because they are two kinds of thing: **derivation nodes** (things this database
 /// produced, which have their own upstream) and **external sources** (things the world told us,
 /// which are where the DAG bottoms out).
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ReadSet {
     /// Derivation nodes whose output this session has read.
     pub nodes: BTreeSet<NodeId>,
     /// External sources this session has read — the `source` of every `Observation` it touched.
     pub sources: BTreeSet<SourceRef>,
+    /// **The most restrictive trust label of everything this session has read.** A write derived from
+    /// this read-set inherits it (AT-035): the weakest link in what you read sets the label of what you
+    /// write. Starts at the least-restrictive identity and only ever climbs.
+    pub min_label: TrustClass,
+}
+
+impl Default for ReadSet {
+    fn default() -> Self {
+        // min_label starts at the LEAST restrictive — an empty read-set has read nothing, so it imposes
+        // no restriction. This is not `TrustClass::default()` on purpose: a security label must never
+        // have a global "trusted" default that some other code path could pick up by accident.
+        ReadSet {
+            nodes: BTreeSet::new(),
+            sources: BTreeSet::new(),
+            min_label: TrustClass::least_restrictive(),
+        }
+    }
 }
 
 impl ReadSet {
@@ -1343,4 +1395,16 @@ fn citations_of(record: &Record) -> Vec<SourceRef> {
 /// ranker can penalise it (AT-043) without re-reading the record.
 fn is_stale(record: &Record) -> bool {
     matches!(record, Record::Claim(c) if c.status == ClaimStatus::Stale)
+}
+
+/// A record's own trust label, before anything it was derived from is folded in.
+///
+/// An observation *is* a trust statement — it carries the trust of its source. A claim carries none of
+/// its own; its label comes entirely from its evidence (the read-set), so it contributes the
+/// least-restrictive identity here and inherits the rest. A bare value likewise imposes no restriction.
+fn own_trust(record: &Record) -> TrustClass {
+    match record {
+        Record::Observation(obs) => obs.trust,
+        Record::Claim(_) | Record::Value(_) => TrustClass::least_restrictive(),
+    }
 }

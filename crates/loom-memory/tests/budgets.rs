@@ -16,6 +16,7 @@ fn entry(i: usize, text: &str, stale: bool) -> IndexEntry {
         Some(Embedding::new([0.1, 0.2, 0.3])),
         vec![SourceRef::new("web", format!("src-{i}"))],
         stale,
+        loom_core::TrustClass::Untrusted,
     )
     .expect("cited")
 }

@@ -950,6 +950,7 @@ dependencies = [
  "bincode",
  "loom-branch",
  "loom-core",
+ "loom-policy",
  "loom-provenance",
  "proptest",
  "serde",

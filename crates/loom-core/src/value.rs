@@ -24,6 +24,26 @@ pub enum TrustClass {
     Untrusted,
 }
 
+impl TrustClass {
+    /// The more restrictive of two labels — the one that wins when information flows combine.
+    ///
+    /// Restrictiveness is exactly the derived `Ord` (`VerifiedSystem < Human < ThirdParty <
+    /// Untrusted`), so this is `max`. It is spelled out as a named method because "the more restrictive
+    /// of these two" is the operation information-flow labelling actually performs, and reading
+    /// `a.max(b)` at the call site invites someone to "simplify" it into `min` and quietly invert the
+    /// entire security lattice. A claim built from a `VerifiedSystem` record *and* an `Untrusted`
+    /// scrape is `Untrusted` — the weakest link sets the label.
+    pub fn most_restrictive(self, other: TrustClass) -> TrustClass {
+        self.max(other)
+    }
+
+    /// The least restrictive label — the identity for `most_restrictive`. A record derived from
+    /// nothing starts here and only ever gets *more* restricted as its inputs are folded in.
+    pub const fn least_restrictive() -> TrustClass {
+        TrustClass::VerifiedSystem
+    }
+}
+
 /// Where a piece of evidence came from.
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 pub struct SourceRef {

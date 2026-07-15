@@ -238,19 +238,43 @@ impl<'a> Retriever<'a> {
         Ok(entries)
     }
 
-    /// **Retrieve, and pack into the query's budget.**
-    ///
-    /// The whole L3 contract in one call: branch-isolated candidates, scored, stale ones penalised and
-    /// marked, packed whole-item into the budget, every item cited.
+    /// **Retrieve, and pack into the query's budget.** No influence filter — every visible candidate is
+    /// eligible. Use [`Retriever::retrieve_filtered`] when a purpose restricts what may enter the
+    /// context.
     pub fn retrieve(
         &self,
         token: &CapabilityToken,
         branch: &BranchId,
         query: &RetrievalQuery,
     ) -> Result<PackedContext> {
+        self.retrieve_filtered(token, branch, query, &|_| true)
+    }
+
+    /// **Retrieve, filtering restricted candidates out *before* packing (AT-036).**
+    ///
+    /// # Why the filter is here and not in the packer
+    ///
+    /// AT-036 is precise about *where*: restricted data is filtered "before the context is packed — not
+    /// scrubbed from the model's output afterwards." Scrubbing after the fact means the restricted
+    /// bytes were in the context window, went to the model, and we are hoping to catch them on the way
+    /// out. That is the architecture the test exists to forbid. So the filter runs on the candidate
+    /// list, and a candidate the filter rejects is *gone* — never scored, never packed, never in the
+    /// window. The packer stays pure and total (AT-042); it never learns the filter exists.
+    ///
+    /// `allow` is applied per candidate. In practice it wraps the policy engine: "may data with this
+    /// label be packed for this purpose?" A `false` drops the candidate silently — from the model's
+    /// point of view the restricted fact simply is not in memory.
+    pub fn retrieve_filtered(
+        &self,
+        token: &CapabilityToken,
+        branch: &BranchId,
+        query: &RetrievalQuery,
+        allow: &dyn Fn(&IndexEntry) -> bool,
+    ) -> Result<PackedContext> {
         let scored: Vec<ScoredCandidate> = self
             .entries_on(token, branch)?
             .into_iter()
+            .filter(|entry| allow(entry)) // BEFORE scoring and packing — never enters the window.
             .map(|entry| {
                 let score = score_candidate(query, &entry);
                 ScoredCandidate { entry, score }

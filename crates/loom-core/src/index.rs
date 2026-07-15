@@ -21,7 +21,7 @@
 //! would be a conflict nobody can resolve. When a record merges, its entry is recomputed on the
 //! target, not transplanted.
 
-use crate::value::SourceRef;
+use crate::value::{SourceRef, TrustClass};
 use crate::Key;
 use serde::{Deserialize, Serialize};
 
@@ -52,6 +52,10 @@ pub struct IndexEntry {
     /// Whether the underlying claim is `Stale`. Cached here so the ranker can penalise it (AT-043)
     /// without re-reading the record, and so the packed context can mark it for the model.
     pub stale: bool,
+    /// **The effective trust label of this record's information** — the most restrictive trust of
+    /// everything it was derived from (AT-035). Cached here so the influence filter (AT-036) can drop a
+    /// restricted candidate *before* packing, without walking the DAG for every candidate.
+    pub label: TrustClass,
 }
 
 impl IndexEntry {
@@ -61,12 +65,14 @@ impl IndexEntry {
     /// time: if nothing can say where a fact came from, it never enters the index, so no retrieval
     /// can ever pack an uncited item. Returns `None`, and the caller must decide — but the caller
     /// cannot decide to store one anyway, because there is no other constructor.
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         key: Key,
         text: impl Into<String>,
         embedding: Option<Embedding>,
         citations: Vec<SourceRef>,
         stale: bool,
+        label: TrustClass,
     ) -> Option<Self> {
         if citations.is_empty() {
             return None;
@@ -77,6 +83,7 @@ impl IndexEntry {
             embedding,
             citations,
             stale,
+            label,
         })
     }
 
@@ -105,7 +112,14 @@ mod tests {
 
     #[test]
     fn an_entry_with_no_citation_cannot_be_built() {
-        let none = IndexEntry::new(b"claim/x".to_vec(), "text", None, vec![], false);
+        let none = IndexEntry::new(
+            b"claim/x".to_vec(),
+            "text",
+            None,
+            vec![],
+            false,
+            TrustClass::Untrusted,
+        );
         assert!(
             none.is_none(),
             "AT-041: an uncited entry must not exist, or a retrieval could pack an uncited item"
@@ -120,6 +134,7 @@ mod tests {
             Some(Embedding::new([0.1, 0.2])),
             vec![SourceRef::new("web", "page-1")],
             false,
+            TrustClass::Untrusted,
         )
         .expect("has a citation");
         let bytes = e.encode().unwrap();
