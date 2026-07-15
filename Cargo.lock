@@ -955,6 +955,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "loom-mcp"
+version = "0.1.0"
+dependencies = [
+ "loom-action",
+ "loom-branch",
+ "loom-core",
+ "loom-memory",
+ "loom-policy",
+ "loom-provenance",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
 name = "loom-memory"
 version = "0.1.0"
 dependencies = [
