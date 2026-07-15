@@ -42,19 +42,35 @@ jobs:
       - run: cargo test --workspace --all-targets
       - run: cargo test --workspace --doc
 
-  # The model oracle. A naive, obviously-correct reference implementation — with a real two-parent
-  # commit DAG, which substrate does not have — differentially tested against the real engine under
-  # randomized branch/write/merge sequences.
-  #
-  # It has already found three real bugs in the merge engine, including one that silently
-  # double-counted a counter on a second merge. If this job goes red, do not ship.
-  oracle:
-    name: model oracle (2,000 sessions)
+  # THE ACCEPTANCE TEST. The Q3 demo (docs/04 §3.1), all ten steps, driven through the MCP surface by
+  # a scripted agent — no LLM. --nocapture so the narrative is visible in the log: a buyer can read the
+  # story, including step 8 (the injection refused) and step 10 (taint naming the account it cannot
+  # un-suspend, first). If this goes red, loomdb-v0.1 is not shippable.
+  demo:
+    name: the Q3 demo (verbatim)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo test -p loom-mcp --test demo -- --nocapture
+
+  # The four model oracles. Each is a naive, obviously-correct reference implementation differentially
+  # tested against the real engine under randomized operation sequences. Between them they have found
+  # multiple real bugs (a double-counted counter on re-merge; provenance overwritten by the data commit;
+  # a taint that stopped at merge boundaries). If any goes red, do not ship.
+  oracles:
+    name: model oracles (branch · taint · isolation · policy)
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v5
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       - run: cargo test -p loom-branch --release --test oracle
-        env:
-          PROPTEST_CASES: 2000
+        env: { PROPTEST_CASES: "2000" }
+      - run: cargo test -p loom-provenance --release --test oracle
+        env: { TAINT_CASES: "2000" }
+      - run: cargo test -p loom-memory --release --test isolation
+        env: { ISOLATION_CASES: "1000" }
+      - run: cargo test -p loom-policy --release --test oracle
+        env: { POLICY_CASES: "4000" }
