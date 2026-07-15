@@ -22,11 +22,15 @@
 
 mod forget;
 mod hnsw;
+mod hnsw_store;
 mod retrieval;
 mod tokens;
 
 pub use forget::{ForgetReport, Forgetter, IrreversibleEffect};
 pub use hnsw::{Hnsw, ItemId, EF_DEFAULT, M};
+pub use hnsw_store::{
+    insert as hnsw_insert, search as hnsw_search, HnswMeta, NodeStore, PersistedNode,
+};
 pub use retrieval::{
     pack, score_candidate, PackedContext, PackedItem, RetrievalQuery, Retriever, ScoredCandidate,
 };
