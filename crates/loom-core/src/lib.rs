@@ -32,6 +32,7 @@
 mod embedding;
 mod envelope;
 mod error;
+mod history;
 mod ids;
 mod index;
 mod provenance;
@@ -42,6 +43,7 @@ mod value;
 pub use embedding::Embedding;
 pub use envelope::WriteEnvelope;
 pub use error::{LoomError, Result};
+pub use history::{ClaimVersion, RESERVED_HISTORY_PREFIX};
 pub use ids::{
     ActorId, BranchId, ClaimId, CommitId, ObservationId, PolicyDecisionId, SessionId, TenantId,
 };

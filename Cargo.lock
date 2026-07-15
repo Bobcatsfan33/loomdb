@@ -1007,6 +1007,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "loom-query"
+version = "0.1.0"
+dependencies = [
+ "loom-branch",
+ "loom-core",
+ "substrate-pager",
+]
+
+[[package]]
 name = "lru-slab"
 version = "0.1.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"

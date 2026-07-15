@@ -1,0 +1,11 @@
+[package]
+name = "loom-query"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+loom-core = { path = "../loom-core" }
+loom-branch = { path = "../loom-branch" }
+substrate-pager = { git = "https://github.com/Bobcatsfan33/substrate", tag = "substrate-v1.2.1" }
+
+[dev-dependencies]

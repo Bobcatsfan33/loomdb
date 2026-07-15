@@ -9,6 +9,7 @@ members = [
     "crates/loom-policy",
     "crates/loom-action",
     "crates/loom-mcp",
+    "crates/loom-query",
 ]
 
 [workspace.package]

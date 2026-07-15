@@ -21,8 +21,9 @@ use crate::tree::Tree;
 use ed25519_dalek::VerifyingKey;
 use loom_core::{
     is_provenance, latest_node_key, node_storage_key, prov_seq_key, source_index_key, ActorId,
-    BranchId, ClaimStatus, CommitId, DerivationNode, IndexEntry, IndexHint, Key, LoomError, NodeId,
-    Record, Result, SessionId, SourceRef, TenantId, TrustClass, Value, WriteEnvelope,
+    BranchId, Claim, ClaimStatus, ClaimVersion, CommitId, DerivationNode, IndexEntry, IndexHint,
+    Key, LoomError, NodeId, Record, Result, SessionId, SourceRef, TenantId, TrustClass, Value,
+    WriteEnvelope,
 };
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::{Arc, Mutex};
@@ -763,6 +764,15 @@ impl Loom {
             )?;
         }
 
+        // Bitemporal history — a claim assertion APPENDS a version and CLOSES the prior open one's
+        // known interval (AT-005/AT-006). Never an overwrite: "what did you believe last week" stays
+        // answerable forever. In this same commit, so a belief and its history cannot diverge.
+        for (_, record) in &written {
+            if let Record::Claim(claim) = record {
+                append_claim_version(&mut tree, claim)?;
+            }
+        }
+
         tree.flush(&mut txn)?;
         let commit = store.commit(txn)?;
 
@@ -1407,4 +1417,74 @@ fn own_trust(record: &Record) -> TrustClass {
         Record::Observation(obs) => obs.trust,
         Record::Claim(_) | Record::Value(_) => TrustClass::least_restrictive(),
     }
+}
+
+/// Append a claim version, closing the prior open version of the same `(subject, predicate)`.
+///
+/// The heart of the bitemporal history (AT-005/AT-006). Reads the existing versions for this claim's
+/// subject+predicate, closes whichever is still open (its `known.end` becomes the new version's
+/// `known.start` — we believed the old thing right up until we believed the new one), marks it
+/// `Superseded`, and appends the new version at the next sequence. Nothing is overwritten; the log
+/// only grows.
+fn append_claim_version(tree: &mut Tree<'_>, claim: &Claim) -> Result<()> {
+    let subject = &claim.subject;
+    let predicate = &claim.predicate;
+    let prefix = ClaimVersion::history_prefix(subject, predicate);
+
+    // Find the existing versions, and the highest sequence.
+    let mut max_seq: Option<u64> = None;
+    let mut open: Vec<(Key, ClaimVersion)> = Vec::new();
+    for (key, record) in tree.scan()? {
+        if !key.starts_with(&prefix) {
+            continue;
+        }
+        let Record::Value(Value::Blob(bytes)) = record else {
+            continue;
+        };
+        let Ok(version) = ClaimVersion::decode(&bytes) else {
+            continue;
+        };
+        max_seq = Some(max_seq.map_or(version.seq, |m| m.max(version.seq)));
+        // An "open" version is one whose known interval has not been closed.
+        if version.claim.known.end.is_none() {
+            open.push((key, version));
+        }
+    }
+
+    // Close every still-open prior version at the moment the new belief begins.
+    let now = claim.known.start;
+    for (key, mut version) in open {
+        if let Some(start) = now {
+            version.claim.known = version.claim.known.closed_at(start);
+        }
+        version.claim.status = ClaimStatus::Superseded;
+        tree.insert(
+            key,
+            Record::Value(Value::Blob(version.encode().map_err(|source| {
+                LoomError::Codec {
+                    op: "encode",
+                    what: "claim version",
+                    source,
+                }
+            })?)),
+        )?;
+    }
+
+    // Append the new version.
+    let seq = max_seq.map_or(0, |m| m + 1);
+    let version = ClaimVersion {
+        claim: claim.clone(),
+        seq,
+    };
+    tree.insert(
+        ClaimVersion::storage_key(subject, predicate, seq),
+        Record::Value(Value::Blob(version.encode().map_err(|source| {
+            LoomError::Codec {
+                op: "encode",
+                what: "claim version",
+                source,
+            }
+        })?)),
+    )?;
+    Ok(())
 }
