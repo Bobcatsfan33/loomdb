@@ -902,6 +902,13 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "0ceec5bc11778974d1bcb055b18002eba7f4b3518b6a0081b3af5f21666da9ad"
 
 [[package]]
+name = "loom-bench"
+version = "0.1.0"
+dependencies = [
+ "libc",
+]
+
+[[package]]
 name = "loom-branch"
 version = "0.1.0"
 dependencies = [
@@ -909,6 +916,7 @@ dependencies = [
  "blake3",
  "ed25519-dalek",
  "getrandom 0.2.17",
+ "loom-bench",
  "loom-core",
  "object_store",
  "proptest",

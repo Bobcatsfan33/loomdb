@@ -24,6 +24,7 @@
 //! else. The absolute figures will differ on your hardware; the **shape across the sweep** is the
 //! claim, and it is the part that should reproduce.
 
+use loom_bench::{preflight, BenchScratch};
 use loom_branch::Loom;
 use loom_core::{ActorId, Key, Record, SessionId, TenantId, Value, WriteEnvelope};
 use std::time::Instant;
@@ -58,9 +59,22 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     );
     println!("{}", "─".repeat(72));
 
+    // Scratch under a NAMED directory, reaped on startup (which catches whatever a previous *killed*
+    // run stranded) and on Drop. This is the fix for the incident where killed runs leaked hundreds of
+    // MB into tempfile dirs and filled the host to zero — see the loom-bench crate docs.
+    let scratch = BenchScratch::open(&std::env::temp_dir(), "at-011")?;
+
+    // Pre-flight the WHOLE sweep before writing a single record. The engine fails fast with StorageFull;
+    // the harness must fail fast too, and name the shortfall, rather than discover it mid-seed.
+    let total: u64 = sizes.iter().map(|&s| s as u64).sum();
+    if let Err(refused) = preflight(total, scratch.path())? {
+        eprintln!("{refused}");
+        return Err(refused.into());
+    }
+
     for &size in &sizes {
-        let dir = tempfile::tempdir()?;
-        let db = Loom::open(dir.path(), TenantId::new("bench"))?;
+        let dir = scratch.db_dir(&format!("baseline-{size}"))?;
+        let db = Loom::open(&dir, TenantId::new("bench"))?;
         let (session, mut token) = db.open_session()?;
 
         let seed_start = Instant::now();
@@ -97,7 +111,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             micros(pct(&samples, 50.0)),
             micros(pct(&samples, 95.0)),
             micros(pct(&samples, 99.0)),
-            bytes(dir_size(dir.path())),
+            bytes(dir_size(&dir)),
         );
     }
 
