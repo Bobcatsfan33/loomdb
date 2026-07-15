@@ -1,0 +1,11 @@
+[package]
+name = "loom-action"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+loom-core = { path = "../loom-core" }
+loom-policy = { path = "../loom-policy" }
+blake3 = "1"
+
+[dev-dependencies]
