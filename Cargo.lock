@@ -957,6 +957,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "loom-policy"
+version = "0.1.0"
+dependencies = [
+ "loom-core",
+ "proptest",
+ "serde",
+]
+
+[[package]]
 name = "loom-provenance"
 version = "0.1.0"
 dependencies = [

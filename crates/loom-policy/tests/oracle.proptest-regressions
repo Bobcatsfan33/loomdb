@@ -1,0 +1,8 @@
+# Seeds for failure cases proptest has generated in the past. It is
+# automatically read and these particular cases re-run before any
+# novel cases are generated.
+#
+# It is recommended to check this file in to source control so that
+# everyone who runs the test benefits from these saved cases.
+cc d0feb6b218ad94b5d1d507926c4a4bd143767eb52513e719bfad57a2dbd66560 # shrinks to rules = [PolicyRule { actor: Any, label: Any, purpose: Any, action: Any, effect: Allow }, PolicyRule { actor: Any, label: Any, purpose: Any, action: Any, effect: Deny }], requests = [Request { actor: "agent", label: VerifiedSystem, purpose: "public_answer", action: "read" }]
+cc 20e092abffe539d2bcbe55594bc88e0023aab3cff41559f10f7959a619b928e3 # shrinks to rules = [PolicyRule { actor: Any, label: Any, purpose: Any, action: Any, effect: Deny }, PolicyRule { actor: Any, label: Any, purpose: Any, action: Any, effect: Allow }], req = Request { actor: "agent", label: VerifiedSystem, purpose: "public_answer", action: "read" }

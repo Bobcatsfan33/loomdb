@@ -1,0 +1,11 @@
+[package]
+name = "loom-policy"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+loom-core = { path = "../loom-core" }
+serde = { version = "1", features = ["derive"] }
+
+[dev-dependencies]
+proptest = "1.5"
