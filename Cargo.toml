@@ -11,6 +11,7 @@ members = [
     "crates/loom-mcp",
     "crates/loom-query",
     "crates/loom-soak",
+    "crates/loom-bundle",
 ]
 
 [workspace.package]
