@@ -197,7 +197,12 @@ mod tests {
     #[test]
     fn a_token_authorizes_exactly_its_scope_and_nothing_else() -> Result<()> {
         let issuer = TokenIssuer::generate();
-        let token = issuer.issue(TenantId::new("t"), SessionId::new("s1"), scope(&["b1", "b2"]), NOW + HOUR)?;
+        let token = issuer.issue(
+            TenantId::new("t"),
+            SessionId::new("s1"),
+            scope(&["b1", "b2"]),
+            NOW + HOUR,
+        )?;
 
         issuer.authorize(&token, &BranchId::new("b1"), NOW)?;
         issuer.authorize(&token, &BranchId::new("b2"), NOW)?;
@@ -217,7 +222,12 @@ mod tests {
     #[test]
     fn an_expired_token_authorizes_nothing() -> Result<()> {
         let issuer = TokenIssuer::generate();
-        let token = issuer.issue(TenantId::new("t"), SessionId::new("s1"), scope(&["b1"]), NOW + HOUR)?;
+        let token = issuer.issue(
+            TenantId::new("t"),
+            SessionId::new("s1"),
+            scope(&["b1"]),
+            NOW + HOUR,
+        )?;
 
         issuer.authorize(&token, &BranchId::new("b1"), NOW)?;
         assert!(matches!(
@@ -232,7 +242,12 @@ mod tests {
         // The attack: take a valid token, add a branch to the scope, present it. The signature must
         // fail, or a capability is just a suggestion.
         let issuer = TokenIssuer::generate();
-        let mut token = issuer.issue(TenantId::new("t"), SessionId::new("s1"), scope(&["b1"]), NOW + HOUR)?;
+        let mut token = issuer.issue(
+            TenantId::new("t"),
+            SessionId::new("s1"),
+            scope(&["b1"]),
+            NOW + HOUR,
+        )?;
 
         token
             .claims
@@ -249,7 +264,12 @@ mod tests {
     #[test]
     fn a_client_cannot_extend_its_own_expiry() -> Result<()> {
         let issuer = TokenIssuer::generate();
-        let mut token = issuer.issue(TenantId::new("t"), SessionId::new("s1"), scope(&["b1"]), NOW)?;
+        let mut token = issuer.issue(
+            TenantId::new("t"),
+            SessionId::new("s1"),
+            scope(&["b1"]),
+            NOW,
+        )?;
         token.claims.expires_at_ms = NOW + 100 * HOUR;
 
         assert!(matches!(
@@ -264,7 +284,12 @@ mod tests {
         let ours = TokenIssuer::generate();
         let theirs = TokenIssuer::generate();
 
-        let foreign = theirs.issue(TenantId::new("t"), SessionId::new("s1"), scope(&["b1"]), NOW + HOUR)?;
+        let foreign = theirs.issue(
+            TenantId::new("t"),
+            SessionId::new("s1"),
+            scope(&["b1"]),
+            NOW + HOUR,
+        )?;
 
         assert!(matches!(
             ours.authorize(&foreign, &BranchId::new("b1"), NOW),
@@ -276,7 +301,12 @@ mod tests {
     #[test]
     fn extending_a_token_adds_one_branch_and_leaves_the_old_token_alone() -> Result<()> {
         let issuer = TokenIssuer::generate();
-        let original = issuer.issue(TenantId::new("t"), SessionId::new("s1"), scope(&["b1"]), NOW + HOUR)?;
+        let original = issuer.issue(
+            TenantId::new("t"),
+            SessionId::new("s1"),
+            scope(&["b1"]),
+            NOW + HOUR,
+        )?;
 
         let extended = issuer.extend(&original, BranchId::new("b2"))?;
 
