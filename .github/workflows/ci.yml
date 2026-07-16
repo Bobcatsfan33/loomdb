@@ -5,6 +5,10 @@ on:
     branches: [main]
   pull_request:
   workflow_dispatch:
+  schedule:
+    # Nightly, 06:00 UTC — the full-window soaks (docs/04 L5). The fast default of both soaks runs in
+    # the ordinary `test` job on every push; this runs the long, release, flat-memory-measured window.
+    - cron: "0 6 * * *"
 
 env:
   CARGO_TERM_COLOR: always
@@ -134,3 +138,48 @@ jobs:
             exit 1
           fi
           echo "OK: loomd airgap binary has no object-storage client compiled in."
+
+  # L5 no-egress certification: the WHOLE suite passes with no route to the outside world. This proves
+  # nothing in LoomDB needs egress — sleep/wake tests use the in-memory object-store backend, and the
+  # oracles, demo, and soaks are all local. Vendor deps while the network is up, then run offline inside
+  # a `--network none` container. (The `airgap` job proves the shipped binary has no S3 client; this
+  # proves the running suite needs no network. Two different guarantees, both required.)
+  no-egress:
+    name: no-egress (offline suite, --network none)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Vendor dependencies (network available)
+        run: |
+          mkdir -p .cargo
+          cargo vendor vendor > vendor-config.toml
+          cat vendor-config.toml >> .cargo/config.toml
+      - name: Run the suite with no network route at all
+        run: |
+          docker run --rm --network none \
+            -v "$PWD":/w -w /w \
+            -e CARGO_TERM_COLOR=always \
+            -e CARGO_HOME=/w/.cargo-home \
+            rust:1 \
+            cargo test --workspace --offline --lib --bins --tests
+
+  # The full-window soaks (docs/04 L5) — the actual gate on the loomdb-v0.2 tag. NIGHTLY / manual only:
+  # the fast default of both soaks already runs on every push (the `test` job), catching regressions;
+  # this runs the long, RELEASE, flat-memory-measured window on the runner (the headroom host, not a dev
+  # laptop). Both gate on zero errors AND flat memory — a leak fails the job (loom_soak::FlatMemory).
+  soak:
+    name: soaks (full window, nightly)
+    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Soak A — airgap endurance (120-day window, long run)
+        run: cargo test -p loom-soak --release --test airgap_endurance -- --nocapture
+        env: { LOOM_SOAK_ITERS: "50000" }
+      - name: Soak B — multi-tenant concurrency (long run, more workers)
+        run: cargo test -p loom-soak --release --test multitenant_endurance -- --nocapture
+        env: { LOOM_SOAK_ITERS: "8000", LOOM_SOAK_WORKERS: "8" }
