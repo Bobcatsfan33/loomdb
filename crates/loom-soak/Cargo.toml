@@ -1,0 +1,31 @@
+[package]
+name = "loom-soak"
+description = "The two long soaks (docs/04 L5): airgap endurance and multi-tenant concurrency. Both gate on zero errors AND flat memory across a full window — a slow leak in a year-long process is a guaranteed outage."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+# The library half is only the shared instrumentation the soaks need: an RSS sampler and the
+# flat-memory gate. The soaks themselves are integration tests (tests/), one per scenario file.
+[dependencies]
+# For current-RSS on macOS (getrusage). On Linux the sampler reads /proc/self/statm with no dep;
+# libc is only pulled for the getrusage fallback. Same crate loom-bench already uses.
+libc = "0.2"
+
+[dev-dependencies]
+# The whole engine converges here so a soak can drive a real agent workload across every crate at once.
+loom-core = { path = "../loom-core" }
+# default-features = false to inherit the airgap posture — Soak A runs airgapped (no remote path).
+loom-branch = { path = "../loom-branch", default-features = false }
+loom-provenance = { path = "../loom-provenance", default-features = false }
+loom-memory = { path = "../loom-memory", default-features = false }
+loom-policy = { path = "../loom-policy" }
+loom-action = { path = "../loom-action" }
+loom-bench = { path = "../loom-bench" }
+# Soak A's first real use of the offline license clock — the never-hard-stop / anti-tamper engine.
+substrate-security = { git = "https://github.com/Bobcatsfan33/substrate", tag = "substrate-v1.2.1" }
+# The budgeted in-memory VFS (CrashVfs::with_budget) that models storage exhaustion with zero disk risk.
+substrate-pager = { workspace = true, features = ["test-util"] }
+ed25519-dalek = { workspace = true }

@@ -10,6 +10,7 @@ members = [
     "crates/loom-action",
     "crates/loom-mcp",
     "crates/loom-query",
+    "crates/loom-soak",
 ]
 
 [workspace.package]
