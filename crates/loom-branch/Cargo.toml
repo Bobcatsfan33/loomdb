@@ -11,7 +11,10 @@ repository.workspace = true
 loom-core.workspace = true
 substrate-pager.workspace = true
 substrate-security.workspace = true
-substrate-store.workspace = true
+# The ONLY dependency that links an object-storage client, and the only thing the `sleep`/`wake`
+# remote-tier path needs. Optional, behind the `remote` feature (see [features]): an airgap build
+# compiles it — and every S3 client transitively inside it — out entirely.
+substrate-store = { workspace = true, optional = true }
 thiserror.workspace = true
 serde.workspace = true
 bincode.workspace = true
@@ -20,14 +23,31 @@ blake3.workspace = true
 getrandom = "0.2"
 ed25519-dalek.workspace = true
 
-tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
-object_store = "0.11"
-
 [dev-dependencies]
 substrate-pager = { workspace = true, features = ["test-util"] }
 loom-bench = { path = "../loom-bench" }
 proptest.workspace = true
 tempfile.workspace = true
+# Test-only. `tokio` drives the async sleep/wake tests; `object_store` provides the in-memory backend
+# the persistence test sleeps into. Neither is used by library code — the library's remote path needs
+# only `substrate-store` — so both are dev-dependencies and never reach a shipped binary. (The
+# persistence test itself is `#![cfg(feature = "remote")]`, so an airgap test build skips it too.)
+tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
+object_store = "0.11"
+
+[features]
+# The remote tier is on by default: a normal build can sleep a tenant to object storage and wake it.
+default = ["remote"]
+# `remote` = the only code in LoomDB that links an object-storage client (substrate-store, and every
+# S3/GCS/Azure client inside it). Building `--no-default-features` compiles the whole `sleep`/`wake`
+# path out, so an **airgap build has no object-storage client in the binary** — an amputation an
+# auditor verifies by inspecting the artifact (`cargo tree --no-default-features -e no-dev` shows no
+# `object_store`), not a `--network none` runtime flag they must trust stays applied in production.
+remote = ["dep:substrate-store"]
+# A marker naming the airgap posture for the proof-of-offline manifest and the `no-egress` CI job.
+# Cargo features are additive and cannot *remove* `remote`, so the airgap BUILD is
+# `--no-default-features --features airgap`; this marker is how code and docs name that posture.
+airgap = []
 
 [[bench]]
 name = "branching"

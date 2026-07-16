@@ -109,3 +109,28 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - run: cargo test -p loom-branch --release --test crash
         env: { AT045_STRIDE: "1" }
+
+  # L5 airgap certification (the amputation, structurally verified). The only code in LoomDB that links
+  # an object-storage client is loom-branch's `remote` sleep/wake path; the airgap build compiles it out.
+  # This job proves the amputation the way an auditor would — by inspecting the artifact's dependency
+  # graph, not by trusting a `--network none` runtime flag — so it CANNOT silently regress if someone
+  # re-adds a default-features edge. It also builds loomd airgapped to prove the gate compiles.
+  airgap:
+    name: airgap amputation (no S3 client in loomd)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: loomd airgap build compiles
+        run: cargo build -p loom-mcp --no-default-features --features airgap
+      - name: no object-storage client in the airgap binary graph
+        run: |
+          echo "loomd airgap dependency graph (no-dev):"
+          cargo tree -p loom-mcp --no-default-features --features airgap -e no-dev
+          if cargo tree -p loom-mcp --no-default-features --features airgap -e no-dev \
+               | grep -iE 'object_store|substrate-store'; then
+            echo "::error::airgap amputation FAILED — loomd links an object-storage client. A default-features edge to loom-branch's remote path leaked back in."
+            exit 1
+          fi
+          echo "OK: loomd airgap binary has no object-storage client compiled in."

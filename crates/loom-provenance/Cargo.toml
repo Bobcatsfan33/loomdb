@@ -9,7 +9,12 @@ repository.workspace = true
 
 [dependencies]
 loom-core.workspace = true
-loom-branch.workspace = true
+# default-features = false so this crate does not force loom-branch's `remote` (object-storage) path
+# on: the airgap posture propagates up from loom-branch through here to loomd. See [features].
+# NOTE: the explicit `path` form, NOT `workspace = true` — `default-features = false` is silently
+# IGNORED when combined with dependency inheritance (it must instead be set in the workspace table), so
+# using the inherited form here would leak `remote` back into every airgap build through this one edge.
+loom-branch = { path = "../loom-branch", default-features = false }
 substrate-pager.workspace = true
 thiserror.workspace = true
 serde.workspace = true
@@ -19,3 +24,11 @@ blake3.workspace = true
 [dev-dependencies]
 proptest.workspace = true
 tempfile.workspace = true
+
+[features]
+# The airgap posture forwards up the dependency chain: this crate's `remote`/`airgap` map straight to
+# loom-branch's, so building loomd `--no-default-features --features airgap` compiles the object-storage
+# client out of every crate at once. See loom-branch's [features] for the amputation this protects.
+default = ["remote"]
+remote = ["loom-branch/remote"]
+airgap = ["loom-branch/airgap"]

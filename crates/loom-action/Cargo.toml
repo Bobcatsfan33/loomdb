@@ -9,5 +9,8 @@ loom-policy = { path = "../loom-policy" }
 blake3 = "1"
 
 [dev-dependencies]
-loom-branch = { path = "../loom-branch" }
-loom-provenance = { path = "../loom-provenance" }
+# default-features = false: these tests never exercise the remote sleep/wake path, and leaving the
+# default (`remote`) on would unify the object-storage client back into every airgap build in the
+# workspace through this one dev edge. The amputation has to hold on every edge, including test ones.
+loom-branch = { path = "../loom-branch", default-features = false }
+loom-provenance = { path = "../loom-provenance", default-features = false }

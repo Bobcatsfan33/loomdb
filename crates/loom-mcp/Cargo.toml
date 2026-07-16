@@ -9,12 +9,21 @@ path = "src/main.rs"
 
 [dependencies]
 loom-core = { path = "../loom-core" }
-loom-branch = { path = "../loom-branch" }
-loom-provenance = { path = "../loom-provenance" }
-loom-memory = { path = "../loom-memory" }
+# The airgap posture terminates here, at the binary. default-features = false on every remote-carrying
+# dependency, and loomd's own `remote`/`airgap` forward to all of them — so `cargo build -p loom-mcp
+# --no-default-features --features airgap` produces a loomd with NO object-storage client anywhere in
+# its graph (verify: `cargo tree -p loom-mcp --no-default-features --features airgap -e no-dev`).
+loom-branch = { path = "../loom-branch", default-features = false }
+loom-provenance = { path = "../loom-provenance", default-features = false }
+loom-memory = { path = "../loom-memory", default-features = false }
 loom-policy = { path = "../loom-policy" }
 loom-action = { path = "../loom-action" }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+
+[features]
+default = ["remote"]
+remote = ["loom-branch/remote", "loom-provenance/remote", "loom-memory/remote"]
+airgap = ["loom-branch/airgap", "loom-provenance/airgap", "loom-memory/airgap"]
 
 [dev-dependencies]

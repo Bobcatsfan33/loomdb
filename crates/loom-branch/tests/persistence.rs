@@ -5,6 +5,12 @@
 //! guess.
 //!
 //! The question that has to have an answer: **"where is branch h2 after a restart?"**
+//!
+//! This whole file exercises the **remote** sleep/wake path, so it is compiled only with the `remote`
+//! feature (on by default). An airgap build (`--no-default-features`) has no object-storage client, so
+//! there is nothing here to test — the file is compiled out, not skipped-with-a-lie (CLAUDE.md rule 8:
+//! the reason is written down, here).
+#![cfg(feature = "remote")]
 
 use loom_branch::{Loom, LoomWakeToken, MergePolicy};
 use loom_core::{ActorId, BranchId, Record, Result, SessionId, TenantId, Value, WriteEnvelope};

@@ -15,6 +15,8 @@
 
 use crate::merge::{is_reserved, merged_from_key, plan_merge, MergeOutcome, MergePolicy};
 use crate::refs::{FileRefStore, MemRefStore, RefStore, Refs};
+// Only the gated `sleep`/`wake` methods name this type; unused in an airgap build.
+#[cfg(feature = "remote")]
 use crate::sleep::LoomWakeToken;
 use crate::token::{CapabilityToken, TokenIssuer};
 use crate::tree::Tree;
@@ -1391,9 +1393,14 @@ impl Loom {
 
     /// **Sleep the whole tenant** into object storage.
     ///
+    /// Only compiled with the `remote` feature (on by default). An airgap build
+    /// (`--no-default-features`) has no object-storage client, so there is nothing to sleep *to* — the
+    /// method does not exist rather than existing and failing at runtime.
+    ///
     /// Every branch is a head, and every head's pages *and its full manifest ancestry* must be durable
     /// before a single local byte is dropped. Putting a tenant to sleep must not quietly discard the
     /// branches nobody happened to be looking at.
+    #[cfg(feature = "remote")]
     ///
     /// The returned token carries the refs — branch heads, tags, and the commit DAG. A token that
     /// carried only data would restore the database and lose the branch names, and *"where is branch
@@ -1427,6 +1434,9 @@ impl Loom {
     }
 
     /// **Wake a sleeping tenant.** Branch names and all.
+    ///
+    /// Only compiled with the `remote` feature (on by default) — see [`sleep`](Self::sleep).
+    #[cfg(feature = "remote")]
     pub fn wake(tiered: &substrate_store::TieredStore, token: &LoomWakeToken) -> Result<Self> {
         let store = Arc::new(MemRefStore::new());
         store.save(&token.refs)?;
