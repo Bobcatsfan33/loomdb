@@ -23,7 +23,7 @@
 
 use std::collections::{BinaryHeap, HashMap, HashSet};
 
-use loom_core::Embedding;
+use crate::Embedding;
 
 /// The identity of an indexed item — its record key.
 pub type ItemId = Vec<u8>;

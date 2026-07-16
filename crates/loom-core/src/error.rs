@@ -130,6 +130,13 @@ pub enum LoomError {
         detail: String,
     },
 
+    /// The ANN index could not be built or searched. Carries the underlying reason.
+    #[error("the ANN (vector) index operation failed: {detail}")]
+    Index {
+        /// What went wrong, in words.
+        detail: String,
+    },
+
     /// Serialization failed.
     #[error("failed to {op} {what}: {source}")]
     Codec {

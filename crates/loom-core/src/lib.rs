@@ -33,6 +33,8 @@ mod embedding;
 mod envelope;
 mod error;
 mod history;
+mod hnsw;
+mod hnsw_store;
 mod ids;
 mod index;
 mod provenance;
@@ -44,6 +46,11 @@ pub use embedding::Embedding;
 pub use envelope::WriteEnvelope;
 pub use error::{LoomError, Result};
 pub use history::{ClaimVersion, RESERVED_HISTORY_PREFIX};
+pub use hnsw::{Hnsw, ItemId, EF_DEFAULT, M};
+pub use hnsw_store::{
+    hnsw_meta_key, hnsw_node_key, insert as hnsw_insert, search as hnsw_search, HnswMeta,
+    NodeStore, PersistedNode, StoreError, RESERVED_HNSW_PREFIX,
+};
 pub use ids::{
     ActorId, BranchId, ClaimId, CommitId, ObservationId, PolicyDecisionId, SessionId, TenantId,
 };

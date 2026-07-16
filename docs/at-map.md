@@ -7,12 +7,13 @@
 > A capability is not done when it works. It is done when the test that would have caught it failing
 > is green. Anything else on this page is not a claim, it is a plan.
 
-Status as of **loomdb-v0.1** — L1 → L4 complete.
+Status as of **loomdb-v0.2 (in progress)** — L1 → L4 complete, v0.2 underway.
 
-**The full scoreboard: AT-001 through AT-047 are green or structurally satisfied, with exactly one
-exception — AT-045 — deferred to v0.2 with a reason in writing (below).** Four model oracles hold under
-fuzzing (branch/merge, taint, isolation, policy). The Q3 demo (docs/04 §3.1) runs verbatim in CI, no
-LLM, and steps 8 and 10 are asserted as the bar.
+**The full scoreboard: AT-001 through AT-047 are ALL green or structurally satisfied.** AT-045
+(crash-at-any-byte, LoomDB-shaped) was the one item deferred at the v0.1 tag; it is **closed in v0.2**
+(below), so the board no longer has an exception. Four model oracles hold under fuzzing (branch/merge,
+taint, isolation, policy). The Q3 demo (docs/04 §3.1) runs verbatim in CI, no LLM, and steps 8 and 10
+are asserted as the bar.
 
 > The rules that must not be "optimized" away later are in [invariants.md](./invariants.md). Each one
 > is there because breaking it produced a bug that **did not fail loudly**.

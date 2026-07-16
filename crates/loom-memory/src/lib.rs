@@ -21,20 +21,17 @@
 //!   derived from it, and reports what it could not undo.
 
 mod forget;
-mod hnsw;
-mod hnsw_store;
 mod retrieval;
 mod tokens;
 
 pub use forget::{ForgetReport, Forgetter, IrreversibleEffect};
-pub use hnsw::{Hnsw, ItemId, EF_DEFAULT, M};
-pub use hnsw_store::{
-    insert as hnsw_insert, search as hnsw_search, HnswMeta, NodeStore, PersistedNode,
-};
 pub use retrieval::{
     pack, score_candidate, PackedContext, PackedItem, RetrievalQuery, Retriever, ScoredCandidate,
 };
 pub use tokens::{estimate, Budget};
 
 /// Re-exported so callers do not need a direct `loom-core` dependency just to build a query.
-pub use loom_core::{Embedding, IndexEntry};
+pub use loom_core::{
+    hnsw_insert, hnsw_search, Embedding, Hnsw, HnswMeta, IndexEntry, ItemId, NodeStore,
+    PersistedNode, StoreError, EF_DEFAULT, M,
+};

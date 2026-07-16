@@ -13,7 +13,7 @@
 
 use std::collections::{BinaryHeap, HashSet};
 
-use loom_core::Embedding;
+use crate::Embedding;
 use serde::{Deserialize, Serialize};
 
 use crate::hnsw::{ItemId, EF_DEFAULT, M};
@@ -38,16 +38,25 @@ pub struct HnswMeta {
     pub dim: Option<usize>,
 }
 
-/// Where the graph's nodes and meta live. The tree implements this; tests use an in-memory map.
+/// An error from the backing store — boxed so this crate stays decoupled from any one storage layer's
+/// error type (the tree's `LoomError`, a test map's infallibility).
+pub type StoreError = Box<dyn std::error::Error + Send + Sync>;
+
+/// Where the graph's nodes and meta live. The branch tree implements this; tests use an in-memory map.
+///
+/// **Fallible on purpose.** A tree-backed store can fail to read (I/O) or to decode (a torn node), and
+/// a graph algorithm that treats a *failed* read as "the node is missing" would silently corrupt the
+/// graph — the exact class of quiet-wrong bug the recall oracle exists to catch. So every access
+/// returns `Result`, and `insert`/`search` propagate it.
 pub trait NodeStore {
-    /// Read a node by id.
-    fn get_node(&self, id: &[u8]) -> Option<PersistedNode>;
+    /// Read a node by id. `Ok(None)` means "not present"; `Err` means "could not tell".
+    fn get_node(&self, id: &[u8]) -> Result<Option<PersistedNode>, StoreError>;
     /// Write a node.
-    fn put_node(&mut self, id: &[u8], node: &PersistedNode);
+    fn put_node(&mut self, id: &[u8], node: &PersistedNode) -> Result<(), StoreError>;
     /// Read the meta.
-    fn get_meta(&self) -> HnswMeta;
+    fn get_meta(&self) -> Result<HnswMeta, StoreError>;
     /// Write the meta.
-    fn put_meta(&mut self, meta: &HnswMeta);
+    fn put_meta(&mut self, meta: &HnswMeta) -> Result<(), StoreError>;
 }
 
 /// Cosine distance in `[0, 2]`; an incomparable pair is maximally far so it never wins.
@@ -66,19 +75,19 @@ fn level_of(id: &[u8]) -> usize {
 
 /// **Insert `(id, vector)` into the persisted graph.** Returns `false` on a dimension mismatch (a
 /// mixed-dimension index is uncomparable and must be refused, not silently corrupt the graph).
-pub fn insert(store: &mut dyn NodeStore, id: &[u8], vector: Embedding) -> bool {
-    let mut meta = store.get_meta();
+pub fn insert(store: &mut dyn NodeStore, id: &[u8], vector: Embedding) -> Result<bool, StoreError> {
+    let mut meta = store.get_meta()?;
     match meta.dim {
-        Some(d) if d != vector.dim() => return false,
+        Some(d) if d != vector.dim() => return Ok(false),
         None => meta.dim = Some(vector.dim()),
         _ => {}
     }
     if vector.dim() == 0 {
-        return false;
+        return Ok(false);
     }
 
     let level = level_of(id);
-    let existing = store.get_node(id);
+    let existing = store.get_node(id)?;
     // A fresh node starts with empty adjacency at every layer up to its level; a re-insert keeps its
     // level but clears its links (they are recomputed below).
     let node_level = existing
@@ -92,11 +101,11 @@ pub fn insert(store: &mut dyn NodeStore, id: &[u8], vector: Embedding) -> bool {
 
     // First node: it is the entry point, linked to nothing.
     let Some(entry) = meta.entry.clone() else {
-        store.put_node(id, &node);
+        store.put_node(id, &node)?;
         meta.entry = Some(id.to_vec());
         meta.max_level = node_level;
-        store.put_meta(&meta);
-        return true;
+        store.put_meta(&meta)?;
+        return Ok(true);
     };
 
     // Persist the node NOW, before linking — with its vector but not yet its neighbours. This is
@@ -105,17 +114,17 @@ pub fn insert(store: &mut dyn NodeStore, id: &[u8], vector: Embedding) -> bool {
     // yet, that read would miss, the distance would come back "maximally far", and the fresh node would
     // be pruned straight back out — so no back-link ever sticks and the node is unreachable. (The
     // in-memory graph sidesteps this by pushing the node before it links; the store must do the same.)
-    store.put_node(id, &node);
+    store.put_node(id, &node)?;
 
     // Descend the upper layers greedily to find an entry point at the node's level.
     let mut current = entry;
     for layer in (node_level + 1..=meta.max_level).rev() {
-        current = greedy_closest(store, &vector, &current, layer);
+        current = greedy_closest(store, &vector, &current, layer)?;
     }
 
     // Link at every layer up to the node's level.
     for layer in (0..=node_level.min(meta.max_level)).rev() {
-        let found = search_layer(store, &vector, &[current.clone()], EF_DEFAULT, layer);
+        let found = search_layer(store, &vector, &[current.clone()], EF_DEFAULT, layer)?;
         let selected: Vec<ItemId> = found
             .iter()
             .filter(|(nid, _)| nid.as_slice() != id)
@@ -126,29 +135,27 @@ pub fn insert(store: &mut dyn NodeStore, id: &[u8], vector: Embedding) -> bool {
 
         // Back-link, pruning each neighbour to its M closest.
         for nid in &selected {
-            if let Some(mut neighbour) = store.get_node(nid) {
+            if let Some(mut neighbour) = store.get_node(nid)? {
                 if let Some(nlayer) = neighbour.neighbours.get_mut(layer) {
                     if !nlayer.iter().any(|x| x == id) {
                         nlayer.push(id.to_vec());
                         if nlayer.len() > M {
                             let nvec = neighbour.vector.clone();
-                            let mut ranked: Vec<(ItemId, f32)> = neighbour.neighbours[layer]
-                                .iter()
-                                .map(|m| {
-                                    let d = store
-                                        .get_node(m)
-                                        .map(|mn| dist(&mn.vector, &nvec))
-                                        .unwrap_or(2.0);
-                                    (m.clone(), d)
-                                })
-                                .collect();
+                            let mut ranked: Vec<(ItemId, f32)> = Vec::new();
+                            for m in &neighbour.neighbours[layer] {
+                                let d = store
+                                    .get_node(m)?
+                                    .map(|mn| dist(&mn.vector, &nvec))
+                                    .unwrap_or(2.0);
+                                ranked.push((m.clone(), d));
+                            }
                             ranked.sort_by(|a, b| {
                                 a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal)
                             });
                             neighbour.neighbours[layer] =
                                 ranked.into_iter().take(M).map(|(m, _)| m).collect();
                         }
-                        store.put_node(nid, &neighbour);
+                        store.put_node(nid, &neighbour)?;
                     }
                 }
             }
@@ -158,49 +165,59 @@ pub fn insert(store: &mut dyn NodeStore, id: &[u8], vector: Embedding) -> bool {
         }
     }
 
-    store.put_node(id, &node);
+    store.put_node(id, &node)?;
     if node_level > meta.max_level {
         meta.max_level = node_level;
         meta.entry = Some(id.to_vec());
     }
-    store.put_meta(&meta);
-    true
+    store.put_meta(&meta)?;
+    Ok(true)
 }
 
 /// **Search the persisted graph for the `k` nearest ids.** Reads only the nodes it traverses.
-pub fn search(store: &dyn NodeStore, query: &Embedding, k: usize, ef: usize) -> Vec<(ItemId, f32)> {
-    let meta = store.get_meta();
+pub fn search(
+    store: &dyn NodeStore,
+    query: &Embedding,
+    k: usize,
+    ef: usize,
+) -> Result<Vec<(ItemId, f32)>, StoreError> {
+    let meta = store.get_meta()?;
     let Some(entry) = meta.entry else {
-        return Vec::new();
+        return Ok(Vec::new());
     };
     if meta.dim != Some(query.dim()) || k == 0 {
-        return Vec::new();
+        return Ok(Vec::new());
     }
 
     let mut current = entry;
     for layer in (1..=meta.max_level).rev() {
-        current = greedy_closest(store, query, &current, layer);
+        current = greedy_closest(store, query, &current, layer)?;
     }
-    let found = search_layer(store, query, &[current], ef.max(k), 0);
+    let found = search_layer(store, query, &[current], ef.max(k), 0)?;
     let mut out: Vec<(ItemId, f32)> = found.into_iter().map(|(id, d)| (id, 1.0 - d)).collect();
     out.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
     out.truncate(k);
-    out
+    Ok(out)
 }
 
-fn greedy_closest(store: &dyn NodeStore, query: &Embedding, start: &[u8], layer: usize) -> ItemId {
+fn greedy_closest(
+    store: &dyn NodeStore,
+    query: &Embedding,
+    start: &[u8],
+    layer: usize,
+) -> Result<ItemId, StoreError> {
     let mut current = start.to_vec();
     let mut current_dist = store
-        .get_node(&current)
+        .get_node(&current)?
         .map(|n| dist(&n.vector, query))
         .unwrap_or(2.0);
     loop {
         let mut improved = false;
-        if let Some(node) = store.get_node(&current) {
+        if let Some(node) = store.get_node(&current)? {
             if let Some(neighbours) = node.neighbours.get(layer) {
                 for n in neighbours {
                     let d = store
-                        .get_node(n)
+                        .get_node(n)?
                         .map(|nn| dist(&nn.vector, query))
                         .unwrap_or(2.0);
                     if d < current_dist {
@@ -212,7 +229,7 @@ fn greedy_closest(store: &dyn NodeStore, query: &Embedding, start: &[u8], layer:
             }
         }
         if !improved {
-            return current;
+            return Ok(current);
         }
     }
 }
@@ -223,14 +240,14 @@ fn search_layer(
     entries: &[ItemId],
     ef: usize,
     layer: usize,
-) -> Vec<(ItemId, f32)> {
+) -> Result<Vec<(ItemId, f32)>, StoreError> {
     let mut visited: HashSet<ItemId> = HashSet::new();
     let mut candidates: BinaryHeap<Closest> = BinaryHeap::new();
     let mut result: BinaryHeap<Farthest> = BinaryHeap::new();
 
     for e in entries {
         let d = store
-            .get_node(e)
+            .get_node(e)?
             .map(|n| dist(&n.vector, query))
             .unwrap_or(2.0);
         visited.insert(e.clone());
@@ -250,14 +267,14 @@ fn search_layer(
                 break;
             }
         }
-        if let Some(node) = store.get_node(&id) {
+        if let Some(node) = store.get_node(&id)? {
             if let Some(neighbours) = node.neighbours.get(layer) {
                 for n in neighbours {
                     if !visited.insert(n.clone()) {
                         continue;
                     }
                     let d = store
-                        .get_node(n)
+                        .get_node(n)?
                         .map(|nn| dist(&nn.vector, query))
                         .unwrap_or(2.0);
                     let worst = result.peek().map(|f| f.dist).unwrap_or(f32::INFINITY);
@@ -281,7 +298,7 @@ fn search_layer(
 
     let mut out: Vec<(ItemId, f32)> = result.into_iter().map(|f| (f.id, f.dist)).collect();
     out.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal));
-    out
+    Ok(out)
 }
 
 /// Min-heap by distance (closest pops first).
@@ -330,4 +347,24 @@ impl PartialOrd for Farthest {
     fn partial_cmp(&self, o: &Self) -> Option<std::cmp::Ordering> {
         Some(self.cmp(o))
     }
+}
+
+/// The reserved prefix the graph lives under, in the branch's own tree. Reserved (`\x00loom/`), so it
+/// is hidden from `scan`, excluded from merge, and inherited on fork — the same treatment as index
+/// entries, and the reason a sibling branch cannot address this branch's graph (invariant I-11).
+pub const RESERVED_HNSW_PREFIX: &[u8] = b"\x00loom/hnsw/";
+
+/// The key one graph node is stored at, derived from the record id.
+pub fn hnsw_node_key(record_id: &[u8]) -> Vec<u8> {
+    let mut k = RESERVED_HNSW_PREFIX.to_vec();
+    k.extend_from_slice(b"n/");
+    k.extend_from_slice(record_id);
+    k
+}
+
+/// The key the graph's meta is stored at.
+pub fn hnsw_meta_key() -> Vec<u8> {
+    let mut k = RESERVED_HNSW_PREFIX.to_vec();
+    k.extend_from_slice(b"meta");
+    k
 }

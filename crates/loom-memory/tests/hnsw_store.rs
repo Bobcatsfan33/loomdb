@@ -8,7 +8,9 @@
 use std::collections::BTreeMap;
 
 use loom_core::Embedding;
-use loom_memory::{hnsw_insert, hnsw_search, HnswMeta, NodeStore, PersistedNode, EF_DEFAULT};
+use loom_memory::{
+    hnsw_insert, hnsw_search, HnswMeta, NodeStore, PersistedNode, StoreError, EF_DEFAULT,
+};
 
 /// An in-memory `NodeStore` that also serializes every node through bincode on write and back on read —
 /// so the test exercises the *encoded* form, the same bytes the tree would hold.
@@ -19,24 +21,26 @@ struct MapStore {
 }
 
 impl NodeStore for MapStore {
-    fn get_node(&self, id: &[u8]) -> Option<PersistedNode> {
-        self.nodes
-            .get(id)
-            .map(|b| bincode::deserialize(b).expect("a stored node must decode"))
-    }
-    fn put_node(&mut self, id: &[u8], node: &PersistedNode) {
-        self.nodes
-            .insert(id.to_vec(), bincode::serialize(node).unwrap());
-    }
-    fn get_meta(&self) -> HnswMeta {
-        if self.meta.is_empty() {
-            HnswMeta::default()
-        } else {
-            bincode::deserialize(&self.meta).unwrap()
+    fn get_node(&self, id: &[u8]) -> Result<Option<PersistedNode>, StoreError> {
+        match self.nodes.get(id) {
+            Some(b) => Ok(Some(bincode::deserialize(b)?)),
+            None => Ok(None),
         }
     }
-    fn put_meta(&mut self, meta: &HnswMeta) {
-        self.meta = bincode::serialize(meta).unwrap();
+    fn put_node(&mut self, id: &[u8], node: &PersistedNode) -> Result<(), StoreError> {
+        self.nodes.insert(id.to_vec(), bincode::serialize(node)?);
+        Ok(())
+    }
+    fn get_meta(&self) -> Result<HnswMeta, StoreError> {
+        if self.meta.is_empty() {
+            Ok(HnswMeta::default())
+        } else {
+            Ok(bincode::deserialize(&self.meta)?)
+        }
+    }
+    fn put_meta(&mut self, meta: &HnswMeta) -> Result<(), StoreError> {
+        self.meta = bincode::serialize(meta)?;
+        Ok(())
     }
 }
 
@@ -85,7 +89,7 @@ fn store_backed_hnsw_meets_the_recall_floor_through_serialization() {
         let mut store = MapStore::default();
         for (id, v) in &items {
             assert!(
-                hnsw_insert(&mut store, id, v.clone()),
+                hnsw_insert(&mut store, id, v.clone()).unwrap(),
                 "insert must accept a same-dim vector"
             );
         }
@@ -101,6 +105,7 @@ fn store_backed_hnsw_meets_the_recall_floor_through_serialization() {
             let q = random_vec(&mut rng, DIM);
             let truth = brute_force(&items, &q, K);
             let got: std::collections::HashSet<Vec<u8>> = hnsw_search(&store, &q, K, EF_DEFAULT)
+                .unwrap()
                 .into_iter()
                 .map(|(id, _)| id)
                 .collect();
@@ -127,10 +132,11 @@ fn a_graph_rebuilt_from_stored_bytes_alone_still_searches() {
 
     let mut store = MapStore::default();
     for (id, v) in &items {
-        hnsw_insert(&mut store, id, v.clone());
+        hnsw_insert(&mut store, id, v.clone()).unwrap();
     }
     let q = random_vec(&mut rng, 16);
     let before: Vec<Vec<u8>> = hnsw_search(&store, &q, 10, EF_DEFAULT)
+        .unwrap()
         .into_iter()
         .map(|(id, _)| id)
         .collect();
@@ -141,6 +147,7 @@ fn a_graph_rebuilt_from_stored_bytes_alone_still_searches() {
         meta: store.meta.clone(),
     };
     let after: Vec<Vec<u8>> = hnsw_search(&rebuilt, &q, 10, EF_DEFAULT)
+        .unwrap()
         .into_iter()
         .map(|(id, _)| id)
         .collect();

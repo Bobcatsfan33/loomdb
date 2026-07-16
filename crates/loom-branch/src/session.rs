@@ -295,6 +295,90 @@ impl Loom {
         }
     }
 
+    /// **Build (or rebuild) the branch's ANN index from its current index entries.**
+    ///
+    /// Reads every index entry on the branch that carries an embedding, inserts each into an HNSW graph
+    /// stored in the branch's OWN tree (reserved `\x00loom/hnsw/` keys), and commits — all in one
+    /// transaction, so the graph is durable-or-absent, never half-built. Token-gated like every write.
+    /// The graph lives in the branch, so it is isolated exactly as the data is (invariant I-11).
+    ///
+    /// This is the explicit build; auto-inserting on every write is deferred behind its own
+    /// write-amplification measurement (see `ann.rs`). Returns how many vectors were indexed.
+    pub fn build_ann_index(&self, token: &CapabilityToken, branch: &BranchId) -> Result<usize> {
+        self.issuer.authorize(token, branch, self.now())?;
+
+        let head = self.head(branch)?;
+        let store = self.pager.fork(&head)?;
+        let mut txn = store.begin()?;
+        let tree = Tree::open(&*store)?;
+
+        // Collect (id, embedding) first, so the graph build is not interleaved with the scan.
+        let mut pairs: Vec<(Key, loom_core::Embedding)> = Vec::new();
+        {
+            let mut scan_tree = tree;
+            for (key, record) in scan_tree.scan()? {
+                if !key.starts_with(loom_core::RESERVED_INDEX_PREFIX) {
+                    continue;
+                }
+                let Record::Value(Value::Blob(bytes)) = record else {
+                    continue;
+                };
+                let entry = IndexEntry::decode(&bytes).map_err(|source| LoomError::Codec {
+                    op: "decode",
+                    what: "index entry",
+                    source,
+                })?;
+                if let Some(emb) = entry.embedding {
+                    pairs.push((entry.key, emb));
+                }
+            }
+
+            let count = pairs.len();
+            let mut node_store = crate::ann::TreeNodeStore::new(scan_tree);
+            for (id, emb) in pairs {
+                loom_core::hnsw_insert(&mut node_store, &id, emb).map_err(|e| {
+                    LoomError::Index {
+                        detail: format!("insert of {}: {e}", String::from_utf8_lossy(&id)),
+                    }
+                })?;
+            }
+            let tree = node_store.into_tree();
+            tree.flush(&mut txn)?;
+            let commit = store.commit(txn)?;
+            self.record_commit(commit, vec![head]);
+            self.set_head(branch, commit)?;
+            Ok(count)
+        }
+    }
+
+    /// **Search the branch's ANN index for the `k` nearest record keys to `query`.**
+    ///
+    /// Reads only the graph nodes the search traverses — the sub-linear win — and only from *this*
+    /// branch's tree, so it can never return a sibling's fact (AT-040, structurally). Returns the record
+    /// keys best-first; the caller loads and packs the entries. Empty if the index was never built.
+    pub fn search_ann(
+        &self,
+        token: &CapabilityToken,
+        branch: &BranchId,
+        query: &loom_core::Embedding,
+        k: usize,
+    ) -> Result<Vec<Key>> {
+        self.issuer.authorize(token, branch, self.now())?;
+
+        let head = self.head(branch)?;
+        let store = self.pager.fork(&head)?;
+        let tree = Tree::open(&*store)?;
+        let node_store = crate::ann::TreeNodeStore::new(tree);
+
+        let hits =
+            loom_core::hnsw_search(&node_store, query, k, loom_core::EF_DEFAULT).map_err(|e| {
+                LoomError::Index {
+                    detail: format!("search: {e}"),
+                }
+            })?;
+        Ok(hits.into_iter().map(|(id, _)| id).collect())
+    }
+
     /// The commit a branch currently points at.
     pub fn head(&self, branch: &BranchId) -> Result<CommitId> {
         self.refs()
