@@ -16,12 +16,13 @@ use std::path::PathBuf;
 use std::process::ExitCode;
 
 use clap::{Parser, Subcommand};
-use loom_bundle::{
-    hex_encode, signing_key_from_hex, verifying_key_from_hex, Bundle, BundleError,
-};
+use loom_bundle::{hex_encode, signing_key_from_hex, verifying_key_from_hex, Bundle, BundleError};
 
 #[derive(Parser)]
-#[command(name = "loom-bundle-tool", about = "Create, sign, and verify offline update bundles")]
+#[command(
+    name = "loom-bundle-tool",
+    about = "Create, sign, and verify offline update bundles"
+)]
 struct Cli {
     #[command(subcommand)]
     command: Command,
@@ -100,8 +101,14 @@ fn run(cli: Cli) -> std::result::Result<(), String> {
             getrandom::getrandom(&mut seed).map_err(|e| format!("generating key material: {e}"))?;
             let signing = ed25519_dalek::SigningKey::from_bytes(&seed);
             let verifying = signing.verifying_key();
-            write_file(&out_secret, &format!("{}\n", hex_encode(signing.to_bytes().as_slice())))?;
-            write_file(&out_public, &format!("{}\n", hex_encode(verifying.as_bytes())))?;
+            write_file(
+                &out_secret,
+                &format!("{}\n", hex_encode(signing.to_bytes().as_slice())),
+            )?;
+            write_file(
+                &out_public,
+                &format!("{}\n", hex_encode(verifying.as_bytes())),
+            )?;
             eprintln!(
                 "wrote signing key to {} and public key to {}",
                 out_secret.display(),
@@ -127,7 +134,8 @@ fn run(cli: Cli) -> std::result::Result<(), String> {
                 Some(ms) => ms,
                 None => now_ms()?,
             };
-            let bundle = Bundle::create(id, kind, version, created, payload, &signing).map_err(describe)?;
+            let bundle =
+                Bundle::create(id, kind, version, created, payload, &signing).map_err(describe)?;
             let bytes = bundle.to_bytes().map_err(describe)?;
             write_bytes(&out, &bytes)?;
             eprintln!(

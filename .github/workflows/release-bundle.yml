@@ -1,0 +1,75 @@
+name: release-bundle
+
+# Sign a release artifact into a verifiable offline update bundle (docs/operations.md).
+#
+# The production signing key never lives in the repo. It is provided here ONLY as the
+# `LOOM_BUNDLE_SIGNING_KEY` repository secret, written to a throwaway file at build time and deleted
+# immediately after signing. The workflow runs only on a published release or a manual dispatch — both
+# owner-triggered on the main repository, where the secret exists — so a fork can never invoke it.
+on:
+  workflow_dispatch:
+    inputs:
+      payload_path:
+        description: "Path to the file to sign (default: the freshly built loomd binary)"
+        required: false
+  release:
+    types: [published]
+
+jobs:
+  sign:
+    name: sign + verify the release bundle
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Build loomd and the bundle tool (release)
+        run: cargo build --release -p loom-mcp -p loom-bundle
+
+      - name: Sign the release bundle
+        env:
+          # Mapped from the secret into the step's environment. GitHub masks it in logs; we also never
+          # echo it, write it with printf (not a command that could log), and delete it right after.
+          LOOM_BUNDLE_SIGNING_KEY: ${{ secrets.LOOM_BUNDLE_SIGNING_KEY }}
+        run: |
+          set -eu
+          if [ -z "${LOOM_BUNDLE_SIGNING_KEY:-}" ]; then
+            echo "::error::LOOM_BUNDLE_SIGNING_KEY secret is not set — cannot sign a release bundle. Set it in repo secrets (64 hex chars)."
+            exit 1
+          fi
+          umask 077
+          printf '%s' "$LOOM_BUNDLE_SIGNING_KEY" > signing.key
+          PAYLOAD="${{ github.event.inputs.payload_path }}"
+          [ -z "$PAYLOAD" ] && PAYLOAD=target/release/loomd
+          ./target/release/loom-bundle-tool sign \
+            --key signing.key \
+            --kind software \
+            --id "loomd-${GITHUB_SHA::12}" \
+            --version "${GITHUB_REF_NAME:-manual}" \
+            --in "$PAYLOAD" \
+            --out loomd.bundle
+          rm -f signing.key
+          echo "signed $PAYLOAD into loomd.bundle"
+
+      - name: Verify the signed bundle against the public key
+        # The public key is safe in the clear; verification is skipped (not failed) if it is not set,
+        # so a first run before the operator has published the public key still produces the bundle.
+        env:
+          LOOM_BUNDLE_PUBLIC_KEY: ${{ secrets.LOOM_BUNDLE_PUBLIC_KEY }}
+        run: |
+          set -eu
+          if [ -z "${LOOM_BUNDLE_PUBLIC_KEY:-}" ]; then
+            echo "::warning::LOOM_BUNDLE_PUBLIC_KEY not set — skipping self-verification. Publish the public key so releases self-verify."
+            exit 0
+          fi
+          printf '%s' "$LOOM_BUNDLE_PUBLIC_KEY" > public.key
+          ./target/release/loom-bundle-tool verify --public public.key --in loomd.bundle
+          rm -f public.key
+
+      - name: Upload the signed bundle
+        uses: actions/upload-artifact@v4
+        with:
+          name: loomd-bundle
+          path: loomd.bundle
+          if-no-files-found: error
