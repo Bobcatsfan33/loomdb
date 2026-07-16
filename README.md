@@ -104,16 +104,25 @@ bound stated plainly.
   found in a POC.
 - **The refs file is rewritten in full on every commit** — O(branches), not O(1). Invisible against
   database *size*; it will show on a tenant with a great many branches.
-- **AT-045 (crash-at-any-byte, LoomDB-shaped) is deferred to v0.2.** Data commits already ride
-  substrate's 50,000-cycle crash suite; what is not yet done is re-driving that harness with
-  LoomDB-shaped workloads including the second durable object (the ref write). The ordering it would
-  check is enforced and unit-tested; the 50,000-cycle proof under LoomDB workloads is the gap.
+- **Wake-over-object-storage p99 is measured at same-runner latency, not wide-area.** AT-047's
+  *correctness* — sleep, wipe the disk, wake elsewhere, identical results, branch names back — is proven,
+  and this is **loom's own session sleep/wake path**, not FlockDB's DuckDB wake. Its **latency** is
+  measured against a real S3 endpoint (`crates/loom-branch/tests/wake_latency.rs`, in CI): wake → first
+  read is **p50 12 ms / p99 13 ms** over 50 cold wakes — well inside the < 250 ms target, over the
+  object-storage protocol. But that MinIO runs on the same host, so it is a **low-latency-endpoint**
+  number; the **wide-area p99 against a genuinely remote bucket is the one open figure**, and it is what
+  any unqualified < 250 ms claim for a *remote-tier* deployment rests on. An **airgap** deployment does
+  not wake from object storage at all (it runs on local storage), so this bound does not apply to it.
 - **Signature verification is opt-in, and key distribution is not solved here.** With an actor registry,
   every write is signed and verified (AT-026); without one, writes are attributable but not
   authenticated. Where keys come from, how they rotate, and how a compromised one is revoked is out of
-  scope for v0.1.
-- **One tenant per store.** Cross-tenant isolation is structural (the tenant *is* the substrate pool),
-  which is *why* AT-039 holds — but a multi-tenant query surface, and its own isolation proofs, is v0.2.
+  scope. (Signed **offline update bundles** — `loom-bundle` — do solve authenticity for updates *into* an
+  enclave, offline; see [`docs/operations.md`](docs/operations.md).)
+- **Multi-tenancy is a signed-token router, one substrate pool per tenant.** Cross-tenant isolation is
+  structural — the token carries its tenant *inside its signature*, the router routes by it, and a
+  tampered or unregistered tenant gets a byte-identical `Unauthorized` (no existence oracle), held under
+  concurrent churn by Soak B. The bound worth naming: isolation rests on that one-pool-per-tenant model,
+  not on row-level filtering that could be got wrong.
 
 The security posture, and what LoomDB does **not** defend against, is in [the threat
 model](docs/threat-model.md).
@@ -124,9 +133,10 @@ The architecture of record lives in the substrate repository:
 
 1. [`docs/03`](https://github.com/Bobcatsfan33/substrate/blob/main/docs/03-agent-native-database-architecture.md) — the architecture
 2. [`docs/05`](https://github.com/Bobcatsfan33/substrate/blob/main/docs/05-loomdb-test-spec.md) — the acceptance catalog (AT-001…AT-047) and the integrity invariants
-4. [`docs/at-map.md`](docs/at-map.md) — which AT-IDs are green, and the one deferred, with reasons
+4. [`docs/at-map.md`](docs/at-map.md) — which AT-IDs are green (AT-001…047, all of them), with the tests
 5. [`docs/invariants.md`](docs/invariants.md) — the rules that must not be "optimized" away
 6. [`docs/threat-model.md`](docs/threat-model.md) — the security posture, and what LoomDB does not defend against
+7. [`docs/operations.md`](docs/operations.md) — running air-gapped: the offline certification, reproducible, and signed update bundles
 3. [`docs/loom-format.md`](docs/loom-format.md) — the on-page record format
 
 ## License
