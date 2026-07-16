@@ -440,9 +440,12 @@ impl Loom {
         self.create_branch(branch.as_str(), base)?;
 
         let scope: BTreeSet<BranchId> = [branch.clone()].into_iter().collect();
-        let token =
-            self.issuer
-                .issue(session.clone(), scope, self.now() + DEFAULT_SESSION_TTL_MS)?;
+        let token = self.issuer.issue(
+            self.tenant.clone(),
+            session.clone(),
+            scope,
+            self.now() + DEFAULT_SESSION_TTL_MS,
+        )?;
 
         Ok((
             SessionHandle {
@@ -481,7 +484,8 @@ impl Loom {
             self.head(branch)?;
         }
         let scope: BTreeSet<BranchId> = branches.iter().cloned().collect();
-        self.issuer.issue(session, scope, self.now() + ttl_ms)
+        self.issuer
+            .issue(self.tenant.clone(), session, scope, self.now() + ttl_ms)
     }
 
     /// Branch from a branch the token already covers, and get a **new** token that covers both.

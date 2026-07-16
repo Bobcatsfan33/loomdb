@@ -130,6 +130,16 @@ pub enum LoomError {
         detail: String,
     },
 
+    /// A request could not be authorized against any tenant. **Deliberately uniform** — it is returned
+    /// whether the token names a tenant that does not exist OR a tenant whose key does not verify the
+    /// token, so a caller cannot use the error to learn whether another tenant exists (AT-039). There is
+    /// no "exists but forbidden" here; there is only "no".
+    #[error(
+        "this request is not authorized. The capability token does not verify against the tenant it \
+         names. Present a token issued by that tenant's own engine."
+    )]
+    Unauthorized,
+
     /// The ANN index could not be built or searched. Carries the underlying reason.
     #[error("the ANN (vector) index operation failed: {detail}")]
     Index {

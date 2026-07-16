@@ -34,6 +34,7 @@ pub mod merge;
 mod refs;
 pub mod session;
 pub mod sleep;
+pub mod tenancy;
 pub mod token;
 pub mod tree;
 
@@ -45,5 +46,6 @@ pub use refs::{FileRefStore, MemRefStore, RefStore, Refs, REFS_FORMAT_VERSION};
 pub use session::ReadSet;
 pub use session::{Loom, MergeResult, SessionHandle, DEFAULT_SESSION_TTL_MS, MAIN};
 pub use sleep::LoomWakeToken;
+pub use tenancy::Tenancy;
 pub use token::{CapabilityToken, TokenClaims, TokenIssuer};
 pub use tree::{Meta, Node, Tree, FORMAT_VERSION, META_PAGE};

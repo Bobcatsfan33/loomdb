@@ -20,13 +20,18 @@
 //! conclusion it drew from a poisoned document into a branch it owns.
 
 use ed25519_dalek::{Signature, Signer, SigningKey, Verifier, VerifyingKey};
-use loom_core::{BranchId, LoomError, Result, SessionId};
+use loom_core::{BranchId, LoomError, Result, SessionId, TenantId};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeSet;
 
 /// The claims a token makes.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TokenClaims {
+    /// **The tenant this token belongs to.** Signed, so it cannot be re-pointed at another tenant: a
+    /// token minted by tenant A's engine carries `tenant = A` inside the signature, and flipping it to
+    /// B breaks the signature — which B's engine (a different key) rejects. This is what makes a
+    /// multi-tenant router structural rather than a `WHERE tenant = ?` someone can forget (AT-039).
+    pub tenant: TenantId,
     /// The session this token belongs to.
     pub session: SessionId,
     /// Exactly which branches it covers.
@@ -98,11 +103,13 @@ impl TokenIssuer {
     /// Mint a token for a set of branches.
     pub fn issue(
         &self,
+        tenant: TenantId,
         session: SessionId,
         scope: BTreeSet<BranchId>,
         expires_at_ms: u64,
     ) -> Result<CapabilityToken> {
         let claims = TokenClaims {
+            tenant,
             session,
             scope,
             expires_at_ms,
@@ -122,6 +129,7 @@ impl TokenIssuer {
         let mut scope = token.claims.scope.clone();
         scope.insert(branch);
         self.issue(
+            token.claims.tenant.clone(),
             token.claims.session.clone(),
             scope,
             token.claims.expires_at_ms,
@@ -189,7 +197,7 @@ mod tests {
     #[test]
     fn a_token_authorizes_exactly_its_scope_and_nothing_else() -> Result<()> {
         let issuer = TokenIssuer::generate();
-        let token = issuer.issue(SessionId::new("s1"), scope(&["b1", "b2"]), NOW + HOUR)?;
+        let token = issuer.issue(TenantId::new("t"), SessionId::new("s1"), scope(&["b1", "b2"]), NOW + HOUR)?;
 
         issuer.authorize(&token, &BranchId::new("b1"), NOW)?;
         issuer.authorize(&token, &BranchId::new("b2"), NOW)?;
@@ -209,7 +217,7 @@ mod tests {
     #[test]
     fn an_expired_token_authorizes_nothing() -> Result<()> {
         let issuer = TokenIssuer::generate();
-        let token = issuer.issue(SessionId::new("s1"), scope(&["b1"]), NOW + HOUR)?;
+        let token = issuer.issue(TenantId::new("t"), SessionId::new("s1"), scope(&["b1"]), NOW + HOUR)?;
 
         issuer.authorize(&token, &BranchId::new("b1"), NOW)?;
         assert!(matches!(
@@ -224,7 +232,7 @@ mod tests {
         // The attack: take a valid token, add a branch to the scope, present it. The signature must
         // fail, or a capability is just a suggestion.
         let issuer = TokenIssuer::generate();
-        let mut token = issuer.issue(SessionId::new("s1"), scope(&["b1"]), NOW + HOUR)?;
+        let mut token = issuer.issue(TenantId::new("t"), SessionId::new("s1"), scope(&["b1"]), NOW + HOUR)?;
 
         token
             .claims
@@ -241,7 +249,7 @@ mod tests {
     #[test]
     fn a_client_cannot_extend_its_own_expiry() -> Result<()> {
         let issuer = TokenIssuer::generate();
-        let mut token = issuer.issue(SessionId::new("s1"), scope(&["b1"]), NOW)?;
+        let mut token = issuer.issue(TenantId::new("t"), SessionId::new("s1"), scope(&["b1"]), NOW)?;
         token.claims.expires_at_ms = NOW + 100 * HOUR;
 
         assert!(matches!(
@@ -256,7 +264,7 @@ mod tests {
         let ours = TokenIssuer::generate();
         let theirs = TokenIssuer::generate();
 
-        let foreign = theirs.issue(SessionId::new("s1"), scope(&["b1"]), NOW + HOUR)?;
+        let foreign = theirs.issue(TenantId::new("t"), SessionId::new("s1"), scope(&["b1"]), NOW + HOUR)?;
 
         assert!(matches!(
             ours.authorize(&foreign, &BranchId::new("b1"), NOW),
@@ -268,7 +276,7 @@ mod tests {
     #[test]
     fn extending_a_token_adds_one_branch_and_leaves_the_old_token_alone() -> Result<()> {
         let issuer = TokenIssuer::generate();
-        let original = issuer.issue(SessionId::new("s1"), scope(&["b1"]), NOW + HOUR)?;
+        let original = issuer.issue(TenantId::new("t"), SessionId::new("s1"), scope(&["b1"]), NOW + HOUR)?;
 
         let extended = issuer.extend(&original, BranchId::new("b2"))?;
 
