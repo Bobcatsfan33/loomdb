@@ -43,7 +43,7 @@ default = ["remote"]
 # path out, so an **airgap build has no object-storage client in the binary** — an amputation an
 # auditor verifies by inspecting the artifact (`cargo tree --no-default-features -e no-dev` shows no
 # `object_store`), not a `--network none` runtime flag they must trust stays applied in production.
-remote = ["dep:substrate-store"]
+remote = ["dep:substrate-store", "substrate-store/remote"]
 # A marker naming the airgap posture for the proof-of-offline manifest and the `no-egress` CI job.
 # Cargo features are additive and cannot *remove* `remote`, so the airgap BUILD is
 # `--no-default-features --features airgap`; this marker is how code and docs name that posture.
