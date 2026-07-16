@@ -39,7 +39,13 @@ jobs:
       - uses: actions/checkout@v5
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
-      - run: cargo test --workspace --all-targets
+      # --lib --bins --tests, NOT --all-targets. `--all-targets` implies `--benches`, and a
+      # `harness = false` bench is a plain `main()` — so `cargo test --all-targets` *runs* every
+      # benchmark to completion. `ann_amplification` builds an 8000-record HNSW graph (145 s in
+      # release, far worse in debug), which hung this job for ~50 min. The benches are still
+      # compile-checked by the `clippy -D warnings` job (which does use --all-targets); they must
+      # not be executed by the test job. Run them deliberately with `cargo bench`.
+      - run: cargo test --workspace --lib --bins --tests
       - run: cargo test --workspace --doc
 
   # THE ACCEPTANCE TEST. The Q3 demo (docs/04 §3.1), all ten steps, driven through the MCP surface by
