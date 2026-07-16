@@ -92,11 +92,16 @@ writes and quietly omits the account it suspended is not an audit tool — it's 
 We would rather you find these here than in an evaluation. None affects correctness; each is a cost or a
 bound stated plainly.
 
-- **Retrieval is O(entries on the branch)**, a scan, not a sub-linear ANN lookup. It is *correct* and
-  branch-isolated (that is the load-bearing property, oracle-checked); it is not yet *fast* at scale. The
-  sub-linear follow-on is a per-branch HNSW — kept **in the branch**, never a shared index, because a
-  shared ANN index would reintroduce the exact cross-branch leak the isolation was designed out
-  ([invariant I-11](docs/invariants.md)).
+- **Retrieval's default is an O(entries) scan.** It is *correct* and branch-isolated (the load-bearing
+  property, oracle-checked). A **per-branch HNSW** index exists (v0.2) — kept **in the branch**, never a
+  shared index that would reintroduce the cross-branch leak the isolation was designed out ([invariant
+  I-11](docs/invariants.md)) — with recall@10 ≥ 0.85 proven against the exact scan. But it is an **opt-in
+  explicit build, not the default**, and here is why, measured rather than hidden: building the graph is
+  **super-linear** in records (≈1.7 s / 15.5 s / 145 s for 500 / 2 000 / 8 000 vectors). So the scan
+  stays the default; ANN accelerates *queries* but is currently expensive to *build*. Making the build
+  O(N·log N) and maintaining the graph incrementally (background compaction, not on the write path — an
+  inline insert would amplify the crash-certified write path) is a v0.3 project, stated here rather than
+  found in a POC.
 - **The refs file is rewritten in full on every commit** — O(branches), not O(1). Invisible against
   database *size*; it will show on a tenant with a great many branches.
 - **AT-045 (crash-at-any-byte, LoomDB-shaped) is deferred to v0.2.** Data commits already ride

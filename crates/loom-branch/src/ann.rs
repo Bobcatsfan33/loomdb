@@ -6,11 +6,21 @@
 //! has a different head manifest and a different tree, and cannot address this graph (invariant I-11,
 //! the reason it is never a shared index).
 //!
-//! Exposed as an **explicit build** (`Loom::build_ann_index`) rather than auto-run on every write.
-//! Auto-inserting into HNSW on the hot write path adds real write amplification — `M` scattered
-//! neighbour updates per record — to a path with its own crash-safety (AT-045) and amplification
-//! budget, and that belongs behind its own measurement. So this slice proves the graph works *in the
-//! branch* and accelerates retrieval; folding the insert into the write path is the next step.
+//! Exposed as an **explicit build** (`Loom::build_ann_index`) rather than auto-run on every write, and
+//! **slice 2c measured why it stays that way** (`benches/ann_amplification.rs`): building the graph is
+//! *super-linear* in the number of records — ~1.7 s / 15.5 s / 145 s to index 500 / 2 000 / 8 000
+//! vectors, i.e. 4× the records for ~9× the time. The graph's storage is cheap (≈675 bytes/record,
+//! graph/data ≈ 0.01), so the cost is time, not space, and it comes from the `M` scattered neighbour
+//! updates per insert — the same random-leaf write amplification the append-ordered-provenance fix
+//! removed elsewhere.
+//!
+//! **The decision that follows from the number:** ANN-on-write does **not** go inline. An inline insert
+//! whose cost climbs with the graph would reintroduce exactly that amplification on the AT-045-certified
+//! write path; and since the *explicit* build is already super-linear, inline would be strictly worse.
+//! So for v0.2 the graph is an **explicit build**, the **brute-force scan stays the correct default**
+//! retrieval path, and ANN is an opt-in accelerator. The production answer — incremental maintenance /
+//! background compaction, plus fixing the build to be genuinely O(N·log N) — is its own project
+//! (v0.3), not a fold-in. Written down here rather than discovered under load.
 
 use std::cell::RefCell;
 
