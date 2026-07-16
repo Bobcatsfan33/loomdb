@@ -296,10 +296,12 @@ fn hex_decode(s: &str, what: &'static str) -> Result<Vec<u8>> {
     let bytes = s.as_bytes();
     let mut i = 0;
     while i < bytes.len() {
-        let hi = (bytes[i] as char).to_digit(16).ok_or_else(|| BundleError::Hex {
-            what,
-            detail: format!("not a hex digit: {:?}", bytes[i] as char),
-        })?;
+        let hi = (bytes[i] as char)
+            .to_digit(16)
+            .ok_or_else(|| BundleError::Hex {
+                what,
+                detail: format!("not a hex digit: {:?}", bytes[i] as char),
+            })?;
         let lo = (bytes[i + 1] as char)
             .to_digit(16)
             .ok_or_else(|| BundleError::Hex {
