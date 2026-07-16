@@ -212,6 +212,12 @@ fn soak_a_airgap_endurance_never_stops_serving_and_does_not_leak() {
             ever_degraded = true;
         }
 
+        // The memory curve: 20 evenly-spaced points across the run, so the report shows the slope, not
+        // just the endpoints. A leak is a rising line here well before the final verdict trips.
+        if iters >= 20 && i % (iters / 20) == 0 {
+            gate.sample(&format!("{}%", (i * 100) / iters));
+        }
+
         // (3) Reads must not stop — under Ok, Warning, or Degraded. Cycle the bounded working set on the
         // main session (deduped read-set → flat RSS; see the warm-up note).
         for j in 0..READS_PER_STEP {

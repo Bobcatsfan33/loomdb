@@ -87,6 +87,28 @@ impl FlatMemory {
         self.steady_state = mem::current_rss_bytes();
     }
 
+    /// Emit one point of the memory **curve**: the current RSS, and its delta from steady state, tagged
+    /// with `progress` (e.g. `"40%"`). The full-window nightly run calls this at intervals so the report
+    /// is a curve — the shape over the run — not just a start and an end. A leak shows as a rising line
+    /// here long before the final [`verdict`](Self::verdict) trips, which is the point: on the long run,
+    /// you want to *see* the slope, not only the pass/fail.
+    pub fn sample(&self, progress: &str) {
+        let Some(now) = mem::current_rss_bytes() else {
+            return;
+        };
+        let delta = self
+            .steady_state
+            .map(|s| now as i64 - s as i64)
+            .unwrap_or(0);
+        eprintln!(
+            "[{}] rss-curve {:>5}  {:.1} MiB  (Δsteady {:+.1} MiB)",
+            self.label,
+            progress,
+            now as f64 / 1_048_576.0,
+            delta as f64 / 1_048_576.0,
+        );
+    }
+
     /// Compare the current RSS to the recorded steady state.
     ///
     /// Returns:

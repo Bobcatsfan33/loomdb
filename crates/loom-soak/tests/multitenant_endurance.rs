@@ -24,6 +24,7 @@
 //! Env-scaled: `LOOM_SOAK_ITERS` (per-worker iterations) and `LOOM_SOAK_WORKERS`. Small defaults for the
 //! PR fast path; the nightly headroom host turns both up for a real, long, concurrent run.
 
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 
 use loom_branch::{Loom, MergePolicy, MergeResult, Tenancy};
@@ -201,11 +202,35 @@ fn soak_b_multitenant_isolation_holds_under_churn_and_memory_is_flat() {
     // --- Concurrent isolation phase: every worker hammers the isolation invariants at once. ---
     let tenants = Arc::new(tenants);
     let ghost_token = Arc::new(ghost_token);
+    let total = (workers * iters).max(1);
+    let progress = Arc::new(AtomicUsize::new(0));
     std::thread::scope(|scope| {
+        // A monitor thread emits the memory curve while the workers run, so the full-window report shows
+        // the slope during the concurrent churn — where a leak would appear — not just the endpoints.
+        {
+            let progress = Arc::clone(&progress);
+            let gate = &gate;
+            scope.spawn(move || {
+                let mut last_pct = usize::MAX;
+                loop {
+                    let p = progress.load(Ordering::Relaxed);
+                    let pct = (p * 100) / total;
+                    if pct != last_pct && pct % 5 == 0 {
+                        gate.sample(&format!("{pct}%"));
+                        last_pct = pct;
+                    }
+                    if p >= total {
+                        break;
+                    }
+                    std::thread::sleep(std::time::Duration::from_millis(50));
+                }
+            });
+        }
         for w in 0..workers {
             let router = Arc::clone(&router);
             let tenants = Arc::clone(&tenants);
             let ghost_token = Arc::clone(&ghost_token);
+            let progress = Arc::clone(&progress);
             scope.spawn(move || {
                 let home = w % TENANTS; // each worker has a home tenant, so its session is reused (bounded)
                 let me = &tenants[home];
@@ -250,6 +275,7 @@ fn soak_b_multitenant_isolation_holds_under_churn_and_memory_is_flat() {
                         on_sibling.is_none(),
                         "BRANCH LEAK (AT-040): sibling branch saw a key written to main after the fork"
                     );
+                    progress.fetch_add(1, Ordering::Relaxed);
                 }
             });
         }

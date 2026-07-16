@@ -183,3 +183,42 @@ jobs:
       - name: Soak B — multi-tenant concurrency (long run, more workers)
         run: cargo test -p loom-soak --release --test multitenant_endurance -- --nocapture
         env: { LOOM_SOAK_ITERS: "8000", LOOM_SOAK_WORKERS: "8" }
+
+  # AT-047 wake latency over REAL object storage — loom's OWN session sleep/wake path (not FlockDB's
+  # DuckDB wake→query). The in-suite AT-047 test proves correctness over an in-memory tier where wake is
+  # microseconds; this measures wake→first-read against a real S3 endpoint and reports p50/p99. MinIO
+  # here is same-runner (low latency), so a pass proves the wake path meets the target over the
+  # object-storage protocol; the WIDE-AREA p99 (a genuinely remote bucket) is the held-for-review
+  # follow-on. Nightly / manual, like the soaks.
+  wake-latency:
+    name: AT-047 wake latency (object storage)
+    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Stand up MinIO and create the bucket
+        run: |
+          set -euo pipefail
+          curl -fsSL https://dl.min.io/server/minio/release/linux-amd64/minio -o minio
+          curl -fsSL https://dl.min.io/client/mc/release/linux-amd64/mc -o mc
+          chmod +x minio mc
+          MINIO_ROOT_USER=minioadmin MINIO_ROOT_PASSWORD=minioadmin \
+            ./minio server /tmp/minio-data --address :9000 >/tmp/minio.log 2>&1 &
+          for i in $(seq 1 40); do
+            if curl -fsS http://localhost:9000/minio/health/live >/dev/null 2>&1; then break; fi
+            sleep 1
+          done
+          curl -fsS http://localhost:9000/minio/health/live && echo "MinIO is live"
+          ./mc alias set local http://localhost:9000 minioadmin minioadmin
+          ./mc mb --ignore-existing local/loomdb
+      - name: Measure loom wake → first read over object storage
+        env:
+          MINIO_URL: http://localhost:9000
+          MINIO_BUCKET: loomdb
+          MINIO_USER: minioadmin
+          MINIO_PASSWORD: minioadmin
+          AWS_REGION: us-east-1
+          LOOM_WAKE_SAMPLES: "50"
+        run: cargo test -p loom-branch --release --test wake_latency -- --ignored --nocapture
