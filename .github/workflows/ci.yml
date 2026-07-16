@@ -75,6 +75,21 @@ jobs:
       - run: cargo test -p loom-policy --release --test oracle
         env: { POLICY_CASES: "4000" }
 
+  # The HNSW recall oracle at full scale. Like the model oracles and the AT-045 sweep, the heavy version
+  # runs here in RELEASE (RECALL_FULL=1) so the debug `test` job stays fast; the debug job runs a small
+  # graph that catches gross breakage. recall@10 vs the exact brute-force scan, through the tree.
+  recall:
+    name: HNSW recall @ full scale (release)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo test --release -p loom-memory --test hnsw --test hnsw_store
+        env: { RECALL_FULL: "1" }
+      - run: cargo test --release -p loom-branch --test ann
+        env: { RECALL_FULL: "1" }
+
   # AT-045 — crash at every byte boundary, under a LoomDB-shaped workload, with one CrashVfs under both
   # the pager and the ref store. The exhaustive every-byte sweep (AT045_STRIDE=1); the in-suite default
   # samples ~200 points. This is the LoomDB-granularity crash re-assertion — substrate's 50,000-cycle

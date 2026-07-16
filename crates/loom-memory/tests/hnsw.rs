@@ -50,17 +50,21 @@ fn brute_force(items: &[(Vec<u8>, Embedding)], query: &Embedding, k: usize) -> V
 #[test]
 fn hnsw_recall_at_10_meets_the_floor() {
     const DIM: usize = 32;
-    const N: usize = 1000;
     const K: usize = 10;
-    const DATASETS: usize = 20;
+    // Scaled by env so the debug `test` job stays fast; the full-scale run is a dedicated release CI
+    // job (RECALL_FULL=1), the same pattern the model oracles use. A small graph still catches gross
+    // recall regressions; the large one is the meaningful floor.
+    let full = std::env::var("RECALL_FULL").is_ok();
+    let n: usize = if full { 1000 } else { 150 };
+    let datasets: usize = if full { 20 } else { 3 };
     // The published floor. HNSW at M=16, ef=64 comfortably clears this on random data; we assert a
     // conservative bar so the test is a regression guard, not a coin flip.
     const FLOOR: f64 = 0.85;
 
     let mut total_recall = 0.0f64;
-    for d in 0..DATASETS {
+    for d in 0..datasets {
         let mut rng = Rng(0xA11CE + d as u64 * 7919);
-        let items: Vec<(Vec<u8>, Embedding)> = (0..N)
+        let items: Vec<(Vec<u8>, Embedding)> = (0..n)
             .map(|i| (format!("k{i}").into_bytes(), random_vec(&mut rng, DIM)))
             .collect();
 
@@ -71,7 +75,7 @@ fn hnsw_recall_at_10_meets_the_floor() {
                 "insert must accept a same-dim vector"
             );
         }
-        assert_eq!(index.len(), N, "every distinct id is indexed once");
+        assert_eq!(index.len(), n, "every distinct id is indexed once");
 
         // 20 queries per dataset.
         let mut hits = 0usize;
@@ -90,7 +94,7 @@ fn hnsw_recall_at_10_meets_the_floor() {
         total_recall += hits as f64 / possible as f64;
     }
 
-    let mean_recall = total_recall / DATASETS as f64;
+    let mean_recall = total_recall / datasets as f64;
     assert!(
         mean_recall >= FLOOR,
         "HNSW recall@{K} = {mean_recall:.3}, below the floor {FLOOR}. An approximate index that misses \

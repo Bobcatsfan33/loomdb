@@ -74,15 +74,16 @@ fn brute_force(items: &[(Vec<u8>, Embedding)], q: &Embedding, k: usize) -> Vec<V
 #[test]
 fn store_backed_hnsw_meets_the_recall_floor_through_serialization() {
     const DIM: usize = 32;
-    const N: usize = 800;
     const K: usize = 10;
-    const DATASETS: usize = 12;
     const FLOOR: f64 = 0.85;
+    let full = std::env::var("RECALL_FULL").is_ok();
+    let n: usize = if full { 800 } else { 150 };
+    let datasets: usize = if full { 12 } else { 3 };
 
     let mut total = 0.0f64;
-    for d in 0..DATASETS {
+    for d in 0..datasets {
         let mut rng = Rng(0xB0B + d as u64 * 7919);
-        let items: Vec<(Vec<u8>, Embedding)> = (0..N)
+        let items: Vec<(Vec<u8>, Embedding)> = (0..n)
             .map(|i| (format!("k{i}").into_bytes(), random_vec(&mut rng, DIM)))
             .collect();
 
@@ -95,7 +96,7 @@ fn store_backed_hnsw_meets_the_recall_floor_through_serialization() {
         }
         assert_eq!(
             store.nodes.len(),
-            N,
+            n,
             "every distinct id is one persisted node"
         );
 
@@ -114,7 +115,7 @@ fn store_backed_hnsw_meets_the_recall_floor_through_serialization() {
         }
         total += hits as f64 / possible as f64;
     }
-    let mean = total / DATASETS as f64;
+    let mean = total / datasets as f64;
     assert!(
         mean >= FLOOR,
         "store-backed recall@{K} = {mean:.3}, below floor {FLOOR}"

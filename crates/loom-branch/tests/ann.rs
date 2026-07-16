@@ -83,8 +83,12 @@ fn seed(
 #[test]
 fn ann_index_in_a_branch_matches_the_brute_force_scan() {
     const DIM: usize = 24;
-    const N: usize = 400;
     const K: usize = 10;
+    let n: usize = if std::env::var("RECALL_FULL").is_ok() {
+        400
+    } else {
+        120
+    };
 
     let db = Loom::in_memory(TenantId::new("acme"))
         .unwrap()
@@ -92,10 +96,10 @@ fn ann_index_in_a_branch_matches_the_brute_force_scan() {
     let (session, token) = db.open_session().unwrap();
     let branch = session.branch.clone();
     let mut rng = Rng(7);
-    let items = seed(&db, &token, &branch, &session.id, &mut rng, N, DIM);
+    let items = seed(&db, &token, &branch, &session.id, &mut rng, n, DIM);
 
     let indexed = db.build_ann_index(&token, &branch).unwrap();
-    assert_eq!(indexed, N, "every vector on the branch is indexed");
+    assert_eq!(indexed, n, "every vector on the branch is indexed");
 
     // 15 queries, recall@K vs the exact top-K.
     let mut hits = 0usize;
