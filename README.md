@@ -104,15 +104,19 @@ bound stated plainly.
   found in a POC.
 - **The refs file is rewritten in full on every commit** — O(branches), not O(1). Invisible against
   database *size*; it will show on a tenant with a great many branches.
-- **Wake-over-object-storage p99 is measured at same-runner latency, not wide-area.** AT-047's
-  *correctness* — sleep, wipe the disk, wake elsewhere, identical results, branch names back — is proven,
-  and this is **loom's own session sleep/wake path**, not FlockDB's DuckDB wake. Its **latency** is
-  measured against a real S3 endpoint (`crates/loom-branch/tests/wake_latency.rs`, in CI): wake → first
-  read is **p50 12 ms / p99 13 ms** over 50 cold wakes — well inside the < 250 ms target, over the
-  object-storage protocol. But that MinIO runs on the same host, so it is a **low-latency-endpoint**
-  number; the **wide-area p99 against a genuinely remote bucket is the one open figure**, and it is what
-  any unqualified < 250 ms claim for a *remote-tier* deployment rests on. An **airgap** deployment does
-  not wake from object storage at all (it runs on local storage), so this bound does not apply to it.
+- **Wake-over-object-storage does NOT meet the 250 ms p99 target over real distance — measured, stated
+  plainly.** AT-047's *correctness* — sleep, wipe the disk, wake elsewhere, identical results, branch
+  names back — is proven, and this is **loom's own session sleep/wake path**, not FlockDB's DuckDB wake.
+  Its **latency** is measured against a real S3 endpoint two ways (`crates/loom-branch/tests/wake_latency.rs`):
+  - **Same-runner** (low-latency endpoint): p50 12 ms / **p99 13 ms** — inside 250 ms over the protocol.
+  - **Wide-area** (a genuinely remote bucket, intercontinental — `wake-latency-widearea.yml`): p50 947 ms /
+    **p99 1020 ms** — **~4× OVER the 250 ms target.** Loom's wake is O(pages-touched), i.e. a *handful of
+    serial faults*; over a ~230 ms intercontinental round-trip, ~4 serial faults ≈ ~950 ms. Meeting the
+    target wide-area requires **coalescing/batching those faults** (a v0.3 item — and one whose naïve
+    per-page form was already measured counterproductive on the sibling engine, so it needs a real
+    ranged/multi-GET, not a fan-out). Until then, the < 250 ms wake is a **same-runner / low-RTT-tier**
+    number, not a wide-area one. An **airgap** deployment does not wake from object storage at all (it
+    runs on local storage), so this bound does not apply to it.
 - **Signature verification is opt-in, and key distribution is not solved here.** With an actor registry,
   every write is signed and verified (AT-026); without one, writes are attributable but not
   authenticated. Where keys come from, how they rotate, and how a compromised one is revoked is out of
