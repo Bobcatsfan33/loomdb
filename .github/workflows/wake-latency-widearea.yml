@@ -1,0 +1,42 @@
+name: wake latency (wide-area, real S3)
+
+# AT-047 over a GENUINELY REMOTE bucket — loom's own session wake→first-read with a real network
+# round-trip per fault. This is the one figure the same-runner MinIO number (p99 ≈ 13 ms) cannot show,
+# and the last gate before an unqualified `< 250 ms` for a remote-tier deployment. (The airgap product
+# runs on local storage and never wakes from object storage, so this does not gate it.)
+#
+# Credentials come from repository secrets, read by name into the step environment — never echoed;
+# object_store speaks HTTPS to AWS. Manual only: it is a measurement, and the reviewer takes it.
+on:
+  workflow_dispatch:
+    inputs:
+      samples:
+        description: "Number of independent cold wakes to time"
+        required: false
+        default: "50"
+
+jobs:
+  measure:
+    name: AT-047 wake latency, over real S3
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Measure loom wake → first read over real S3
+        env:
+          AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          AWS_REGION: ${{ secrets.WAKE_REGION }}
+          WAKE_BUCKET: ${{ secrets.WAKE_BUCKET }}
+          LOOM_WAKE_SAMPLES: ${{ github.event.inputs.samples }}
+          # MINIO_URL intentionally UNSET → the harness uses the real-AWS (HTTPS, region-derived) path,
+          # and reports the wide-area p99 instead of asserting the < 250 ms same-runner guard.
+        run: |
+          set -eu
+          if [ -z "${AWS_ACCESS_KEY_ID:-}" ] || [ -z "${WAKE_BUCKET:-}" ]; then
+            echo "::error::wide-area secrets are not set on this repo (need AWS_ACCESS_KEY_ID, AWS_SECRET_ACCESS_KEY, WAKE_REGION, WAKE_BUCKET)."
+            exit 1
+          fi
+          echo "Measuring loom wake against bucket '$WAKE_BUCKET' in region '$AWS_REGION' (credentials from secrets, not shown)."
+          cargo test -p loom-branch --release --test wake_latency -- --ignored --nocapture

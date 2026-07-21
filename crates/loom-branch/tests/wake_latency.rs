@@ -49,21 +49,44 @@ fn counter(n: i64) -> Record {
     Record::Value(Value::Counter(n))
 }
 
-/// A fresh S3-backed `RemoteTier` for `pool`. A unique pool per run keeps repeated runs from reading
-/// each other's warm objects.
+/// A fresh S3-backed `RemoteTier` for `pool`, in one of two modes decided by the environment:
+///
+/// - **Same-runner MinIO** (`MINIO_URL` set): custom endpoint over HTTP with explicit creds — the
+///   low-latency control (p99 ≈ 13 ms; not a wide-area number).
+/// - **Real AWS S3, wide-area** (`MINIO_URL` unset): region-derived HTTPS endpoint, credentials from
+///   the standard `AWS_*` env the workflow maps from repository secrets (never echoed). `WAKE_ENDPOINT`
+///   (optional) points at an S3-compatible service like R2. This is the genuinely-remote p99 an
+///   unqualified `< 250 ms` for a remote-tier deployment rests on.
 fn s3_remote(pool: &str) -> RemoteTier {
-    let url = std::env::var("MINIO_URL")
-        .expect("MINIO_URL is not set — this test needs a real S3-compatible endpoint");
-    let backend = AmazonS3Builder::new()
-        .with_endpoint(url)
-        .with_bucket_name(std::env::var("MINIO_BUCKET").unwrap_or_else(|_| "loomdb".into()))
-        .with_access_key_id(std::env::var("MINIO_USER").unwrap_or_else(|_| "minioadmin".into()))
-        .with_secret_access_key(
-            std::env::var("MINIO_PASSWORD").unwrap_or_else(|_| "minioadmin".into()),
-        )
-        .with_allow_http(true)
-        .build()
-        .expect("build an S3 client");
+    let bucket = std::env::var("WAKE_BUCKET")
+        .or_else(|_| std::env::var("MINIO_BUCKET"))
+        .unwrap_or_else(|_| "loomdb".into());
+    let mut builder = AmazonS3Builder::new().with_bucket_name(bucket);
+
+    if let Ok(url) = std::env::var("MINIO_URL") {
+        builder = builder
+            .with_endpoint(url)
+            .with_allow_http(true)
+            .with_access_key_id(std::env::var("MINIO_USER").unwrap_or_else(|_| "minioadmin".into()))
+            .with_secret_access_key(
+                std::env::var("MINIO_PASSWORD").unwrap_or_else(|_| "minioadmin".into()),
+            );
+    } else {
+        if let Ok(region) = std::env::var("AWS_REGION").or_else(|_| std::env::var("WAKE_REGION")) {
+            builder = builder.with_region(region);
+        }
+        if let Ok(key) = std::env::var("AWS_ACCESS_KEY_ID") {
+            builder = builder.with_access_key_id(key);
+        }
+        if let Ok(secret) = std::env::var("AWS_SECRET_ACCESS_KEY") {
+            builder = builder.with_secret_access_key(secret);
+        }
+        if let Ok(endpoint) = std::env::var("WAKE_ENDPOINT") {
+            builder = builder.with_endpoint(endpoint);
+        }
+    }
+
+    let backend = builder.build().expect("build an S3 client");
     RemoteTier::new(Arc::new(backend), pool.to_string())
 }
 
@@ -177,14 +200,22 @@ fn at_047_wake_latency_over_object_storage() {
     println!("mean: {mean:.1} ms");
     println!("(loom's OWN sleep/wake path, not FlockDB's DuckDB wake. Only a wide-area number if MINIO_URL is remote.)");
 
-    // Guard, not a published wide-area claim: against a same-runner endpoint this must comfortably hold,
-    // and a regression that makes wake fetch everything eagerly would blow past it. The wide-area p99 is
-    // reported from a genuinely remote bucket, held for review, and is what any unqualified claim rests on.
     let p99 = pct(99.0);
-    assert!(
-        p99 < 250.0,
-        "AT-047 p99 wake→first-read was {p99:.1} ms (target < 250 ms) against this endpoint"
-    );
+    // The `< 250 ms` check is a regression GUARD, applied only against a same-runner endpoint (MINIO_URL
+    // set), where wake must comfortably hold and a regression that makes it fetch everything eagerly
+    // would blow past it. Against a genuinely-remote bucket this is a MEASUREMENT, not a gate: the
+    // number is the deliverable (held for review), and whether it clears 250 ms is the reviewer's call —
+    // so a wide-area p99 over the target reports honestly instead of failing the run.
+    if std::env::var("MINIO_URL").is_ok() {
+        assert!(
+            p99 < 250.0,
+            "AT-047 p99 wake→first-read was {p99:.1} ms (target < 250 ms) against this same-runner endpoint"
+        );
+    } else if p99 >= 250.0 {
+        println!("NOTE: wide-area p99 {p99:.1} ms is OVER the 250 ms target — reported, not asserted; no <250ms claim.");
+    } else {
+        println!("wide-area p99 {p99:.1} ms is UNDER 250 ms — but confirm against your own bucket before quoting.");
+    }
 
     drop(rt);
 }
