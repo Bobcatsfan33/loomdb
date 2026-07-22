@@ -109,13 +109,19 @@ bound stated plainly.
   names back — is proven, and this is **loom's own session sleep/wake path**, not FlockDB's DuckDB wake.
   Its **latency** is measured against a real S3 endpoint two ways (`crates/loom-branch/tests/wake_latency.rs`):
   - **Same-runner** (low-latency endpoint): p50 12 ms / **p99 13 ms** — inside 250 ms over the protocol.
-  - **Wide-area** (a genuinely remote bucket, intercontinental — `wake-latency-widearea.yml`): p50 947 ms /
-    **p99 1020 ms** — **~4× OVER the 250 ms target.** Loom's wake is O(pages-touched), i.e. a *handful of
-    serial faults*; over a ~230 ms intercontinental round-trip, ~4 serial faults ≈ ~950 ms. Meeting the
-    target wide-area requires **coalescing/batching those faults** (a v0.3 item — and one whose naïve
-    per-page form was already measured counterproductive on the sibling engine, so it needs a real
-    ranged/multi-GET, not a fan-out). Until then, the < 250 ms wake is a **same-runner / low-RTT-tier**
-    number, not a wide-area one. An **airgap** deployment does not wake from object storage at all (it
+  - **Wide-area, serial** (a genuinely remote bucket, intercontinental — `wake-latency-widearea.yml`):
+    p50 ~945 ms / **p99 ~1000 ms** — **~4× OVER target.** Loom's wake is O(pages-touched) (a *handful of
+    serial faults*, measured mean **2 pages**); over a ~230 ms round-trip, those serial faults + the
+    overlay-manifest chain add up.
+  - **Wide-area, batched** (`get_batch` coalescing, substrate ≥ v1.3.0): p50 764 ms / **p99 808 ms** —
+    **improved but still over target.** The measured breakdown says why, and it is two things, not one:
+    (1) `get_batch` of the 2-page fault set takes ~450 ms — ≈ **2 round-trips, not one**, because the
+    connection pool is cold and each GET pays a fresh TLS handshake (a warm, keep-alive pool sized to the
+    concurrency width would cut this toward ~1 RTT); (2) the read still walks the **overlay-manifest
+    chain serially** (~310 ms) — a different object type `get_batch` does not touch, so it needs its own
+    batching. Coalescing the *pages* is necessary but not sufficient; a warm pool **and** manifest-chain
+    batching are the remaining levers before the wide-area wake clears 250 ms. An **airgap** deployment
+    does not wake from object storage at all (it
     runs on local storage), so this bound does not apply to it.
 - **Signature verification is opt-in, and key distribution is not solved here.** With an actor registry,
   every write is signed and verified (AT-026); without one, writes are attributable but not
