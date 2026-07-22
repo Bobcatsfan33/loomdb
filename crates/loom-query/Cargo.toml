@@ -7,7 +7,7 @@ edition.workspace = true
 loom-core = { path = "../loom-core" }
 # default-features = false so loom-query does not force the remote path on; airgap forwards (see [features]).
 loom-branch = { path = "../loom-branch", default-features = false }
-substrate-pager = { git = "https://github.com/Bobcatsfan33/substrate", tag = "substrate-v1.2.2" }
+substrate-pager = { git = "https://github.com/Bobcatsfan33/substrate", tag = "substrate-v1.3.0" }
 
 [features]
 default = ["remote"]
