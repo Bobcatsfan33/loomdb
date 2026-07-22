@@ -31,10 +31,45 @@
 use loom_branch::{Loom, LoomWakeToken, MemRefStore};
 use loom_core::{ActorId, BranchId, Record, SessionId, TenantId, Value, WriteEnvelope};
 use object_store::aws::AmazonS3Builder;
+use object_store::ObjectStore;
 use std::sync::Arc;
 use std::time::Instant;
 use substrate_pager::{PageId, StoreConfig};
 use substrate_store::{RemoteTier, TieredStore};
+
+/// Build the object-storage client once — its connection pool is what "warm" means. Sharing ONE client
+/// across a run's wakes (via [`RemoteTier::new`] with `Arc::clone`) models the production loomd server:
+/// a persistent client whose keep-alive connections stay open between wakes, so a wake reuses them
+/// instead of paying a fresh TLS handshake per GET. Env logic identical to [`s3_remote`].
+fn s3_client() -> Arc<dyn ObjectStore> {
+    let bucket = std::env::var("WAKE_BUCKET")
+        .or_else(|_| std::env::var("MINIO_BUCKET"))
+        .unwrap_or_else(|_| "loomdb".into());
+    let mut builder = AmazonS3Builder::new().with_bucket_name(bucket);
+    if let Ok(url) = std::env::var("MINIO_URL") {
+        builder = builder
+            .with_endpoint(url)
+            .with_allow_http(true)
+            .with_access_key_id(std::env::var("MINIO_USER").unwrap_or_else(|_| "minioadmin".into()))
+            .with_secret_access_key(
+                std::env::var("MINIO_PASSWORD").unwrap_or_else(|_| "minioadmin".into()),
+            );
+    } else {
+        if let Ok(region) = std::env::var("AWS_REGION").or_else(|_| std::env::var("WAKE_REGION")) {
+            builder = builder.with_region(region);
+        }
+        if let Ok(key) = std::env::var("AWS_ACCESS_KEY_ID") {
+            builder = builder.with_access_key_id(key);
+        }
+        if let Ok(secret) = std::env::var("AWS_SECRET_ACCESS_KEY") {
+            builder = builder.with_secret_access_key(secret);
+        }
+        if let Ok(endpoint) = std::env::var("WAKE_ENDPOINT") {
+            builder = builder.with_endpoint(endpoint);
+        }
+    }
+    Arc::new(builder.build().expect("build an S3 client"))
+}
 
 fn envelope(branch: &BranchId) -> WriteEnvelope {
     WriteEnvelope::new(
@@ -249,6 +284,12 @@ fn at_047_wake_latency_batched_over_object_storage() {
     let mut fault_pages_n: Vec<usize> = Vec::with_capacity(samples);
     let branch = BranchId::new("investigation-1");
 
+    // ONE shared client for the whole run — its connection pool warms on the first wake and stays warm
+    // (keep-alive), so the measured wakes reuse connections instead of paying a fresh TLS handshake per
+    // GET. This is the pooling lever: it re-baselines BOTH components (get_batch pages AND the manifest
+    // walk), since both go through this same client to the same store.
+    let backend = s3_client();
+
     for s in 0..samples {
         let pool = format!("loombatch-{s}");
         let tenant = TenantId::new(pool.clone());
@@ -258,7 +299,7 @@ fn at_047_wake_latency_batched_over_object_storage() {
         let token_json = rt.block_on(async {
             let tiered = TieredStore::open(
                 seed_home.path(),
-                s3_remote(&pool),
+                RemoteTier::new(Arc::clone(&backend), pool.clone()),
                 StoreConfig {
                     pool: pool.clone(),
                     ..Default::default()
@@ -299,7 +340,7 @@ fn at_047_wake_latency_batched_over_object_storage() {
         let fault_pages: Vec<PageId> = rt.block_on(async {
             let tiered = TieredStore::open(
                 probe_home.path(),
-                s3_remote(&pool),
+                RemoteTier::new(Arc::clone(&backend), pool.clone()),
                 StoreConfig {
                     pool: pool.clone(),
                     ..Default::default()
@@ -327,7 +368,7 @@ fn at_047_wake_latency_batched_over_object_storage() {
         let (value, this_batch_ms, this_read_ms) = rt.block_on(async {
             let tiered = TieredStore::open(
                 wake_home.path(),
-                s3_remote(&pool),
+                RemoteTier::new(Arc::clone(&backend), pool.clone()),
                 StoreConfig {
                     pool: pool.clone(),
                     ..Default::default()
