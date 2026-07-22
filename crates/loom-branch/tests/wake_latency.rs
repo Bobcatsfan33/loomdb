@@ -281,6 +281,7 @@ fn at_047_wake_latency_batched_over_object_storage() {
     let mut total_ms: Vec<f64> = Vec::with_capacity(samples);
     let mut batch_ms: Vec<f64> = Vec::with_capacity(samples);
     let mut read_ms: Vec<f64> = Vec::with_capacity(samples);
+    let mut rtt_ms: Vec<f64> = Vec::with_capacity(samples);
     let mut fault_pages_n: Vec<usize> = Vec::with_capacity(samples);
     let branch = BranchId::new("investigation-1");
 
@@ -362,7 +363,21 @@ fn at_047_wake_latency_batched_over_object_storage() {
         });
         drop(probe_home);
 
-        // ── Measured wake (cold, fresh cache): get_batch the fault set, then read. Timed + broken down. ──
+        // ── RTT probe: time ONE warm GET, so every component below can be reported in RTT-multiples.
+        //    This is the only thing that cuts through the wild run-to-run network variance (the serial
+        //    baseline alone swings 2x between runs) — 450 ms means nothing until you know if that is one
+        //    round-trip or two. Uses the shared, already-warm client; a raw remote GET, not through the
+        //    tier cache. ──
+        let rtt = rt.block_on(async {
+            let remote = RemoteTier::new(Arc::clone(&backend), pool.clone());
+            let key = remote.page_key(fault_pages[0]);
+            let t = Instant::now();
+            remote.get(&key).await.expect("rtt probe get");
+            t.elapsed().as_secs_f64() * 1000.0
+        });
+        rtt_ms.push(rtt);
+
+        // ── Measured wake (cold cache, warm client): get_batch the fault set, then read. Timed + broken down. ──
         let wake_home = tempfile::tempdir().expect("tempdir");
         let started = Instant::now();
         let (value, this_batch_ms, this_read_ms) = rt.block_on(async {
@@ -412,21 +427,31 @@ fn at_047_wake_latency_batched_over_object_storage() {
     let mean = |v: &[f64]| v.iter().sum::<f64>() / v.len() as f64;
     let mean_u = |v: &[usize]| v.iter().sum::<usize>() as f64 / v.len() as f64;
 
-    println!("--- AT-047 BATCHED: loom wake COALESCED via get_batch ({samples} cold wakes) ---");
+    let rtt = mean(&rtt_ms).max(0.001);
+    println!("--- AT-047 BATCHED: loom wake COALESCED via get_batch, warm pool ({samples} cold wakes) ---");
     println!(
         "fault set size          : mean {:.1} pages (deduped to objects by get_batch)",
         mean_u(&fault_pages_n)
     );
     println!(
-        "wake → first read TOTAL : p50 {:.1} / p99 {:.1} ms",
-        pct(&total_ms, 50.0),
-        pct(&total_ms, 99.0)
+        "1 RTT (warm GET)        : mean {rtt:.1} ms  ← the unit; absolute ms below are noisy, RTT-multiples are not"
     );
     println!(
-        "  ├ get_batch(pages)     : mean {:.1} ms  (concurrent, deduped — the coalesced part)",
-        mean(&batch_ms)
+        "wake → first read TOTAL : p50 {:.1} / p99 {:.1} ms   = {:.2} RTT (p50)",
+        pct(&total_ms, 50.0),
+        pct(&total_ms, 99.0),
+        pct(&total_ms, 50.0) / rtt
     );
-    println!("  └ read (manifest chain + warm pages) : mean {:.1} ms  (serial manifests get_batch does NOT touch)", mean(&read_ms));
+    println!(
+        "  ├ get_batch(pages)     : mean {:.1} ms = {:.2} RTT  (concurrent, deduped — the coalesced part)",
+        mean(&batch_ms),
+        mean(&batch_ms) / rtt
+    );
+    println!(
+        "  └ read (manifest chain + warm pages) : mean {:.1} ms = {:.2} RTT  (serial manifests get_batch does NOT touch)",
+        mean(&read_ms),
+        mean(&read_ms) / rtt
+    );
     println!("(loom's OWN wake, not DuckDB. Only a wide-area number if MINIO_URL is remote.)");
 
     let p99 = pct(&total_ms, 99.0);
