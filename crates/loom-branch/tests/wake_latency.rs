@@ -508,6 +508,10 @@ fn at_047_hot_vs_cold_rewake_over_object_storage() {
     let mut cold_ms: Vec<f64> = Vec::with_capacity(samples);
     let mut hot_ms: Vec<f64> = Vec::with_capacity(samples);
     let mut rtt_ms: Vec<f64> = Vec::with_capacity(samples);
+    let mut warm_manifests_n: Vec<usize> = Vec::with_capacity(samples);
+    let mut warm_pages_n: Vec<usize> = Vec::with_capacity(samples);
+    let mut hot_read_faults_n: Vec<u64> = Vec::with_capacity(samples);
+    let mut hot_hydrate_ms: Vec<f64> = Vec::with_capacity(samples);
 
     let open = |home: &std::path::Path, pool: &str| {
         rt.block_on(TieredStore::open(
@@ -608,19 +612,35 @@ fn at_047_hot_vs_cold_rewake_over_object_storage() {
         });
         rtt_ms.push(rtt);
 
+        // Warm-set composition — how much of each object type the cold read learned, so we can see
+        // whether the manifest chain (the serial bottleneck) is actually being hydrated.
+        warm_manifests_n.push(warm.manifests.len());
+        warm_pages_n.push(warm.pages.len());
+
         // The hot token: same refs (nothing was written), with the learned warm set grafted on.
         let token_hot = LoomWakeToken {
             warm_set: warm,
             ..token_cold.clone()
         };
 
-        // ── HOT: re-wake carrying the warm set → prefetch fires in Loom::wake and overlaps the read. ──
+        // ── HOT: re-wake carrying the warm set → hydrate (awaited), then wake+read on the warm cache. ──
+        // We split the two costs: hydrate in isolation, then wake+read. Loom::wake also hydrates, but by
+        // then everything is resident so its hydrate is a cheap no-op — so this attributes the round-trips
+        // honestly (hydrate vs. everything-else) without changing the total a production single-wake pays.
         let hot_home = tempfile::tempdir().expect("tempdir");
-        let hot_elapsed = {
+        let (hot_elapsed, hydrate_only_ms, read_faults) = {
             let tiered = open(hot_home.path(), &pool);
             let started = Instant::now();
+
+            // 1. Hydrate in isolation, timed.
+            let t_h = Instant::now();
+            tiered.hydrate(&token_hot.warm_set);
+            let hydrate_ms = t_h.elapsed().as_secs_f64() * 1000.0;
+            let misses_after_hydrate = tiered.stats().misses;
+
+            // 2. Wake (its internal hydrate is now a warm no-op) + read.
+            let db = Loom::wake(&tiered, &token_hot).expect("hot wake");
             let value = {
-                let db = Loom::wake(&tiered, &token_hot).expect("hot wake");
                 let cap = db
                     .issue_capability(
                         SessionId::new("hot"),
@@ -631,11 +651,14 @@ fn at_047_hot_vs_cold_rewake_over_object_storage() {
                 db.read(&cap, &branch, b"key-0000").expect("hot read")
             };
             let elapsed = started.elapsed().as_secs_f64() * 1000.0;
+            let read_faults = tiered.stats().misses.saturating_sub(misses_after_hydrate);
             assert_eq!(value, Some(counter(0)), "hot woke to the wrong value");
-            elapsed
+            (elapsed, hydrate_ms, read_faults)
         };
         drop(hot_home);
         hot_ms.push(hot_elapsed);
+        hot_hydrate_ms.push(hydrate_only_ms);
+        hot_read_faults_n.push(read_faults);
     }
 
     let sort =
@@ -647,12 +670,25 @@ fn at_047_hot_vs_cold_rewake_over_object_storage() {
         v[idx.min(v.len() - 1)]
     };
     let mean = |v: &[f64]| v.iter().sum::<f64>() / v.len() as f64;
+    let mean_u = |v: &[usize]| v.iter().sum::<usize>() as f64 / v.len() as f64;
+    let mean_u64 = |v: &[u64]| v.iter().sum::<u64>() as f64 / v.len() as f64;
     let rtt = mean(&rtt_ms).max(0.001);
 
     println!(
         "--- AT-047 HOT vs COLD: loom's real wake path, warm set via token ({samples} samples) ---"
     );
     println!("1 RTT (warm GET)   : mean {rtt:.1} ms  ← the unit");
+    println!(
+        "warm set learned   : mean {:.1} manifests + {:.1} pages   |   hot read faulted mean {:.2} objects AFTER hydrate",
+        mean_u(&warm_manifests_n),
+        mean_u(&warm_pages_n),
+        mean_u64(&hot_read_faults_n),
+    );
+    println!(
+        "hot breakdown      : hydrate mean {:.1} ms = {:.2} RTT   |   wake+read (warm) = the rest",
+        mean(&hot_hydrate_ms),
+        mean(&hot_hydrate_ms) / rtt,
+    );
     println!(
         "COLD (first-ever)  : p50 {:.1} / p99 {:.1} ms   = {:.2} / {:.2} RTT   (serial overlay-chain walk)",
         pct(&cold_ms, 50.0),
