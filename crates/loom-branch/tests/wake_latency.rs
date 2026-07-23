@@ -466,3 +466,224 @@ fn at_047_wake_latency_batched_over_object_storage() {
 
     drop(rt);
 }
+
+/// **AT-047, hot vs cold — the warm set through LoomDB's REAL wake path.**
+///
+/// The batched test above *simulates* a warm re-wake by learning the fault set with a probe and calling
+/// `get_batch` by hand — and its own breakdown flags that it coalesces the pages but leaves the overlay
+/// MANIFEST chain serial ("the next thing to batch"). substrate v1.4.x makes that automatic: a session's
+/// faulted objects (chain **and** pages) are learned into the warm set, `sleep()` carries it in the
+/// token, and `Loom::wake` hands it to `TieredStore::prefetch`, which hydrates the whole chain in one
+/// concurrent round-trip before the first read arrives. This test measures **that**, end to end, with no
+/// hand-built batch — the number is loom's actual wake, not a harness stand-in.
+///
+/// Two paths against the same point read, same tenant shape:
+///
+/// - **cold** — first-ever wake, empty warm set: the serial overlay-chain walk. The `~2–4 RTT` baseline.
+/// - **hot**  — re-wake carrying the warm set the cold session learned: the prefetch collapses the walk.
+///   The `< 250 ms` target lives here.
+///
+/// The hot token is the cold token with the warm set the cold wake learned grafted on (nothing was
+/// written between them, so the refs are identical) — exactly what a real working session's `sleep()`
+/// persists, without needing a read-only re-sleep to resolve a history closure it never faulted.
+///
+/// Wide-area (no `MINIO_URL`): the hot p99 is the deliverable, and whether it clears 250 ms is the
+/// AT-047 verdict. Same-runner: informational (RTT ≈ 0 hides the gap).
+#[test]
+#[ignore = "needs an S3-compatible endpoint; set MINIO_URL. Measures loom's warm-set hot re-wake vs cold first-ever (AT-047)."]
+fn at_047_hot_vs_cold_rewake_over_object_storage() {
+    let samples: usize = std::env::var("LOOM_WAKE_SAMPLES")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(20);
+
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .expect("runtime");
+
+    let branch = BranchId::new("investigation-1");
+    let backend = s3_client(); // one warm, pooled client for the whole run — see the batched test.
+
+    let mut cold_ms: Vec<f64> = Vec::with_capacity(samples);
+    let mut hot_ms: Vec<f64> = Vec::with_capacity(samples);
+    let mut rtt_ms: Vec<f64> = Vec::with_capacity(samples);
+
+    let open = |home: &std::path::Path, pool: &str| {
+        rt.block_on(TieredStore::open(
+            home,
+            RemoteTier::new(Arc::clone(&backend), pool.to_string()),
+            StoreConfig {
+                pool: pool.to_string(),
+                ..Default::default()
+            },
+        ))
+        .expect("open tier")
+    };
+
+    for s in 0..samples {
+        let pool = format!("loomhotcold-{s}");
+        let tenant = TenantId::new(pool.clone());
+
+        // ── seed + sleep: 12 writes so the head is an overlay on a base (the realistic wake shape). The
+        //    seed never faults, so this cold token's warm set is empty — a true first-ever token. ──
+        let seed_home = tempfile::tempdir().expect("tempdir");
+        let token_cold = rt.block_on(async {
+            let tiered = TieredStore::open(
+                seed_home.path(),
+                RemoteTier::new(Arc::clone(&backend), pool.clone()),
+                StoreConfig {
+                    pool: pool.clone(),
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("open seed tier");
+            let db = Loom::on(
+                Arc::clone(tiered.pager()),
+                Arc::new(MemRefStore::new()),
+                tenant.clone(),
+            )
+            .expect("open loom");
+            let (session, token) = db
+                .open_session_named(SessionId::new("investigation-1"))
+                .expect("session");
+            for round in 0..12u64 {
+                db.write(
+                    &token,
+                    &session.branch,
+                    format!("key-{round:04}").into_bytes(),
+                    counter(round as i64),
+                    &envelope(&session.branch),
+                )
+                .expect("write");
+            }
+            db.sleep(&tiered).await.expect("sleep")
+        });
+        drop(seed_home);
+        assert!(
+            token_cold.warm_set.is_empty(),
+            "a first-ever token should carry no warm set"
+        );
+
+        // ── COLD: first-ever wake, empty warm set → serial chain walk. Also learns the warm set. ──
+        let cold_home = tempfile::tempdir().expect("tempdir");
+        let (cold_elapsed, warm) = {
+            let tiered = open(cold_home.path(), &pool);
+            let started = Instant::now();
+            let value = {
+                let db = Loom::wake(&tiered, &token_cold).expect("cold wake");
+                let cap = db
+                    .issue_capability(
+                        SessionId::new("cold"),
+                        std::slice::from_ref(&branch),
+                        3_600_000,
+                    )
+                    .expect("cap");
+                db.read(&cap, &branch, b"key-0000").expect("cold read")
+            };
+            let elapsed = started.elapsed().as_secs_f64() * 1000.0;
+            assert_eq!(value, Some(counter(0)), "cold woke to the wrong value");
+            (elapsed, tiered.warm_set())
+        };
+        drop(cold_home);
+        cold_ms.push(cold_elapsed);
+        assert!(
+            !warm.is_empty(),
+            "the cold read learned no warm set — nothing for the hot path to prefetch"
+        );
+
+        // ── RTT probe: one warm GET of a known-durable object (a page the cold read faulted), so both
+        //    paths can be read in RTT-multiples through the wild run-to-run network variance. Raw remote
+        //    GET, not through a tier cache. ──
+        let rtt = rt.block_on(async {
+            let remote = RemoteTier::new(Arc::clone(&backend), pool.clone());
+            let key = match warm.pages.first() {
+                Some(&p) => remote.page_key(p),
+                None => remote.manifest_key(warm.manifests[0]),
+            };
+            let t = Instant::now();
+            let _ = remote.get(&key).await;
+            t.elapsed().as_secs_f64() * 1000.0
+        });
+        rtt_ms.push(rtt);
+
+        // The hot token: same refs (nothing was written), with the learned warm set grafted on.
+        let token_hot = LoomWakeToken {
+            warm_set: warm,
+            ..token_cold.clone()
+        };
+
+        // ── HOT: re-wake carrying the warm set → prefetch fires in Loom::wake and overlaps the read. ──
+        let hot_home = tempfile::tempdir().expect("tempdir");
+        let hot_elapsed = {
+            let tiered = open(hot_home.path(), &pool);
+            let started = Instant::now();
+            let value = {
+                let db = Loom::wake(&tiered, &token_hot).expect("hot wake");
+                let cap = db
+                    .issue_capability(
+                        SessionId::new("hot"),
+                        std::slice::from_ref(&branch),
+                        3_600_000,
+                    )
+                    .expect("cap");
+                db.read(&cap, &branch, b"key-0000").expect("hot read")
+            };
+            let elapsed = started.elapsed().as_secs_f64() * 1000.0;
+            assert_eq!(value, Some(counter(0)), "hot woke to the wrong value");
+            elapsed
+        };
+        drop(hot_home);
+        hot_ms.push(hot_elapsed);
+    }
+
+    let sort =
+        |v: &mut Vec<f64>| v.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+    sort(&mut cold_ms);
+    sort(&mut hot_ms);
+    let pct = |v: &[f64], p: f64| -> f64 {
+        let idx = ((p / 100.0) * (v.len() as f64 - 1.0)).round() as usize;
+        v[idx.min(v.len() - 1)]
+    };
+    let mean = |v: &[f64]| v.iter().sum::<f64>() / v.len() as f64;
+    let rtt = mean(&rtt_ms).max(0.001);
+
+    println!(
+        "--- AT-047 HOT vs COLD: loom's real wake path, warm set via token ({samples} samples) ---"
+    );
+    println!("1 RTT (warm GET)   : mean {rtt:.1} ms  ← the unit");
+    println!(
+        "COLD (first-ever)  : p50 {:.1} / p99 {:.1} ms   = {:.2} / {:.2} RTT   (serial overlay-chain walk)",
+        pct(&cold_ms, 50.0),
+        pct(&cold_ms, 99.0),
+        pct(&cold_ms, 50.0) / rtt,
+        pct(&cold_ms, 99.0) / rtt,
+    );
+    println!(
+        "HOT  (warm re-wake): p50 {:.1} / p99 {:.1} ms   = {:.2} / {:.2} RTT   (prefetch collapses the chain)",
+        pct(&hot_ms, 50.0),
+        pct(&hot_ms, 99.0),
+        pct(&hot_ms, 50.0) / rtt,
+        pct(&hot_ms, 99.0) / rtt,
+    );
+    println!(
+        "speedup (p50)      : {:.2}x",
+        pct(&cold_ms, 50.0) / pct(&hot_ms, 50.0).max(1e-9)
+    );
+    println!("(loom's OWN wake through the warm set, not DuckDB. Only a wide-area number if MINIO_URL is remote.)");
+
+    let hot_p99 = pct(&hot_ms, 99.0);
+    if std::env::var("MINIO_URL").is_ok() {
+        println!("(same-runner endpoint — informational; the warm set's payoff only shows wide-area where RTT is real.)");
+    } else if hot_p99 < 250.0 {
+        println!(
+            "RESULT: hot re-wake wide-area p99 {hot_p99:.1} ms is UNDER 250 ms — AT-047 wide-area limit RETIRES for the hot-tenant re-wake (cold first-ever stays the serial {:.2}-RTT baseline).",
+            pct(&cold_ms, 50.0) / rtt
+        );
+    } else {
+        println!("RESULT: hot re-wake wide-area p99 {hot_p99:.1} ms is still OVER 250 ms — reported honestly; no <250ms claim, AT-047 limit stands and its number is UPDATED to this measurement.");
+    }
+
+    drop(rt);
+}

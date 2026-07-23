@@ -1430,6 +1430,9 @@ impl Loom {
             tenant: self.tenant.clone(),
             page_size: self.pager.page_size(),
             refs,
+            // Snapshot what this session faulted from the tier, so the next wake can prefetch it. A hint;
+            // nothing depends on it for correctness (it is content-addressed downstream).
+            warm_set: tiered.warm_set(),
         })
     }
 
@@ -1438,6 +1441,13 @@ impl Loom {
     /// Only compiled with the `remote` feature (on by default) — see [`sleep`](Self::sleep).
     #[cfg(feature = "remote")]
     pub fn wake(tiered: &substrate_store::TieredStore, token: &LoomWakeToken) -> Result<Self> {
+        // Speculatively hydrate the warm set the last session learned, before the first read arrives.
+        // LoomDB manages its own wake (many branch heads, not one manifest — see `sleep.rs`), so it
+        // cannot go through `TieredStore::wake`; it calls the tier's prefetch directly. Best-effort and
+        // content-addressed: on a cold token (`warm_set` empty) this is a no-op and the wake is exactly
+        // what it was before. It runs on a dedicated thread and overlaps the reads below.
+        tiered.prefetch(&token.warm_set);
+
         let store = Arc::new(MemRefStore::new());
         store.save(&token.refs)?;
         Loom::assemble(Arc::clone(tiered.pager()), store, token.tenant.clone())

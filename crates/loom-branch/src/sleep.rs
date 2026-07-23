@@ -21,6 +21,7 @@
 use crate::refs::Refs;
 use loom_core::{LoomError, Result, TenantId};
 use serde::{Deserialize, Serialize};
+use substrate_store::HotSetSnapshot;
 
 /// Everything needed to bring a sleeping tenant back.
 ///
@@ -34,6 +35,14 @@ pub struct LoomWakeToken {
     pub page_size: usize,
     /// Branch heads, tags, and the commit DAG — including every merge's second parent.
     pub refs: Refs,
+    /// The **warm set** the last active session faulted — the manifest chain and pages a re-wake will
+    /// most likely need. `wake()` hands this to the tier's speculative prefetch, collapsing the serial
+    /// overlay-chain walk into one concurrent round-trip for a hot re-wake. A **hint only**:
+    /// content-addressing means a stale entry can never serve a wrong byte, so it needs no validation.
+    /// `#[serde(default)]` keeps tokens written before this field readable — they simply wake cold,
+    /// exactly as they did before, with no head start.
+    #[serde(default)]
+    pub warm_set: HotSetSnapshot,
 }
 
 impl LoomWakeToken {

@@ -1905,7 +1905,7 @@ checksum = "7da8b5736845d9f2fcb837ea5d9e2628564b3b043a70948a3f0b778838c5fb4f"
 [[package]]
 name = "substrate-pager"
 version = "0.1.0"
-source = "git+https://github.com/Bobcatsfan33/substrate?tag=substrate-v1.3.0#1ceeca35bcac31e7147d64df140a8f0587a71d04"
+source = "git+https://github.com/Bobcatsfan33/substrate?tag=substrate-v1.4.1#cc9e8da02c22870b235fa3d898cde0627a00e2ac"
 dependencies = [
  "bincode",
  "blake3",
@@ -1916,7 +1916,7 @@ dependencies = [
 [[package]]
 name = "substrate-security"
 version = "0.1.0"
-source = "git+https://github.com/Bobcatsfan33/substrate?tag=substrate-v1.3.0#1ceeca35bcac31e7147d64df140a8f0587a71d04"
+source = "git+https://github.com/Bobcatsfan33/substrate?tag=substrate-v1.4.1#cc9e8da02c22870b235fa3d898cde0627a00e2ac"
 dependencies = [
  "blake3",
  "chacha20poly1305",
@@ -1932,7 +1932,7 @@ dependencies = [
 [[package]]
 name = "substrate-store"
 version = "0.1.0"
-source = "git+https://github.com/Bobcatsfan33/substrate?tag=substrate-v1.3.0#1ceeca35bcac31e7147d64df140a8f0587a71d04"
+source = "git+https://github.com/Bobcatsfan33/substrate?tag=substrate-v1.4.1#cc9e8da02c22870b235fa3d898cde0627a00e2ac"
 dependencies = [
  "async-trait",
  "bytes",
@@ -1949,7 +1949,7 @@ dependencies = [
 [[package]]
 name = "substrate-wal"
 version = "0.1.0"
-source = "git+https://github.com/Bobcatsfan33/substrate?tag=substrate-v1.3.0#1ceeca35bcac31e7147d64df140a8f0587a71d04"
+source = "git+https://github.com/Bobcatsfan33/substrate?tag=substrate-v1.4.1#cc9e8da02c22870b235fa3d898cde0627a00e2ac"
 dependencies = [
  "bincode",
  "crc32c",
