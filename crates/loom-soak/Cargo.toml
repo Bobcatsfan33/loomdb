@@ -25,7 +25,7 @@ loom-policy = { path = "../loom-policy" }
 loom-action = { path = "../loom-action" }
 loom-bench = { path = "../loom-bench" }
 # Soak A's first real use of the offline license clock — the never-hard-stop / anti-tamper engine.
-substrate-security = { git = "https://github.com/Bobcatsfan33/substrate", tag = "substrate-v1.4.1" }
+substrate-security = { git = "https://github.com/Bobcatsfan33/substrate", tag = "substrate-v1.4.2" }
 # The budgeted in-memory VFS (CrashVfs::with_budget) that models storage exhaustion with zero disk risk.
 substrate-pager = { workspace = true, features = ["test-util"] }
 ed25519-dalek = { workspace = true }

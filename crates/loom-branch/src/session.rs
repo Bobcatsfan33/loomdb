@@ -1441,12 +1441,15 @@ impl Loom {
     /// Only compiled with the `remote` feature (on by default) — see [`sleep`](Self::sleep).
     #[cfg(feature = "remote")]
     pub fn wake(tiered: &substrate_store::TieredStore, token: &LoomWakeToken) -> Result<Self> {
-        // Speculatively hydrate the warm set the last session learned, before the first read arrives.
+        // Hydrate the warm set the last session learned, and WAIT for it, before the first read arrives.
         // LoomDB manages its own wake (many branch heads, not one manifest — see `sleep.rs`), so it
-        // cannot go through `TieredStore::wake`; it calls the tier's prefetch directly. Best-effort and
-        // content-addressed: on a cold token (`warm_set` empty) this is a no-op and the wake is exactly
-        // what it was before. It runs on a dedicated thread and overlaps the reads below.
-        tiered.prefetch(&token.warm_set);
+        // cannot go through `TieredStore::wake`; it drives the tier's hydration directly. We use the
+        // AWAITED `hydrate` rather than the detached `prefetch` deliberately: over a wide-area link the
+        // detached prefetch floors at ~2 round-trips because the first read races it, whereas hydrate
+        // pays one concurrent round-trip up front so the read that follows is fully warm (~1 RTT). On a
+        // cold token (`warm_set` empty) it is a no-op and the wake is exactly what it was before.
+        // Best-effort and content-addressed: a stale entry is skipped, never wrong.
+        tiered.hydrate(&token.warm_set);
 
         let store = Arc::new(MemRefStore::new());
         store.save(&token.refs)?;
