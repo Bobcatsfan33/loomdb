@@ -104,28 +104,36 @@ bound stated plainly.
   found in a POC.
 - **The refs file is rewritten in full on every commit** — O(branches), not O(1). Invisible against
   database *size*; it will show on a tenant with a great many branches.
-- **Wake-over-object-storage does NOT meet the 250 ms p99 target over real distance — measured, stated
-  plainly.** AT-047's *correctness* — sleep, wipe the disk, wake elsewhere, identical results, branch
+- **Wake-over-object-storage is now a function of link RTT, not of the algorithm — measured, stated in
+  round-trips.** AT-047's *correctness* — sleep, wipe the disk, wake elsewhere, identical results, branch
   names back — is proven, and this is **loom's own session sleep/wake path**, not FlockDB's DuckDB wake.
-  Its **latency** is measured against a real S3 endpoint two ways (`crates/loom-branch/tests/wake_latency.rs`):
-  - **Same-runner** (low-latency endpoint): p50 12 ms / **p99 13 ms** — inside 250 ms over the protocol.
-  - **Wide-area, serial** (a genuinely remote bucket, intercontinental — `wake-latency-widearea.yml`):
-    p50 ~945 ms / **p99 ~1000 ms** — **~4× OVER target.** Loom's wake is O(pages-touched) (a *handful of
-    serial faults*, measured mean **2 pages**); over a ~230 ms round-trip, those serial faults + the
-    overlay-manifest chain add up.
-  - **Wide-area, batched + warm pool** (`get_batch`, substrate ≥ v1.3.0), reported in RTT-multiples
-    because absolute ms swing ~2× run-to-run: the wake is **~3.85 RTT** = `get_batch`(2 pages) **1.60
-    RTT** + the overlay-**manifest chain 1.94 RTT** (a warm GET is 1 RTT ≈ 230 ms). Improved but still
-    over target, and the split is decisive: (1) a **warm keep-alive pool** eliminates the handshake tax
-    (`get_batch` warm ≈ 1.6 RTT, was ~2 cold); (2) the manifest chain is **pointer-chasing** (head →
-    overlay-base → …, each id inside the previous), so it is *inherently serial* and cannot be batched
-    cold — and pages cannot be faulted until the manifests are resolved. That serial dependency floors
-    the straightforward path near **2 RTT**. The one lever that breaks it is a **learned warm set**:
-    cache the manifest ids *and* page ids from the prior wake, fetch them all in one concurrent
-    `get_batch` (~1 RTT), validate, fall back to the serial walk on a miss — the hot-tenant re-wake
-    reaching ~230 ms. That is the v0.3 target; the cold first-ever wake stays ~2–4 RTT. An **airgap**
-    deployment does not wake from object storage at all (it
-    runs on local storage), so this bound does not apply to it.
+  Its **latency** is measured against a real S3 endpoint (`crates/loom-branch/tests/wake_latency.rs`),
+  reported in **RTT-multiples** because absolute ms swing run-to-run (1 warm GET ≈ 160–230 ms depending on
+  route):
+  - **Same-runner** (low-latency endpoint): p99 ~13 ms — inside 250 ms over the protocol (not a wide-area
+    number).
+  - **Wide-area, cold first-ever wake** (intercontinental bucket, Sydney — `wake-latency-widearea.yml`):
+    **~4 RTT** (p50 ~920 ms). The overlay-manifest chain is **pointer-chasing** (head → overlay-base → …,
+    each id inside the previous), so it is *inherently serial* and cannot be batched when the ids aren't
+    known yet. This is the unavoidable cold cost.
+  - **Wide-area, hot re-wake with the learned warm set** (substrate ≥ v1.4.2, `at_047_hot_vs_cold`):
+    **~2.3 RTT** (p50 ~634 ms / p99 ~696 ms) — the warm set **halves** the wake. It records the manifest
+    ids *and* page ids a session faults, `sleep()` carries them in the token, and the next wake
+    **hydrates them in one concurrent batch and awaits it** before the first read.
+  - **The algorithm is optimal, and the test proves it:** after hydration the read faults **zero**
+    objects — the entire remaining cost is the hydrate's own concurrent fetch, not the read. And that cost
+    is **pure transport**: S3's REST API is HTTP/1.1, so *N* concurrent GETs open *N* connections and each
+    cold one pays a TLS handshake — measured **~2.3 RTT** for a 3-object warm set (1 manifest + 2 pages)
+    instead of the ~1 RTT the batch *should* cost. A **keep-alive pool pre-warmed to the concurrency
+    width** reuses connections and removes the handshake, bringing hydrate toward **~1 RTT**. That is the
+    remaining v0.3 lever, and it is a transport optimization, not more algorithm.
+  - **What that means for the 250 ms bar.** Hot re-wake ≈ hydrate (1–2 RTT) + a warm read (~110 ms). With
+    a pre-warmed pool that is ≈ `1×RTT + 110 ms`, so it clears 250 ms **wherever `RTT + 110 ms < 250 ms`**
+    — i.e. links with **RTT ≲ 130 ms** (regional and near-continental wide-area). At the most extreme
+    intercontinental distances it does **not**: Sydney's ~160–230 ms RTT lands ~270–340 ms even with a
+    perfect 1-RTT hydrate. Compute it for your own region. The cold first-ever wake stays ~4 RTT
+    regardless. An **airgap** deployment does not wake from object storage at all (it runs on local
+    storage), so this bound does not apply to it.
 - **Signature verification is opt-in, and key distribution is not solved here.** With an actor registry,
   every write is signed and verified (AT-026); without one, writes are attributable but not
   authenticated. Where keys come from, how they rotate, and how a compromised one is revoked is out of
