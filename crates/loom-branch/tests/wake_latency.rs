@@ -504,6 +504,11 @@ fn at_047_hot_vs_cold_rewake_over_object_storage() {
 
     let branch = BranchId::new("investigation-1");
     let backend = s3_client(); // one warm, pooled client for the whole run — see the batched test.
+                               // Time-boxed transport experiment: pre-warm the connection pool before each hot hydrate. Checks the
+                               // VALUE (not just presence), so an empty env — the workflow's "off" — stays off.
+    let prewarm = std::env::var("LOOM_PREWARM_POOL")
+        .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+        .unwrap_or(false);
 
     let mut cold_ms: Vec<f64> = Vec::with_capacity(samples);
     let mut hot_ms: Vec<f64> = Vec::with_capacity(samples);
@@ -630,6 +635,38 @@ fn at_047_hot_vs_cold_rewake_over_object_storage() {
         let hot_home = tempfile::tempdir().expect("tempdir");
         let (hot_elapsed, hydrate_only_ms, read_faults) = {
             let tiered = open(hot_home.path(), &pool);
+
+            // EXPERIMENT (LOOM_PREWARM_POOL): before timing, open keep-alive connections sized to the warm
+            // set by raw-GETting its objects on the shared client. hydrate then reuses those idle
+            // connections instead of paying a fresh TLS handshake per concurrent GET — modelling a busy
+            // production server whose pool is already warm. The raw GETs don't fill the tier cache, so
+            // hydrate still does real fetches; only the connection state carries over. Off by default.
+            if prewarm {
+                let keys: Vec<object_store::path::Path> = {
+                    let r = RemoteTier::new(Arc::clone(&backend), pool.clone());
+                    token_hot
+                        .warm_set
+                        .manifests
+                        .iter()
+                        .map(|&m| r.manifest_key(m))
+                        .chain(token_hot.warm_set.pages.iter().map(|&p| r.page_key(p)))
+                        .collect()
+                };
+                rt.block_on(async {
+                    let remote = Arc::new(RemoteTier::new(Arc::clone(&backend), pool.clone()));
+                    let mut handles = Vec::new();
+                    for key in keys {
+                        let remote = Arc::clone(&remote);
+                        handles.push(tokio::spawn(async move {
+                            let _ = remote.get(&key).await;
+                        }));
+                    }
+                    for h in handles {
+                        let _ = h.await;
+                    }
+                });
+            }
+
             let started = Instant::now();
 
             // 1. Hydrate in isolation, timed.
@@ -685,9 +722,10 @@ fn at_047_hot_vs_cold_rewake_over_object_storage() {
         mean_u64(&hot_read_faults_n),
     );
     println!(
-        "hot breakdown      : hydrate mean {:.1} ms = {:.2} RTT   |   wake+read (warm) = the rest",
+        "hot breakdown      : hydrate mean {:.1} ms = {:.2} RTT   |   wake+read (warm) = the rest   [pool pre-warm: {}]",
         mean(&hot_hydrate_ms),
         mean(&hot_hydrate_ms) / rtt,
+        if prewarm { "ON" } else { "off" },
     );
     println!(
         "COLD (first-ever)  : p50 {:.1} / p99 {:.1} ms   = {:.2} / {:.2} RTT   (serial overlay-chain walk)",

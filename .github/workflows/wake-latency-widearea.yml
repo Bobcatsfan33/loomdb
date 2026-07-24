@@ -14,6 +14,10 @@ on:
         description: "Number of independent cold wakes to time"
         required: false
         default: "50"
+      prewarm:
+        description: "Pre-warm the connection pool before each hot hydrate (transport experiment): 1 = on"
+        required: false
+        default: "0"
 
 jobs:
   measure:
@@ -30,6 +34,9 @@ jobs:
           AWS_REGION: ${{ secrets.WAKE_REGION }}
           WAKE_BUCKET: ${{ secrets.WAKE_BUCKET }}
           LOOM_WAKE_SAMPLES: ${{ github.event.inputs.samples }}
+          # When "1", the hot/cold test pre-warms the connection pool before each hydrate (transport
+          # experiment: reuse keep-alive connections instead of paying a fresh TLS handshake per GET).
+          LOOM_PREWARM_POOL: ${{ github.event.inputs.prewarm == '1' && '1' || '' }}
           # MINIO_URL intentionally UNSET → the harness uses the real-AWS (HTTPS, region-derived) path,
           # and reports the wide-area p99 instead of asserting the < 250 ms same-runner guard.
         run: |
