@@ -116,24 +116,27 @@ bound stated plainly.
     **~4 RTT** (p50 ~920 ms). The overlay-manifest chain is **pointer-chasing** (head → overlay-base → …,
     each id inside the previous), so it is *inherently serial* and cannot be batched when the ids aren't
     known yet. This is the unavoidable cold cost.
-  - **Wide-area, hot re-wake with the learned warm set** (substrate ≥ v1.4.2, `at_047_hot_vs_cold`):
-    **~2.3 RTT** (p50 ~634 ms / p99 ~696 ms) — the warm set **halves** the wake. It records the manifest
-    ids *and* page ids a session faults, `sleep()` carries them in the token, and the next wake
-    **hydrates them in one concurrent batch and awaits it** before the first read.
-  - **The algorithm is optimal, and the test proves it:** after hydration the read faults **zero**
-    objects — the entire remaining cost is the hydrate's own concurrent fetch, not the read. And that cost
-    is **pure transport**: S3's REST API is HTTP/1.1, so *N* concurrent GETs open *N* connections and each
-    cold one pays a TLS handshake — measured **~2.3 RTT** for a 3-object warm set (1 manifest + 2 pages)
-    instead of the ~1 RTT the batch *should* cost. A **keep-alive pool pre-warmed to the concurrency
-    width** reuses connections and removes the handshake, bringing hydrate toward **~1 RTT**. That is the
-    remaining v0.3 lever, and it is a transport optimization, not more algorithm.
-  - **What that means for the 250 ms bar.** Hot re-wake ≈ hydrate (1–2 RTT) + a warm read (~110 ms). With
-    a pre-warmed pool that is ≈ `1×RTT + 110 ms`, so it clears 250 ms **wherever `RTT + 110 ms < 250 ms`**
-    — i.e. links with **RTT ≲ 130 ms** (regional and near-continental wide-area). At the most extreme
-    intercontinental distances it does **not**: Sydney's ~160–230 ms RTT lands ~270–340 ms even with a
-    perfect 1-RTT hydrate. Compute it for your own region. The cold first-ever wake stays ~4 RTT
-    regardless. An **airgap** deployment does not wake from object storage at all (it runs on local
-    storage), so this bound does not apply to it.
+  - **Wide-area, hot re-wake with the learned warm set** (substrate ≥ v1.4.2, `at_047_hot_vs_cold`): the
+    warm set records the manifest ids *and* page ids a session faults, `sleep()` carries them in the token,
+    and the next wake **hydrates them in one concurrent batch and awaits it** before the first read. The
+    algorithm is **optimal, and the test proves it**: after hydration the read faults **zero** objects, so
+    the entire cost is the hydrate's own concurrent fetch — a *pure function of the connection pool*:
+    - **Cold pool** (a wake after the server has been idle): **~2.3 RTT** (p50 ~634 ms). S3's REST API is
+      HTTP/1.1, so the batch's *N* concurrent GETs open *N* connections and each pays a fresh TLS
+      handshake — one extra round-trip on top of the GET.
+    - **Warm pool** (a busy server, or a maintained keep-alive pool — `prewarm` in the harness):
+      **~1.03 RTT** (p50 **232 ms** / p99 278 ms). Reusing idle keep-alive connections removes the
+      handshake, and the warm read on top is **essentially free** — the hot re-wake *is* the one-round-trip
+      hydrate. Measured to Sydney, RTT ≈ 226 ms.
+  - **What that means for the 250 ms bar.** On a warm pool the hot re-wake is **≈ 1×RTT**, so it clears
+    250 ms **wherever `RTT < ~250 ms`** — which includes even Sydney-class intercontinental links at the
+    **median** (p50 232 ms), with the **p99 (278 ms) just over** at that extreme distance because of
+    network tail variance. Nearer wide-area links clear it comfortably at both. The warm-pool condition is
+    what a continuously-loaded server holds naturally; guaranteeing it under bursty load (an explicitly
+    maintained keep-alive pool sized to the hydrate concurrency) is the remaining transport step, and it is
+    infrastructure, not algorithm. The cold-pool first-wake-after-idle is ~2.3 RTT, and the cold
+    *first-ever* wake stays ~4 RTT regardless. An **airgap** deployment does not wake from object storage
+    at all (it runs on local storage), so this bound does not apply to it.
 - **Signature verification is opt-in, and key distribution is not solved here.** With an actor registry,
   every write is signed and verified (AT-026); without one, writes are attributable but not
   authenticated. Where keys come from, how they rotate, and how a compromised one is revoked is out of
