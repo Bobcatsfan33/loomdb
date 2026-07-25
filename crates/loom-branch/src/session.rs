@@ -24,8 +24,8 @@ use ed25519_dalek::VerifyingKey;
 use loom_core::{
     is_provenance, latest_node_key, node_storage_key, prov_seq_key, source_index_key, ActorId,
     BranchId, Claim, ClaimStatus, ClaimVersion, CommitId, DerivationNode, IndexEntry, IndexHint,
-    Key, LoomError, NodeId, Record, Result, SessionId, SourceRef, TenantId, TrustClass, Value,
-    WriteEnvelope,
+    Key, LoomError, NodeId, NodeStore, Record, Result, SessionId, SourceRef, TenantId, TrustClass,
+    Value, WriteEnvelope,
 };
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::{Arc, Mutex};
@@ -312,45 +312,72 @@ impl Loom {
         let head = self.head(branch)?;
         let store = self.pager.fork(&head)?;
         let mut txn = store.begin()?;
-        let tree = Tree::open(&*store)?;
+        let mut tree = Tree::open(&*store)?;
 
-        // Collect (id, embedding) first, so the graph build is not interleaved with the scan.
+        // 1. One O(N) scan of the branch's index entries → (id, embedding) pairs.
         let mut pairs: Vec<(Key, loom_core::Embedding)> = Vec::new();
-        {
-            let mut scan_tree = tree;
-            for (key, record) in scan_tree.scan()? {
-                if !key.starts_with(loom_core::RESERVED_INDEX_PREFIX) {
-                    continue;
-                }
-                let Record::Value(Value::Blob(bytes)) = record else {
-                    continue;
-                };
-                let entry = IndexEntry::decode(&bytes).map_err(|source| LoomError::Codec {
-                    op: "decode",
-                    what: "index entry",
-                    source,
-                })?;
-                if let Some(emb) = entry.embedding {
-                    pairs.push((entry.key, emb));
-                }
+        for (key, record) in tree.scan()? {
+            if !key.starts_with(loom_core::RESERVED_INDEX_PREFIX) {
+                continue;
             }
-
-            let count = pairs.len();
-            let mut node_store = crate::ann::TreeNodeStore::new(scan_tree);
-            for (id, emb) in pairs {
-                loom_core::hnsw_insert(&mut node_store, &id, emb).map_err(|e| {
-                    LoomError::Index {
-                        detail: format!("insert of {}: {e}", String::from_utf8_lossy(&id)),
-                    }
-                })?;
+            let Record::Value(Value::Blob(bytes)) = record else {
+                continue;
+            };
+            let entry = IndexEntry::decode(&bytes).map_err(|source| LoomError::Codec {
+                op: "decode",
+                what: "index entry",
+                source,
+            })?;
+            if let Some(emb) = entry.embedding {
+                pairs.push((entry.key, emb));
             }
-            let tree = node_store.into_tree();
-            tree.flush(&mut txn)?;
-            let commit = store.commit(txn)?;
-            self.record_commit(commit, vec![head]);
-            self.set_head(branch, commit)?;
-            Ok(count)
         }
+        let count = pairs.len();
+
+        // 2. Build the HNSW graph IN MEMORY — normalized vectors, dot-product distance, index-based
+        //    adjacency. This is the O(N·log N) core. Keeping it off the per-operation tree/bincode path
+        //    is what makes it feasible at scale: the tree is written once, in step 4, not on every one of
+        //    the ~1000 distance computations each insert makes. (Search stays store-backed and unchanged;
+        //    a graph built on unit vectors with dot is identical to one built with cosine, so the
+        //    persisted graph searches the same.)
+        let raw: std::collections::HashMap<Key, loom_core::Embedding> =
+            pairs.iter().cloned().collect();
+        let mut graph = loom_core::Hnsw::new();
+        for (id, emb) in pairs {
+            graph.insert(id, emb);
+        }
+
+        // 3. Export to persisted nodes carrying the caller's RAW vectors (on-disk bytes unchanged).
+        let (mut nodes, meta) = graph.export_persisted(&raw);
+        drop(graph);
+        drop(raw);
+
+        // 4. Bulk-persist in ONE pass, SORTED by tree key — sequential leaf writes instead of the M
+        //    scattered random-leaf writes per insert that made the old build super-linear (the
+        //    write-amplification `ann.rs` documented). Still through the fallible NodeStore: a failed
+        //    write is an error, never silently dropped.
+        nodes.sort_by_key(|(id, _)| loom_core::hnsw_node_key(id));
+        let mut node_store = crate::ann::TreeNodeStore::new(tree);
+        for (id, node) in &nodes {
+            node_store
+                .put_node(id, node)
+                .map_err(|e| LoomError::Index {
+                    detail: format!(
+                        "persist ANN node {}: {e}; rebuild the index",
+                        String::from_utf8_lossy(id)
+                    ),
+                })?;
+        }
+        node_store.put_meta(&meta).map_err(|e| LoomError::Index {
+            detail: format!("persist ANN graph meta: {e}; rebuild the index"),
+        })?;
+
+        let tree = node_store.into_tree();
+        tree.flush(&mut txn)?;
+        let commit = store.commit(txn)?;
+        self.record_commit(commit, vec![head]);
+        self.set_head(branch, commit)?;
+        Ok(count)
     }
 
     /// **Search the branch's ANN index for the `k` nearest record keys to `query`.**

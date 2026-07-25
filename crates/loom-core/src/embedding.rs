@@ -56,6 +56,42 @@ impl Embedding {
 
         Some(dot / (na.sqrt() * nb.sqrt()))
     }
+
+    /// **The bare dot product** — `None` when the two cannot be compared (differing dims, or empty).
+    ///
+    /// On **unit-length** vectors this *is* cosine similarity: `dot(â, b̂) = cos(a, b)`, because the
+    /// norms are 1. That identity is the whole point of [`normalized`](Self::normalized): normalize once,
+    /// then compare with a single-accumulator dot instead of [`cosine`](Self::cosine)'s three
+    /// accumulators and two square roots — a large constant saving in a graph build that computes the
+    /// same distances thousands of times, and **recall-neutral by construction** because it preserves
+    /// the cosine ranking exactly.
+    pub fn dot(&self, other: &Embedding) -> Option<f32> {
+        if self.0.len() != other.0.len() || self.0.is_empty() {
+            return None;
+        }
+        Some(self.0.iter().zip(&other.0).map(|(a, b)| a * b).sum())
+    }
+
+    /// **A unit-length copy** of this vector — `None` for a zero or empty vector (no direction, so no
+    /// unit form), the same "not comparable" cases [`cosine`](Self::cosine) refuses.
+    ///
+    /// Normalizing is a **load-time** conversion, never a storage one: the persisted bytes stay the
+    /// caller's verbatim vector (no format change, no migration, `as-of` reproducibility intact), and we
+    /// normalize into the build buffer / query path so distance can be a bare [`dot`](Self::dot). Because
+    /// `dot(â, b̂) = cos(a, b)`, building the graph on normalized vectors yields the *same* graph as
+    /// building it on the raw vectors with cosine — the normalization changes the cost, never the
+    /// ranking.
+    pub fn normalized(&self) -> Option<Embedding> {
+        if self.0.is_empty() {
+            return None;
+        }
+        let norm_sq: f32 = self.0.iter().map(|x| x * x).sum();
+        if norm_sq == 0.0 {
+            return None;
+        }
+        let inv = 1.0 / norm_sq.sqrt();
+        Some(Embedding(self.0.iter().map(|x| x * inv).collect()))
+    }
 }
 
 #[cfg(test)]
@@ -95,5 +131,42 @@ mod tests {
             None,
             "a zero vector has no direction; its cosine is undefined, not zero"
         );
+    }
+
+    #[test]
+    fn dot_of_normalized_equals_cosine() {
+        // The identity the fast build rests on: normalizing then taking the dot product reproduces
+        // cosine exactly, so the graph built on unit vectors is the graph cosine would have built.
+        let pairs = [
+            (vec![3.0f32, 1.0, -2.0, 5.0], vec![-1.0f32, 4.0, 2.0, 0.5]),
+            (vec![1.0, 0.0, 0.0], vec![0.0, 1.0, 0.0]),
+            (vec![0.1, 0.2, 0.3, 0.4], vec![0.4, 0.3, 0.2, 0.1]),
+        ];
+        for (a, b) in pairs {
+            let a = Embedding::new(a);
+            let b = Embedding::new(b);
+            let cos = a.cosine(&b).unwrap();
+            let dot_norm = a
+                .normalized()
+                .unwrap()
+                .dot(&b.normalized().unwrap())
+                .unwrap();
+            assert!(
+                (cos - dot_norm).abs() < 1e-6,
+                "dot(normalized) = {dot_norm} must equal cosine = {cos}"
+            );
+        }
+    }
+
+    #[test]
+    fn normalized_is_unit_length_and_refuses_zero() {
+        let n = Embedding::new([3.0, 4.0]).normalized().unwrap();
+        let len: f32 = n.0.iter().map(|x| x * x).sum::<f32>().sqrt();
+        assert!(
+            (len - 1.0).abs() < 1e-6,
+            "normalized vector must be unit length, got {len}"
+        );
+        assert_eq!(Embedding::new([0.0, 0.0]).normalized(), None);
+        assert_eq!(Embedding::new(Vec::<f32>::new()).normalized(), None);
     }
 }

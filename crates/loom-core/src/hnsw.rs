@@ -21,24 +21,37 @@
 //! assignment is a hash of the id, so the same items build the same graph). Persisting the graph into
 //! the branch tree is the next slice; the algorithm is proven here first.
 
-use std::collections::{BinaryHeap, HashMap, HashSet};
+use std::cell::{Cell, RefCell};
+use std::collections::{BinaryHeap, HashMap};
 
+use crate::hnsw_store::{HnswMeta, PersistedNode};
 use crate::Embedding;
 
 /// The identity of an indexed item — its record key.
 pub type ItemId = Vec<u8>;
 
-/// How many neighbours a node keeps per layer (the classic HNSW `M`). Higher = better recall, more
-/// memory and slower insert. 16 is the common default and what the recall oracle is tuned against.
+/// How many neighbours a node keeps per **upper** layer (the classic HNSW `M`), and how many links a
+/// new node forms per layer. Higher = better recall, more memory and slower insert.
 pub const M: usize = 16;
+
+/// The maximum degree at **layer 0** — the classic HNSW `Mmax0 = 2M`. Layer 0 is the densest and does
+/// the fine-grained search, so it is allowed twice the connectivity of the sparse upper layers. Capping
+/// layer 0 at `M` (as an earlier version did) starves the base layer and is why recall sagged as the
+/// graph grew; `2M` here is what holds it at scale.
+pub const M_MAX0: usize = 2 * M;
 
 /// The base of the exponential level distribution. `1/ln(M)` is the value the HNSW paper derives as
 /// optimal; a node's level is `floor(-ln(h) * mult)` for a hash `h` in (0,1].
 const LEVEL_MULT: f64 = 0.36067; // 1 / ln(16)
 
-/// How wide the search beam is during construction and query (`efConstruction` / `ef`). Wider = better
-/// recall, slower. The query can override it.
+/// How wide the **query** beam is by default (`ef`). The caller can override it per search.
 pub const EF_DEFAULT: usize = 64;
+
+/// How wide the **construction** beam is (`efConstruction`), separate from the query `ef`. The build can
+/// afford a wider beam than a latency-sensitive query — it runs once and sets the graph quality every
+/// later search inherits — so a larger value here buys recall at scale for a constant-factor build cost
+/// (it does not change the N·log N shape). Tuned with the build-complexity benchmark's recall gate.
+pub const EF_CONSTRUCTION: usize = 200;
 
 /// One node: its vector, and its neighbours per layer.
 struct Node {
@@ -58,6 +71,14 @@ pub struct Hnsw {
     entry: Option<usize>,
     max_level: usize,
     dim: Option<usize>,
+    /// Reusable "visited" set for `search_layer`, keyed by node index, tagged with an epoch so it is
+    /// cleared in O(1) (bump the epoch) instead of reallocated per call. This replaces a per-call
+    /// `HashSet<usize>` — whose SipHash on ~1000 lookups/insert dominated the build — with a plain array
+    /// probe, and it is the single largest per-insert constant cut. Interior-mutable so `search` (`&self`)
+    /// and `relink` (`&mut self`) can both use it; a node `n` counts as visited this call iff
+    /// `visited[n] == epoch`.
+    visited: RefCell<Vec<u32>>,
+    epoch: Cell<u32>,
 }
 
 impl Default for Hnsw {
@@ -76,6 +97,8 @@ impl Hnsw {
             entry: None,
             max_level: 0,
             dim: None,
+            visited: RefCell::new(Vec::new()),
+            epoch: Cell::new(0),
         }
     }
 
@@ -95,13 +118,17 @@ impl Hnsw {
     /// a mixed-dimension index cannot be compared, and silently accepting it would corrupt every later
     /// search. The caller decides what to do; we do not guess.
     pub fn insert(&mut self, id: ItemId, vector: Embedding) -> bool {
+        // Normalize on the way in, once: the graph is built with a bare dot product (see `dist`), which
+        // on unit vectors is cosine exactly — same graph as cosine would build, at a fraction of the
+        // per-distance cost. `normalized` returns `None` for a zero/empty vector (no direction, cannot
+        // be placed), which subsumes the old dim-0 rejection.
+        let Some(vector) = vector.normalized() else {
+            return false;
+        };
         match self.dim {
             Some(d) if d != vector.dim() => return false,
             None => self.dim = Some(vector.dim()),
             _ => {}
-        }
-        if vector.dim() == 0 {
-            return false;
         }
 
         // Replace-in-place if the id already exists: drop its old links, keep its slot.
@@ -145,6 +172,12 @@ impl Hnsw {
         if self.dim != Some(query.dim()) || k == 0 {
             return Vec::new();
         }
+        // Normalize the query once, so every `dist` below is a bare dot product against the unit-length
+        // stored vectors. A zero-vector query has no direction and matches nothing.
+        let Some(query_n) = query.normalized() else {
+            return Vec::new();
+        };
+        let query = &query_n;
 
         // Descend the upper layers greedily to find a good entry point for layer 0.
         let mut current = entry;
@@ -163,16 +196,51 @@ impl Hnsw {
         out
     }
 
+    /// **Export the built graph as persisted nodes, carrying the caller's RAW vectors** — ready to
+    /// bulk-write into a [`NodeStore`](crate::NodeStore).
+    ///
+    /// This is the bridge from the fast in-RAM build to the durable graph. The graph *structure* (levels,
+    /// adjacency, entry point) was computed on normalized vectors with a dot product; the persisted
+    /// vectors are the caller's originals (`raw`, keyed by id), so the on-disk bytes never change and a
+    /// search over them with cosine reproduces the same ranking. A node whose id is absent from `raw`
+    /// falls back to its normalized vector — still correct under cosine, so the export is total.
+    ///
+    /// Adjacency is translated from internal indices to ids here, once, at the end — the whole build
+    /// never paid the cost of id-keyed lookups in its hot loop.
+    pub fn export_persisted(
+        &self,
+        raw: &HashMap<ItemId, Embedding>,
+    ) -> (Vec<(ItemId, PersistedNode)>, HnswMeta) {
+        let mut out = Vec::with_capacity(self.nodes.len());
+        for (idx, node) in self.nodes.iter().enumerate() {
+            let id = &self.ids[idx];
+            let neighbours: Vec<Vec<ItemId>> = node
+                .neighbours
+                .iter()
+                .map(|layer| layer.iter().map(|&n| self.ids[n].clone()).collect())
+                .collect();
+            let vector = raw.get(id).cloned().unwrap_or_else(|| node.vector.clone());
+            out.push((id.clone(), PersistedNode { vector, neighbours }));
+        }
+        let meta = HnswMeta {
+            entry: self.entry.map(|e| self.ids[e].clone()),
+            max_level: self.max_level,
+            dim: self.dim,
+        };
+        (out, meta)
+    }
+
     // ── internals ──────────────────────────────────────────────────────────────────────────────────
 
     /// Cosine *distance* in `[0, 2]` (`1 - cosine`); an incomparable pair is treated as maximally far,
     /// so it never wins a nearest-neighbour race.
+    ///
+    /// Stored vectors are unit-normalized ([`insert`](Self::insert)) and the query is normalized on entry
+    /// ([`search`](Self::search)/[`relink`](Self::relink) queries with stored vectors), so cosine is a
+    /// bare **dot product** here: `1 - dot`. An incomparable pair (dim mismatch) yields `None`, treated as
+    /// dot `-1` ⇒ distance 2 (maximally far), never winning a race.
     fn dist(&self, a: usize, query: &Embedding) -> f32 {
-        self.nodes[a]
-            .vector
-            .cosine(query)
-            .map(|c| 1.0 - c)
-            .unwrap_or(2.0)
+        1.0 - self.nodes[a].vector.dot(query).unwrap_or(-1.0)
     }
 
     /// A node's level, from a hash of its id — deterministic, so the graph does not depend on a RNG
@@ -216,7 +284,23 @@ impl Hnsw {
         ef: usize,
         layer: usize,
     ) -> Vec<(usize, f32)> {
-        let mut visited: HashSet<usize> = HashSet::new();
+        // Epoch-tagged visited set: bump the epoch so the array reads as empty in O(1), growing it to
+        // cover every node. `visited[n] == epoch` means "seen this call".
+        let mut visited = self.visited.borrow_mut();
+        if visited.len() < self.nodes.len() {
+            visited.resize(self.nodes.len(), 0);
+        }
+        let epoch = self.epoch.get().wrapping_add(1);
+        self.epoch.set(epoch);
+        let mut seen = |n: usize| -> bool {
+            if visited[n] == epoch {
+                true
+            } else {
+                visited[n] = epoch;
+                false
+            }
+        };
+
         // `candidates`: a min-heap by distance (closest first) to explore. `result`: a max-heap by
         // distance (farthest first) so we can evict the worst when it overflows `ef`.
         let mut candidates: BinaryHeap<Rev> = BinaryHeap::new();
@@ -224,7 +308,7 @@ impl Hnsw {
 
         for &e in entries {
             let d = self.dist(e, query);
-            visited.insert(e);
+            seen(e);
             candidates.push(Rev { idx: e, dist: d });
             result.push(Far { idx: e, dist: d });
         }
@@ -238,7 +322,7 @@ impl Hnsw {
             }
             if let Some(neighbours) = self.nodes[idx].neighbours.get(layer) {
                 for &n in neighbours {
-                    if !visited.insert(n) {
+                    if seen(n) {
                         continue;
                     }
                     let d = self.dist(n, query);
@@ -259,6 +343,38 @@ impl Hnsw {
         out
     }
 
+    /// **The neighbour-selection heuristic** (HNSW paper, Algorithm 4) — pick up to `m` links from
+    /// `candidates` (given as `(idx, distance-to-base)`, closest first) that are *diverse*, not merely
+    /// closest.
+    ///
+    /// A candidate `e` is kept only if it is closer to `base` than to every neighbour already kept —
+    /// `dist(e, base) < dist(e, r)` for all kept `r`. This drops a candidate that sits "behind" one
+    /// already chosen (in roughly the same direction), so the `m` links spread around the node instead of
+    /// clustering on one side. That diversity is what keeps the graph *navigable* as it grows: plain
+    /// take-`m`-closest packs links into dense regions, and a query arriving from a sparse direction finds
+    /// no edge to follow — the recall collapse this replaces.
+    fn select_heuristic(&self, candidates: &[(usize, f32)], m: usize) -> Vec<usize> {
+        let mut kept: Vec<usize> = Vec::with_capacity(m);
+        for &(e, d_e_base) in candidates {
+            if kept.len() >= m {
+                break;
+            }
+            // Keep `e` unless it is closer to an already-kept neighbour than to `base`.
+            let redundant = kept.iter().any(|&r| {
+                let d_e_r = 1.0
+                    - self.nodes[e]
+                        .vector
+                        .dot(&self.nodes[r].vector)
+                        .unwrap_or(-1.0);
+                d_e_r < d_e_base
+            });
+            if !redundant {
+                kept.push(e);
+            }
+        }
+        kept
+    }
+
     /// Link a freshly-inserted (or replaced) node into the graph at every layer up to its level.
     fn relink(&mut self, idx: usize) {
         let Some(entry) = self.entry else { return };
@@ -272,13 +388,16 @@ impl Hnsw {
         }
 
         for layer in (0..=node_level.min(self.max_level)).rev() {
-            let found = self.search_layer(&query, &[current], EF_DEFAULT, layer);
-            let selected: Vec<usize> = found
-                .iter()
-                .take(M)
-                .map(|(i, _)| *i)
-                .filter(|&i| i != idx)
+            // A WIDE construction beam, then the diversity heuristic to pick M links from it.
+            let found: Vec<(usize, f32)> = self
+                .search_layer(&query, &[current], EF_CONSTRUCTION, layer)
+                .into_iter()
+                .filter(|(i, _)| *i != idx)
                 .collect();
+            let selected = self.select_heuristic(&found, M);
+
+            // Layer 0 tolerates twice the degree (Mmax0); the sparse upper layers stay at M.
+            let m_max = if layer == 0 { M_MAX0 } else { M };
 
             // Link both ways.
             self.nodes[idx].neighbours[layer] = selected.clone();
@@ -294,17 +413,17 @@ impl Hnsw {
                 if let Some(nlayer) = self.nodes[n].neighbours.get_mut(layer) {
                     nlayer.push(idx);
                 }
-                // Prune the neighbour back to M by keeping its closest — computed without holding a
-                // mutable borrow across `dist` (which reads `self`).
-                if self.nodes[n].neighbours[layer].len() > M {
+                // If the neighbour is now over-connected, re-select its links with the SAME diversity
+                // heuristic (not just "keep closest") — so pruning preserves navigability too.
+                if self.nodes[n].neighbours[layer].len() > m_max {
                     let nvec = self.nodes[n].vector.clone();
-                    let current = self.nodes[n].neighbours[layer].clone();
-                    let mut ranked: Vec<(usize, f32)> =
-                        current.iter().map(|&m| (m, self.dist(m, &nvec))).collect();
+                    let mut ranked: Vec<(usize, f32)> = self.nodes[n].neighbours[layer]
+                        .iter()
+                        .map(|&m| (m, self.dist(m, &nvec)))
+                        .collect();
                     ranked
                         .sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal));
-                    self.nodes[n].neighbours[layer] =
-                        ranked.into_iter().take(M).map(|(m, _)| m).collect();
+                    self.nodes[n].neighbours[layer] = self.select_heuristic(&ranked, m_max);
                 }
             }
             if let Some((i, _)) = found.first() {
