@@ -21,6 +21,10 @@
 use crate::refs::Refs;
 use loom_core::{LoomError, Result, TenantId};
 use serde::{Deserialize, Serialize};
+// The warm set lives in `substrate-store`, which an airgap build compiles out entirely (it has no
+// object-storage tier to warm). So the field it types — and this import — are behind `remote`, exactly
+// like `sleep`/`wake` themselves; an airgap token is just tenant + page_size + refs.
+#[cfg(feature = "remote")]
 use substrate_store::HotSetSnapshot;
 
 /// Everything needed to bring a sleeping tenant back.
@@ -40,7 +44,9 @@ pub struct LoomWakeToken {
     /// overlay-chain walk into one concurrent round-trip for a hot re-wake. A **hint only**:
     /// content-addressing means a stale entry can never serve a wrong byte, so it needs no validation.
     /// `#[serde(default)]` keeps tokens written before this field readable — they simply wake cold,
-    /// exactly as they did before, with no head start.
+    /// exactly as they did before, with no head start. Present only in a `remote` build (an airgap build
+    /// has no tier to warm); serde ignores it in a token an airgap reader never produces anyway.
+    #[cfg(feature = "remote")]
     #[serde(default)]
     pub warm_set: HotSetSnapshot,
 }
