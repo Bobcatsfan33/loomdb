@@ -1,0 +1,30 @@
+name: HNSW build complexity (1k→1M, headroom host)
+
+# The v0.3 evidence that the HNSW build is O(N·log N), not O(N²), run on a clean host with real memory
+# — the 1M point wants ~1-2 GB RAM, which a runner has and a near-full laptop may not. It builds the
+# graph in RAM across a geometric range, fits N·log N against N² (c_nlogn stays flat while c_n²
+# collapses), and gates recall@10 ≥ 0.85 vs brute force on clustered (real-embedding-shaped) data at
+# both the smallest and largest size. Manual: it is a measurement, and the reviewer takes it.
+on:
+  workflow_dispatch:
+    inputs:
+      with_1m:
+        description: "Include the 1M point (needs ~1-2 GB RAM): 1 = on"
+        required: false
+        default: "1"
+
+jobs:
+  measure:
+    name: HNSW build complexity, 1k→1M in release
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Build-complexity benchmark (release)
+        env:
+          HNSW_BENCH_1M: ${{ github.event.inputs.with_1m == '1' && '1' || '' }}
+        run: |
+          set -eu
+          echo "Measuring HNSW build complexity (release); 1M point: ${HNSW_BENCH_1M:-off}."
+          cargo test -p loom-core --release --test hnsw_build_scaling -- --ignored --nocapture
