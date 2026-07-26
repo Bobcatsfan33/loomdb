@@ -94,13 +94,15 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         return Err(refused.into());
     }
 
-    println!("HNSW write-amplification — the slice-2c decision number");
+    println!(
+        "HNSW write-amplification — the slice-2c decision number (inline vs background compaction)"
+    );
     println!("  {DIM}-dim vectors, on-disk\n");
     println!(
-        "{:>10}  {:>12}  {:>12}  {:>10}  {:>14}  {:>16}",
-        "records", "data MB", "graph MB", "graph/data", "bulk build", "incr insert p50"
+        "{:>10}  {:>10}  {:>13}  {:>13}  {:>8}  {:>14}",
+        "records", "graph/data", "baseline", "inline", "amp", "inline latency"
     );
-    println!("{}", "─".repeat(84));
+    println!("{}", "─".repeat(88));
 
     for &n in &sizes {
         let dir = scratch.db_dir(&format!("n{n}"))?;
@@ -125,52 +127,68 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         // Bulk build the ANN index; measure time and the added footprint.
         let t = Instant::now();
         db.build_ann_index(&token, &branch)?;
-        let bulk = t.elapsed();
+        let _bulk = t.elapsed(); // fold cost, amortized under compaction
         let graph_bytes = dir_size(&dir).saturating_sub(data_bytes);
 
-        // Incremental insert cost vs graph size: measure the marginal cost of one MORE indexed write
-        // FOLLOWED BY a rebuild delta is too coarse; instead time single build_ann_index calls after
-        // adding one record, at a few graph sizes. Simpler and honest: time 20 single-record appends +
-        // rebuild, and report the per-op median. (A true incremental insert API is slice 2c's product;
-        // this bounds its cost from above using the bulk path.)
-        let mut per_op = Vec::new();
-        for j in 0..20 {
-            let t = Instant::now();
+        // ── The slice-2c decision number: INLINE write amplification vs a bare indexed write. ──
+        // With the graph at size `n`, measure the ON-DISK bytes a commit writes for:
+        //   (a) BASELINE — one `write_indexed` (record + index entry), no ANN maintenance; and
+        //   (b) INLINE   — one `ann_insert` (link the new node into the graph: ~M scattered node writes).
+        // The ratio is the amplification an inline ANN-on-write adds to the AT-045-certified write path.
+        // COMPACTION's cost is the baseline plus a small append to an unindexed buffer — i.e. ~1×,
+        // sequential — with the graph folded in bulk in the background (the `bulk build` column above,
+        // amortised) and search unioning the buffer; so this ratio is exactly the number that decides
+        // inline vs compaction.
+        const OPS: usize = 8;
+
+        let before = dir_size(&dir);
+        for j in 0..OPS {
             db.write_indexed(
                 &token,
                 &branch,
-                format!("extra/{j:04}").into_bytes(),
-                obs(1_000_000 + j),
+                format!("base/{j:04}").into_bytes(),
+                obs(2_000_000 + j),
                 IndexHint::text("f").with_embedding(rv(&mut rng, DIM)),
                 &env(&session.id, &branch),
             )?;
-            per_op.push(t.elapsed().as_micros() as u64);
         }
-        per_op.sort_unstable();
-        let incr_p50 = per_op[per_op.len() / 2];
+        let baseline_per = (dir_size(&dir).saturating_sub(before)) as f64 / OPS as f64;
+
+        let before = dir_size(&dir);
+        let t = Instant::now();
+        for j in 0..OPS {
+            db.ann_insert(
+                &token,
+                &branch,
+                format!("inl/{j:04}").into_bytes(),
+                rv(&mut rng, DIM),
+            )?;
+        }
+        let inline_ms = t.elapsed().as_secs_f64() * 1000.0 / OPS as f64;
+        let inline_per = (dir_size(&dir).saturating_sub(before)) as f64 / OPS as f64;
+        let amp = inline_per / baseline_per.max(1.0);
 
         println!(
-            "{:>10}  {:>12}  {:>12}  {:>10}  {:>14}  {:>16}",
+            "{:>10}  {:>10}  {:>13}  {:>13}  {:>8}  {:>14}",
             n,
-            format!("{:.1}", data_bytes as f64 / 1e6),
-            format!("{:.1}", graph_bytes as f64 / 1e6),
             format!("{:.2}", graph_bytes as f64 / data_bytes.max(1) as f64),
-            format!("{:.2}s", bulk.as_secs_f64()),
-            format!("{incr_p50}µs (write only)"),
+            format!("{:.0} B/w", baseline_per),
+            format!("{:.0} B/ins", inline_per),
+            format!("{amp:.1}×"),
+            format!("{inline_ms:.1} ms/ins"),
         );
     }
 
     println!("\nReading the result:");
-    println!("  graph/data ratio → the storage cost of the index.");
+    println!("  amp = inline bytes-per-insert ÷ baseline bytes-per-write — what ANN-on-write adds to the");
+    println!("  AT-045-certified write path. Inline links ~M scattered graph nodes per insert, so amp ≈ M-ish");
+    println!("  and grows with the tree depth (log N). COMPACTION appends the write to an unindexed buffer");
+    println!("  (≈1× baseline, sequential) and folds the graph in the background (the bulk column, amortised),");
+    println!("  search unioning buffer + graph — so it trades that amplification for a bounded buffer scan and");
+    println!("  a small staleness window (records written since the last fold), with INLINE staleness = 0.");
     println!(
-        "  bulk build time growing FASTER than linearly in records → the neighbour-update scatter"
+        "  The decision is read off `amp`: small ⇒ inline is affordable; large ⇒ compaction (or a"
     );
-    println!(
-        "  (M random leaves per insert) is amplifying, and ANN-on-write should NOT go inline —"
-    );
-    println!(
-        "  it should stay an explicit build or become background compaction. A near-linear build"
-    );
-    println!("  means inline is affordable. The decision is read off these numbers.");
+    println!("  recent-buffer hybrid: inline the last K, bulk-fold the rest).");
     Ok(())
 }

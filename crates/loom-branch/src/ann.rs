@@ -16,11 +16,19 @@
 //! which cuts the constant and removes the scatter — the build tracks N·log N to 1M with recall@10 held
 //! (see the at-map's *HNSW index build* section for the curve and numbers).
 //!
-//! **Still deferred, and why (the slice-2c question):** now that a single insert is O(log N), whether ANN
-//! maintenance moves **inline** on the write path or into **background compaction** is a distinct,
-//! measured write-path-placement decision — not folded in here, because an inline insert would touch the
-//! AT-045-certified write path. The scan stays the correct default retrieval path; ANN is an opt-in
-//! query accelerator. Written down here rather than discovered under load.
+//! **v0.4 made the index LIVE (slice 2c, resolved on the number).** The placement question — inline on
+//! every write vs. background compaction — was decided by measurement (`benches/ann_amplification.rs`):
+//! an inline insert added growing amplification (~1.7–2.2× and climbing) and, disqualifyingly, ~220 ms of
+//! per-write latency that grows with the graph, on the AT-045-certified write path. So the answer is
+//! **compaction**: an indexed write appends its vector to an in-branch **buffer** (reserved
+//! `\x00loom/annbuf/`, ≈1× baseline, in the same commit); `search_ann` **unions** the graph with a
+//! bounded buffer brute-scan, so a freshly-written vector is searchable *immediately* — **0 staleness**;
+//! and `Loom::ann_fold` folds the buffer into the graph off the write path, publishing with a
+//! compare-and-set on the head so it never stalls or clobbers a live write. The buffer→graph handoff is
+//! one atomic commit — a crash leaves every vector in the buffer or the graph, never neither (AT-045 over
+//! the fold), and the fold racing appends and searches loses nothing and double-indexes nothing (the
+//! `compaction.rs` concurrency gate). The full scan remains available as an exact fallback; ANN is the
+//! accelerator, now live rather than an explicit-build snapshot.
 
 use std::cell::RefCell;
 

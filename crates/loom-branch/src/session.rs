@@ -149,6 +149,17 @@ pub struct Loom {
     ///
     /// Callers may still ADD external sources. They may not OMIT what they read.
     read_sets: Mutex<BTreeMap<SessionId, ReadSet>>,
+    /// **Serializes head mutations on a branch** so a read-modify-write of the branch head is atomic.
+    ///
+    /// A write forks the current head, commits, and advances the head; with nothing between the read and
+    /// the advance, two concurrent writers (or a writer and the background ANN fold) could both fork the
+    /// same head and the second advance would silently discard the first. Loom's model is single-writer
+    /// per branch, so this was latent — but the background compaction fold IS a second writer, and it
+    /// advances the head with a **compare-and-set** (apply the rebuilt graph only if the head has not
+    /// moved). This lock is what makes that CAS atomic against a live write. Held only across the head
+    /// read → advance; the fold's expensive rebuild happens *outside* it, so a fold never stalls the
+    /// write path.
+    write_lock: Mutex<()>,
     issuer: TokenIssuer,
     tenant: TenantId,
     now_ms: Box<dyn Fn() -> u64 + Send + Sync>,
@@ -220,6 +231,7 @@ impl Loom {
             refs: Mutex::new(refs),
             store,
             read_sets: Mutex::new(BTreeMap::new()),
+            write_lock: Mutex::new(()),
             issuer: TokenIssuer::generate(),
             tenant,
             now_ms: Box::new(|| {
@@ -308,13 +320,62 @@ impl Loom {
     /// write-amplification measurement (see `ann.rs`). Returns how many vectors were indexed.
     pub fn build_ann_index(&self, token: &CapabilityToken, branch: &BranchId) -> Result<usize> {
         self.issuer.authorize(token, branch, self.now())?;
-
+        // The explicit build is a deliberate foreground op, so it just holds the head lock across the
+        // whole thing — briefly serializing writes is fine here (unlike the background fold, which must
+        // never stall the write path and so uses a compare-and-set instead).
+        let _wg = self.write_guard();
         let head = self.head(branch)?;
-        let store = self.pager.fork(&head)?;
+        let (commit, count) = self.rebuild_graph(&head)?;
+        self.record_commit(commit, vec![head]);
+        self.set_head(branch, commit)?;
+        Ok(count)
+    }
+
+    /// **Fold the write buffer into the graph — the background compaction that keeps the ANN index
+    /// live** (slice 2c). Rebuilds the graph from the branch's index entries and clears the folded
+    /// buffer in ONE atomic commit, and publishes it with a **compare-and-set** on the head.
+    ///
+    /// The expensive rebuild runs *outside* the head lock — that is the whole point, so a fold never
+    /// stalls the write path. Only the CAS is under the lock: publish the rebuild iff no write moved the
+    /// head while we were building it. If one did, the built commit is a harmless orphan and we retry
+    /// from the new head (which now includes that write's buffered vector, so each attempt folds strictly
+    /// more — progress, not livelock). Throughout, every buffered vector stays searchable via the union
+    /// scan, so nothing is ever lost or briefly unsearchable. Returns how many vectors the graph now
+    /// holds, or `0` if it lost every race to a burst of writes (the buffer stays; the next fold wins).
+    pub fn ann_fold(&self, token: &CapabilityToken, branch: &BranchId) -> Result<usize> {
+        self.issuer.authorize(token, branch, self.now())?;
+        const MAX_RETRIES: usize = 8;
+        for _ in 0..MAX_RETRIES {
+            let head = self.head(branch)?;
+            let (commit, count) = self.rebuild_graph(&head)?;
+            let published = {
+                let _wg = self.write_guard();
+                if self.head(branch)? == head {
+                    self.record_commit(commit, vec![head]);
+                    self.set_head(branch, commit)?;
+                    true
+                } else {
+                    false
+                }
+            };
+            if published {
+                return Ok(count);
+            }
+        }
+        Ok(0)
+    }
+
+    /// Rebuild the graph from the branch's index entries at `head` and clear the folded buffer, in one
+    /// commit parented on `head`. Returns `(commit, vectors_indexed)`. **Does not advance the head** — the
+    /// caller publishes it (under the head lock, or via a compare-and-set), which is what lets the fold do
+    /// this expensive work off the write path.
+    fn rebuild_graph(&self, head: &CommitId) -> Result<(CommitId, usize)> {
+        let store = self.pager.fork(head)?;
         let mut txn = store.begin()?;
         let mut tree = Tree::open(&*store)?;
 
-        // 1. One O(N) scan of the branch's index entries → (id, embedding) pairs.
+        // 1. One O(N) scan of the branch's index entries → (id, embedding) pairs. (Buffered vectors ARE
+        //    index entries, so a rebuild folds them in by construction.)
         let mut pairs: Vec<(Key, loom_core::Embedding)> = Vec::new();
         for (key, record) in tree.scan()? {
             if !key.starts_with(loom_core::RESERVED_INDEX_PREFIX) {
@@ -335,27 +396,18 @@ impl Loom {
         let count = pairs.len();
 
         // 2. Build the HNSW graph IN MEMORY — normalized vectors, dot-product distance, index-based
-        //    adjacency. This is the O(N·log N) core. Keeping it off the per-operation tree/bincode path
-        //    is what makes it feasible at scale: the tree is written once, in step 4, not on every one of
-        //    the ~1000 distance computations each insert makes. (Search stays store-backed and unchanged;
-        //    a graph built on unit vectors with dot is identical to one built with cosine, so the
-        //    persisted graph searches the same.)
+        //    adjacency. The O(N·log N) core, off the per-operation tree/bincode path.
         let raw: std::collections::HashMap<Key, loom_core::Embedding> =
             pairs.iter().cloned().collect();
         let mut graph = loom_core::Hnsw::new();
         for (id, emb) in pairs {
             graph.insert(id, emb);
         }
-
-        // 3. Export to persisted nodes carrying the caller's RAW vectors (on-disk bytes unchanged).
         let (mut nodes, meta) = graph.export_persisted(&raw);
         drop(graph);
         drop(raw);
 
-        // 4. Bulk-persist in ONE pass, SORTED by tree key — sequential leaf writes instead of the M
-        //    scattered random-leaf writes per insert that made the old build super-linear (the
-        //    write-amplification `ann.rs` documented). Still through the fallible NodeStore: a failed
-        //    write is an error, never silently dropped.
+        // 3. Bulk-persist in ONE pass, SORTED by tree key — sequential leaf writes, no scatter.
         nodes.sort_by_key(|(id, _)| loom_core::hnsw_node_key(id));
         let mut node_store = crate::ann::TreeNodeStore::new(tree);
         for (id, node) in &nodes {
@@ -371,20 +423,72 @@ impl Loom {
         node_store.put_meta(&meta).map_err(|e| LoomError::Index {
             detail: format!("persist ANN graph meta: {e}; rebuild the index"),
         })?;
+        let mut tree = node_store.into_tree();
 
+        // 4. Clear the folded buffer — every buffered vector is now in the graph, so drop the buffer
+        //    entries in this SAME commit. Crash-atomic with the graph write (AT-045): either the fold
+        //    committed (vectors in graph, buffer cleared) or it did not (vectors still in buffer) — the
+        //    handoff has no window in which a vector is in neither.
+        for (bkey, _) in tree.scan_prefix(loom_core::RESERVED_ANNBUF_PREFIX)? {
+            tree.remove(&bkey)?;
+        }
+
+        tree.flush(&mut txn)?;
+        let commit = store.commit(txn)?;
+        Ok((commit, count))
+    }
+
+    /// **Insert one vector into the branch's ANN graph incrementally, in its own commit** — the *inline*
+    /// write-path primitive slice 2c weighs against background compaction.
+    ///
+    /// The insert is O(log N) now that the algorithm navigates the graph, and it goes through the same
+    /// fallible `NodeStore` (a failed write is an error, never a silent drop). What it costs, and the
+    /// reason it is a *decision* rather than a default, is **write amplification**: linking one node
+    /// touches ~`M` scattered graph nodes, so one logical write becomes ~`M` random-leaf tree writes on
+    /// the AT-045-certified write path. `ann_amplification` measures exactly that, against a bare indexed
+    /// write, so the placement is chosen on the number.
+    pub fn ann_insert(
+        &self,
+        token: &CapabilityToken,
+        branch: &BranchId,
+        key: Key,
+        embedding: loom_core::Embedding,
+    ) -> Result<()> {
+        self.issuer.authorize(token, branch, self.now())?;
+
+        let _wg = self.write_guard();
+        let head = self.head(branch)?;
+        let store = self.pager.fork(&head)?;
+        let mut txn = store.begin()?;
+        let tree = Tree::open(&*store)?;
+        let mut node_store = crate::ann::TreeNodeStore::new(tree);
+        loom_core::hnsw_insert(&mut node_store, &key, embedding).map_err(|e| LoomError::Index {
+            detail: format!(
+                "inline ANN insert of {}: {e}; the index may need a rebuild",
+                String::from_utf8_lossy(&key)
+            ),
+        })?;
         let tree = node_store.into_tree();
         tree.flush(&mut txn)?;
         let commit = store.commit(txn)?;
         self.record_commit(commit, vec![head]);
         self.set_head(branch, commit)?;
-        Ok(count)
+        Ok(())
     }
 
     /// **Search the branch's ANN index for the `k` nearest record keys to `query`.**
     ///
-    /// Reads only the graph nodes the search traverses — the sub-linear win — and only from *this*
-    /// branch's tree, so it can never return a sibling's fact (AT-040, structurally). Returns the record
-    /// keys best-first; the caller loads and packs the entries. Empty if the index was never built.
+    /// **Unions two sources, so the result is always live** (the slice-2c "0 staleness" guarantee):
+    ///
+    /// 1. the **graph** — the folded HNSW, searched sub-linearly (only the nodes the traversal touches);
+    /// 2. the **write buffer** — vectors written since the last fold, brute-scanned. The buffer is a
+    ///    reserved prefix range, so this scan is O(buffer) (bounded by the fold threshold), never O(N).
+    ///
+    /// A record can appear in both for the brief window while a fold is committing, so results are
+    /// **deduplicated by record key** (buffer wins — it is at least as fresh). Both sources are read from
+    /// *one consistent fork* of the branch head, so a concurrent write or fold is never seen half-applied,
+    /// and both live in *this* branch's tree, so a sibling's vector can never surface (AT-040). Returns
+    /// the record keys best-first; empty if nothing was ever indexed.
     pub fn search_ann(
         &self,
         token: &CapabilityToken,
@@ -396,16 +500,49 @@ impl Loom {
 
         let head = self.head(branch)?;
         let store = self.pager.fork(&head)?;
-        let tree = Tree::open(&*store)?;
-        let node_store = crate::ann::TreeNodeStore::new(tree);
+        let mut tree = Tree::open(&*store)?;
 
-        let hits =
-            loom_core::hnsw_search(&node_store, query, k, loom_core::EF_DEFAULT).map_err(|e| {
-                LoomError::Index {
-                    detail: format!("search: {e}"),
+        // 1. Buffer brute-scan (bounded, prefix-ranged). Dedup set keyed by record id: the buffer is the
+        //    fresher source, so a key seen here is never overwritten by the graph.
+        let mut scored: Vec<(Key, f32)> = Vec::new();
+        let mut seen: std::collections::HashSet<Key> = std::collections::HashSet::new();
+        for (bkey, record) in tree.scan_prefix(loom_core::RESERVED_ANNBUF_PREFIX)? {
+            let Some(rid) = loom_core::ann_buffer_record_id(&bkey) else {
+                continue;
+            };
+            let Record::Value(Value::Blob(bytes)) = record else {
+                continue;
+            };
+            let emb: loom_core::Embedding =
+                bincode::deserialize(&bytes).map_err(|source| LoomError::Codec {
+                    op: "decode",
+                    what: "ANN buffer vector",
+                    source,
+                })?;
+            if let Some(sim) = query.cosine(&emb) {
+                if seen.insert(rid.to_vec()) {
+                    scored.push((rid.to_vec(), sim));
                 }
+            }
+        }
+
+        // 2. Graph search. Over-fetch a little so the dedup against the buffer cannot leave us short of k.
+        let node_store = crate::ann::TreeNodeStore::new(tree);
+        let want = k + seen.len();
+        let hits = loom_core::hnsw_search(&node_store, query, want, loom_core::EF_DEFAULT)
+            .map_err(|e| LoomError::Index {
+                detail: format!("search: {e}"),
             })?;
-        Ok(hits.into_iter().map(|(id, _)| id).collect())
+        for (id, sim) in hits {
+            if seen.insert(id.clone()) {
+                scored.push((id, sim));
+            }
+        }
+
+        // 3. Merge: the true top-k across both sources by similarity.
+        scored.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+        scored.truncate(k);
+        Ok(scored.into_iter().map(|(id, _)| id).collect())
     }
 
     /// The commit a branch currently points at.
@@ -777,6 +914,11 @@ impl Loom {
         // rewind boundary a recall plan wants ("move the branch back to before this write"). So
         // provenance goes in the same transaction as the data, atomically, and a crash can no longer
         // separate a write from its provenance.
+        //
+        // Held from here through `set_head`: the head read, the fork, and the advance are one atomic
+        // read-modify-write, so a concurrent writer or the background fold cannot fork the same head and
+        // clobber this commit (or be clobbered by it).
+        let _wg = self.write_guard();
         let head = self.head(branch)?;
         let store = self.pager.fork(&head)?;
 
@@ -879,6 +1021,24 @@ impl Loom {
                     }
                 })?)),
             )?;
+
+            // **The ANN write buffer** — the live-index half of slice 2c. If this entry carries an
+            // embedding, stash it in the branch's buffer (reserved, in-branch) in this SAME commit, so a
+            // freshly-written vector is searchable immediately (via the union brute-scan) without waiting
+            // for a fold, and a crash can never separate the entry from its buffered vector. A fold later
+            // moves it into the graph and clears this key, atomically.
+            if let Some(emb) = &hint.embedding {
+                tree.insert(
+                    loom_core::ann_buffer_key(key),
+                    Record::Value(Value::Blob(bincode::serialize(emb).map_err(|source| {
+                        LoomError::Codec {
+                            op: "encode",
+                            what: "ANN buffer vector",
+                            source,
+                        }
+                    })?)),
+                )?;
+            }
         }
 
         // Bitemporal history — a claim assertion APPENDS a version and CLOSES the prior open one's
@@ -896,6 +1056,13 @@ impl Loom {
         self.record_commit(commit, vec![head]);
         self.set_head(branch, commit)?;
         Ok(commit)
+    }
+
+    /// Hold the head-mutation lock. Every branch-head read-modify-write — a write, an ANN insert, the
+    /// fold's compare-and-set — holds this across its head read → advance, so no two can interleave and
+    /// silently drop one another's commit.
+    fn write_guard(&self) -> std::sync::MutexGuard<'_, ()> {
+        self.write_lock.lock().unwrap_or_else(|e| e.into_inner())
     }
 
     /// Take a session's read-set, clearing it. The next write starts fresh.

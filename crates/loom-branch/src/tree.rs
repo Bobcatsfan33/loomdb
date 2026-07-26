@@ -477,6 +477,53 @@ impl<'a> Tree<'a> {
         Ok(())
     }
 
+    /// Every `(key, record)` whose key starts with `prefix`, in key order — **without reading the rest
+    /// of the tree**. It descends only into subtrees whose key range overlaps `[prefix, prefix⁺)`, so it
+    /// is O(log N + matches), not O(N). This is what keeps the ANN buffer scan (a reserved-prefix range)
+    /// bounded by the buffer size rather than the whole branch.
+    pub fn scan_prefix(&mut self, prefix: &[u8]) -> Result<Vec<(Key, Record)>> {
+        let mut out = Vec::new();
+        let root = self.meta.root;
+        let hi = prefix_upper(prefix);
+        self.collect_range(root, prefix, hi.as_deref(), &mut out)?;
+        Ok(out)
+    }
+
+    fn collect_range(
+        &mut self,
+        page: LogicalPageNo,
+        lo: &[u8],
+        hi: Option<&[u8]>,
+        out: &mut Vec<(Key, Record)>,
+    ) -> Result<()> {
+        match self.node(page)? {
+            Node::Leaf { entries } => {
+                for (k, r) in entries {
+                    let ks = k.as_slice();
+                    if ks >= lo && hi.is_none_or(|h| ks < h) {
+                        out.push((k, r));
+                    }
+                }
+            }
+            Node::Internal { keys, children } => {
+                // child[i] owns keys in [keys[i-1], keys[i]); descend only where that overlaps [lo, hi).
+                for (i, &child) in children.iter().enumerate() {
+                    let lower = if i == 0 { None } else { keys.get(i - 1) };
+                    let upper = keys.get(i);
+                    let below_hi = match (lower, hi) {
+                        (Some(l), Some(h)) => l.as_slice() < h,
+                        _ => true,
+                    };
+                    let above_lo = upper.is_none_or(|u| u.as_slice() > lo);
+                    if below_hi && above_lo {
+                        self.collect_range(child, lo, hi, out)?;
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
     /// Every key in the leaves stored at these logical pages.
     ///
     /// This is the **merge prefilter** (docs/03 §3.3). substrate's `diff3` tells us which *pages*
@@ -543,6 +590,21 @@ fn entry_cost(key: &[u8], record: &Record) -> Result<usize> {
 }
 
 /// Which child of an internal node a key belongs under.
+/// The smallest key that does **not** begin with `prefix` — the exclusive upper bound of the prefix
+/// range. Increment the last byte, carrying over trailing `0xFF`s; `None` means "no upper bound" (the
+/// prefix was all `0xFF`, so everything `>= prefix` matches).
+fn prefix_upper(prefix: &[u8]) -> Option<Vec<u8>> {
+    let mut hi = prefix.to_vec();
+    while let Some(last) = hi.last_mut() {
+        if *last < 0xFF {
+            *last += 1;
+            return Some(hi);
+        }
+        hi.pop();
+    }
+    None
+}
+
 fn child_index(keys: &[Key], key: &[u8]) -> usize {
     // `partition_point` is the first index where the separator is > key, which is exactly the child
     // that owns the key. Getting this off by one sends every lookup down the wrong subtree, which is

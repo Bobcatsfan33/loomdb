@@ -48,8 +48,9 @@ pub use error::{LoomError, Result};
 pub use history::{ClaimVersion, RESERVED_HISTORY_PREFIX};
 pub use hnsw::{Hnsw, ItemId, EF_DEFAULT, M};
 pub use hnsw_store::{
-    hnsw_meta_key, hnsw_node_key, insert as hnsw_insert, search as hnsw_search, HnswMeta,
-    NodeStore, PersistedNode, StoreError, RESERVED_HNSW_PREFIX,
+    ann_buffer_key, ann_buffer_record_id, hnsw_meta_key, hnsw_node_key, insert as hnsw_insert,
+    search as hnsw_search, HnswMeta, NodeStore, PersistedNode, StoreError, RESERVED_ANNBUF_PREFIX,
+    RESERVED_HNSW_PREFIX,
 };
 pub use ids::{
     ActorId, BranchId, ClaimId, CommitId, ObservationId, PolicyDecisionId, SessionId, TenantId,

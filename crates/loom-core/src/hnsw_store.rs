@@ -368,3 +368,25 @@ pub fn hnsw_meta_key() -> Vec<u8> {
     k.extend_from_slice(b"meta");
     k
 }
+
+/// The reserved prefix for the **ANN write buffer** — freshly-written vectors that are searchable but
+/// not yet folded into the graph (the live-index / background-compaction design).
+///
+/// Reserved (`\x00loom/`), so — like the graph — it is hidden from `scan`, excluded from merge, and
+/// inherited on fork: the buffer is **in-branch**, so AT-040 isolation holds for a buffered vector
+/// exactly as it does for a graph node. A record's vector lands here (alongside its index entry) on
+/// write, is searched by a bounded brute-scan unioned with the graph, and is removed **atomically** when
+/// a fold commits it into the graph.
+pub const RESERVED_ANNBUF_PREFIX: &[u8] = b"\x00loom/annbuf/";
+
+/// The key a buffered vector is stored at, derived from the record id. The value is the embedding.
+pub fn ann_buffer_key(record_id: &[u8]) -> Vec<u8> {
+    let mut k = RESERVED_ANNBUF_PREFIX.to_vec();
+    k.extend_from_slice(record_id);
+    k
+}
+
+/// Recover the record id from a buffer key (strip the reserved prefix).
+pub fn ann_buffer_record_id(key: &[u8]) -> Option<&[u8]> {
+    key.strip_prefix(RESERVED_ANNBUF_PREFIX)
+}

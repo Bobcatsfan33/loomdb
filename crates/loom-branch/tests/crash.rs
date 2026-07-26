@@ -205,6 +205,117 @@ fn verify_recovery(disk: Arc<MemVfs>, acked: &[Ack]) {
     }
 }
 
+// ── AT-045 over the ANN fold: the buffer→graph handoff survives a crash at any byte ──
+
+fn ann_vec(i: usize) -> loom_core::Embedding {
+    let mut v = vec![0.02f32; 16];
+    v[i % 16] = 1.0;
+    loom_core::Embedding::new(v)
+}
+
+/// Write ten indexed vectors (each buffered), then fold them into the graph. Returns the
+/// `(branch, key)` of every write that was **acknowledged** before the crash. The fold's own Ok/Err is
+/// irrelevant to the invariant: whether or not it committed, an acked vector must be recoverable in the
+/// buffer *or* the graph.
+fn run_fold_workload(db: &Loom) -> Vec<(BranchId, Vec<u8>)> {
+    let Ok((session, token)) = db.open_session() else {
+        return Vec::new();
+    };
+    let branch = session.branch.clone();
+    let mut acked = Vec::new();
+    for i in 0..10usize {
+        let key = format!("v/{i:03}").into_bytes();
+        if db
+            .write_indexed(
+                &token,
+                &branch,
+                key.clone(),
+                observation(&format!("v{i}")),
+                loom_core::IndexHint::text("f").with_embedding(ann_vec(i)),
+                &env(&session.id, &branch),
+            )
+            .is_ok()
+        {
+            acked.push((branch.clone(), key));
+        } else {
+            return acked;
+        }
+    }
+    // The fold moves the buffered vectors into the graph in ONE atomic commit. A crash here must leave
+    // every acked vector in the buffer (fold uncommitted) or the graph (committed) — never neither.
+    let _ = db.ann_fold(&token, &branch);
+    acked
+}
+
+/// After recovery, every acknowledged vector must survive **in the buffer or in the graph** — the
+/// handoff has no window in which it is in neither. Read the tree directly (no token), the same way the
+/// prefix sweep does, because this is a storage guarantee.
+fn verify_fold_recovery(disk: Arc<MemVfs>, acked: &[(BranchId, Vec<u8>)]) {
+    let db = loom_on(reboot(disk), "acme")
+        .expect("a rebooted database must REOPEN after a mid-fold crash (I-8)");
+    for (branch, key) in acked {
+        let head = db.head(branch).unwrap_or_else(|_| {
+            panic!("AT-045/fold: acknowledged branch is gone after recovery — a write was lost")
+        });
+        let store = db
+            .pager_for_debug()
+            .fork(&head)
+            .expect("AT-045/fold: recovered head is not a readable manifest — torn state");
+        let mut tree = loom_branch::Tree::open(&*store)
+            .expect("AT-045/fold: recovered tree does not open — torn state");
+        let in_buffer = tree
+            .get(&loom_core::ann_buffer_key(key))
+            .expect("AT-045/fold: reading the buffer errored — torn state")
+            .is_some();
+        let in_graph = tree
+            .get(&loom_core::hnsw_node_key(key))
+            .expect("AT-045/fold: reading the graph errored — torn state")
+            .is_some();
+        assert!(
+            in_buffer || in_graph,
+            "AT-045/fold: vector {:?} is in NEITHER buffer nor graph after a mid-fold crash — the \
+             handoff lost it",
+            String::from_utf8_lossy(key)
+        );
+    }
+}
+
+/// **The fold survives a crash at every byte boundary.** Same sweep as the write path, over a workload
+/// whose last act is an ANN fold: at each crash point the buffer→graph handoff recovers with every acked
+/// vector in exactly one of the two, never lost.
+#[test]
+fn at_045_crash_during_fold_never_loses_a_vector() {
+    let (probe_disk, probe_vfs) = crashing_mem_vfs(i64::MAX);
+    let total_bytes = {
+        let db = loom_on(probe_vfs.clone(), "acme").unwrap();
+        let acked = run_fold_workload(&db);
+        assert!(
+            acked.len() >= 10,
+            "the full fold workload should acknowledge all ten writes with an unlimited budget"
+        );
+        drop(db);
+        i64::MAX - probe_vfs.remaining()
+    };
+    drop(probe_disk);
+    assert!(total_bytes > 0, "the fold workload must write something");
+
+    let stride: i64 = std::env::var("AT045_STRIDE")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or_else(|| (total_bytes / 200).max(1));
+
+    let mut budget = 0i64;
+    while budget <= total_bytes {
+        let (disk, vfs) = crashing_mem_vfs(budget);
+        let acked = match loom_on(vfs.clone(), "acme") {
+            Ok(db) => run_fold_workload(&db),
+            Err(_) => Vec::new(),
+        };
+        verify_fold_recovery(disk, &acked);
+        budget += stride;
+    }
+}
+
 /// **The sweep: crash at every byte boundary, and recover cleanly every time.**
 #[test]
 fn at_045_crash_at_any_byte_recovers_to_a_prefix() {
