@@ -92,16 +92,37 @@ writes and quietly omits the account it suspended is not an audit tool — it's 
 We would rather you find these here than in an evaluation. None affects correctness; each is a cost or a
 bound stated plainly.
 
-- **Retrieval's default is an O(entries) scan.** It is *correct* and branch-isolated (the load-bearing
-  property, oracle-checked). A **per-branch HNSW** index exists (v0.2) — kept **in the branch**, never a
-  shared index that would reintroduce the cross-branch leak the isolation was designed out ([invariant
-  I-11](docs/invariants.md)) — with recall@10 ≥ 0.85 proven against the exact scan. But it is an **opt-in
-  explicit build, not the default**, and here is why, measured rather than hidden: building the graph is
-  **super-linear** in records (≈1.7 s / 15.5 s / 145 s for 500 / 2 000 / 8 000 vectors). So the scan
-  stays the default; ANN accelerates *queries* but is currently expensive to *build*. Making the build
-  O(N·log N) and maintaining the graph incrementally (background compaction, not on the write path — an
-  inline insert would amplify the crash-certified write path) is a v0.3 project, stated here rather than
-  found in a POC.
+- **Retrieval's default is an O(entries) scan; the per-branch HNSW index builds in O(N·log N)
+  (v0.3, measured).** The scan is *correct* and branch-isolated (the load-bearing property,
+  oracle-checked). The **HNSW** index accelerates queries and is kept **in the branch**, never a shared
+  index that would reintroduce the cross-branch leak the isolation was designed out ([invariant
+  I-11](docs/invariants.md)), with recall@10 ≥ 0.85 proven against the exact scan. **v0.3 made the build
+  scale:** it builds the graph in RAM (unit-normalized vectors, a bare-dot distance, an epoch-tagged
+  visited set) and persists once in a sorted pass, and a build-complexity benchmark
+  (`crates/loom-core/tests/hnsw_build_scaling.rs`, 1k→1M, release, clustered real-embedding-shaped data,
+  run on a stock CI runner) shows it tracks **N·log N, not N²** — the N·log N constant stays flat (~2×
+  across the whole range, cache drift only) while the N² constant **collapses ~240×**. A **1M-vector
+  build runs in ~5.6 min** (~340 µs/insert on that runner); recall@10 holds at **1.000 (1k) / 0.996 (1M
+  at the default ef=64) / 1.000 (1M at ef=128)**. Parameters: M=16, Mmax0=2M, efConstruction=200,
+  efSearch=64. **Recall is strongly distribution-dependent, and the number above is on realistic
+  clustered embeddings** (real embeddings live near topics, not spread uniformly): recall@10 ≥ 0.99 there
+  at the default beam. On the *pathological* case — uniform-random, near-orthogonal vectors, where the
+  true top-10 are barely separated from everything else — recall is much lower, and the deficit **grows
+  with N**: at 100k, ef=64 gives ~0.51 and a wider beam recovers it (0.87 at ef=256, 0.96 at ef=512); at
+  1M, ef=64 gives ~0.28 and even ef=512 reaches only ~0.71. Recall climbs monotonically with the beam at
+  both scales — the graph the build produces is **navigable** — but uniform high-dim vectors at 1M sit
+  near the regime where nearest-neighbour is barely defined and recall is hard for *any* index (and no
+  real embedding model produces them). So the honest claim is **≥ 0.99 on realistic clustered embeddings
+  at the default beam; materially lower on uniform/adversarial distributions and lower still at scale** —
+  stated conditioned on the distribution, the way the wake number states hot-vs-cold. *(The
+  build was never O(N²): the insert has always navigated the graph — greedy descent
+  plus a bounded beam, not a brute-force scan. What v0.3 removed was a large per-insert **constant**,
+  paid through the per-operation tree/bincode path plus M scattered write-amplifying leaf writes; it
+  **cut the constant and took construction off the per-op store**, and did not replace a scan that was
+  never there.)* Whether a **single** ANN insert then moves inline or to background compaction — now that
+  inserts are O(log N) — is a separate, measured write-path-placement decision (the slice-2c question),
+  deferred to a follow-on rather than folded into the build, because an inline insert would touch the
+  crash-certified write path.
 - **The refs file is rewritten in full on every commit** — O(branches), not O(1). Invisible against
   database *size*; it will show on a tenant with a great many branches.
 - **Wake-over-object-storage is now a function of link RTT, not of the algorithm — measured, stated in

@@ -296,3 +296,65 @@ something to re-prove, not assume.
 **The refs file is rewritten in full on every commit.** That is O(branches), not O(1). It does not show
 up against baseline *size* — which is what AT-011 claims — but it will show up on a tenant with a great
 many branches. Not optimised, and not hidden.
+
+## HNSW index build — **O(N·log N), measured (v0.3)**
+
+**The record, corrected.** The per-branch HNSW build was once described here as *super-linear*
+(≈1.7 s / 15.5 s / 145 s for 500 / 2 000 / 8 000 vectors). It was slow, but it was **never O(N²)**, and it
+was never a brute-force neighbour scan: the insert has always *navigated the graph* — greedy descent
+plus a bounded beam — which is ~O(log N) per insert. What made it slow was a large per-insert **constant**
+paid through the per-operation tree/bincode path, plus M scattered write-amplifying leaf writes. So the
+honest v0.3 statement is: **the constant was cut and construction was taken off the per-op store** — not
+"a brute-force scan was replaced."
+
+**What changed.** The graph now builds in RAM (unit-normalized vectors so distance is a bare dot product —
+recall-neutral, `dot(â,b̂)=cos(a,b)`; an epoch-tagged visited set replacing a per-call `HashSet`), and is
+persisted once in a **single sorted pass** through the same fallible `NodeStore` (sequential leaf writes,
+not scattered). The classic HNSW pieces that hold recall at scale were added: **Mmax0 = 2M** at layer 0,
+the **neighbour-selection heuristic** (paper Alg. 4) for selection and pruning, and **efConstruction (200)
+separate from efSearch (64)**. Persisted bytes are unchanged (normalization is load-time only), so search
+and `as-of` reproducibility are untouched.
+
+**Measured** (`crates/loom-core/tests/hnsw_build_scaling.rs`, DIM=64, release, clustered
+real-embedding-shaped data; run to 1M on a stock CI runner — `hnsw-build-scaling.yml`):
+
+| N | build | µs/insert | c_nlogn (ns) | c_n² (ps) |
+|---|---|---|---|---|
+| 1 000 | 0.08 s | 82 | 8 255 | 82 264 271 |
+| 10 000 | 1.1 s | 111 | 8 368 | 11 119 100 |
+| 100 000 | 18.3 s | 183 | 11 043 | 1 834 230 |
+| 1 000 000 | 339 s | 339 | 16 995 | 338 731 |
+
+The N·log N constant stays flat (**2.06× across the whole range**, drifting up only with the CPU
+cache-miss rate); the N² constant **collapses 243×**. c_n² varies ~118× more than c_nlogn ⇒ **N² is
+rejected**; the empirical exponent (1.13 → 1.27) is nowhere near 2. Params:
+**M=16 / Mmax0=32 / efConstruction=200 / efSearch=64.** AT-040 isolation and AT-045's every-byte crash
+sweep were re-run green after the change.
+
+**Recall@10 vs brute force — held, and scoped to the distribution (like the wake number is scoped
+hot-vs-cold).** On **realistic clustered embeddings** (real vectors live near topics, not uniformly on
+the sphere): **1.000** at 1k, **0.996** at 1M, both at the default ef=64 — **≥ 0.99**.
+
+On the **pathological uniform-random** case — near-orthogonal vectors, where the true top-10 are barely
+separated from everything else — recall is much lower, and the deficit **grows with N** as the vectors
+crowd closer to equidistant:
+
+| ef | 64 | 128 | 256 | 512 |
+|---|---|---|---|---|
+| 100k uniform | 0.51 | 0.74 | **0.87** | 0.96 |
+| 1M uniform | 0.28 | 0.39 | 0.55 | 0.71 |
+
+Recall climbs **monotonically** with the beam at both scales — that is the evidence the *graph* is
+well-connected (the spec pieces did their job) — but at 100k it clears the 0.85 floor by ef=256, while at
+1M it is still climbing and does **not** reach 0.85 within ef ≤ 512. This is not a graph defect: uniform
+high-dimensional vectors at 1M sit near the regime where "nearest neighbour" is barely defined and recall
+is hard for **any** index, and no embedding model a user would deploy produces them. So the honest claim
+is **recall@10 ≥ 0.99 on realistic clustered embeddings at the default beam; strongly
+distribution-dependent — materially lower on uniform/adversarial distributions and lower still at scale,
+recoverable in part by widening the search beam.** Real embeddings cluster; that is the regime the ≥ 0.99
+is measured in and conditioned on.
+
+**Deferred, on purpose (the slice-2c question).** Now that a single insert is O(log N), whether ANN
+maintenance moves **inline** on the write path or into **background compaction** is a distinct,
+measured write-path-placement decision — not folded into the build, because an inline insert would touch
+the crash-certified write path. It is a v0.3+ follow-on.

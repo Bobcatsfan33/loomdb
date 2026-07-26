@@ -6,21 +6,21 @@
 //! has a different head manifest and a different tree, and cannot address this graph (invariant I-11,
 //! the reason it is never a shared index).
 //!
-//! Exposed as an **explicit build** (`Loom::build_ann_index`) rather than auto-run on every write, and
-//! **slice 2c measured why it stays that way** (`benches/ann_amplification.rs`): building the graph is
-//! *super-linear* in the number of records — ~1.7 s / 15.5 s / 145 s to index 500 / 2 000 / 8 000
-//! vectors, i.e. 4× the records for ~9× the time. The graph's storage is cheap (≈675 bytes/record,
-//! graph/data ≈ 0.01), so the cost is time, not space, and it comes from the `M` scattered neighbour
-//! updates per insert — the same random-leaf write amplification the append-ordered-provenance fix
-//! removed elsewhere.
+//! Exposed as an **explicit build** (`Loom::build_ann_index`) rather than auto-run on every write.
 //!
-//! **The decision that follows from the number:** ANN-on-write does **not** go inline. An inline insert
-//! whose cost climbs with the graph would reintroduce exactly that amplification on the AT-045-certified
-//! write path; and since the *explicit* build is already super-linear, inline would be strictly worse.
-//! So for v0.2 the graph is an **explicit build**, the **brute-force scan stays the correct default**
-//! retrieval path, and ANN is an opt-in accelerator. The production answer — incremental maintenance /
-//! background compaction, plus fixing the build to be genuinely O(N·log N) — is its own project
-//! (v0.3), not a fold-in. Written down here rather than discovered under load.
+//! **v0.3 made the build O(N·log N)** (`crates/loom-core/tests/hnsw_build_scaling.rs`). The old cost —
+//! measured at ~1.7 s / 15.5 s / 145 s for 500 / 2 000 / 8 000 vectors — was *never* quadratic and never
+//! a brute-force scan (the insert has always navigated the graph); it was a large per-insert **constant**
+//! paid through the per-operation tree/bincode path, plus the `M` scattered write-amplifying leaf writes
+//! per insert. `build_ann_index` now builds the graph **in RAM** and persists it in **one sorted pass**,
+//! which cuts the constant and removes the scatter — the build tracks N·log N to 1M with recall@10 held
+//! (see the at-map's *HNSW index build* section for the curve and numbers).
+//!
+//! **Still deferred, and why (the slice-2c question):** now that a single insert is O(log N), whether ANN
+//! maintenance moves **inline** on the write path or into **background compaction** is a distinct,
+//! measured write-path-placement decision — not folded in here, because an inline insert would touch the
+//! AT-045-certified write path. The scan stays the correct default retrieval path; ANN is an opt-in
+//! query accelerator. Written down here rather than discovered under load.
 
 use std::cell::RefCell;
 
