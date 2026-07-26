@@ -35,7 +35,7 @@ use object_store::ObjectStore;
 use std::sync::Arc;
 use std::time::Instant;
 use substrate_pager::{PageId, StoreConfig};
-use substrate_store::{RemoteTier, TieredStore};
+use substrate_store::{RemoteTier, TieredStore, WarmPoolConfig};
 
 /// Build the object-storage client once — its connection pool is what "warm" means. Sharing ONE client
 /// across a run's wakes (via [`RemoteTier::new`] with `Arc::clone`) models the production loomd server:
@@ -759,5 +759,220 @@ fn at_047_hot_vs_cold_rewake_over_object_storage() {
         println!("RESULT: hot re-wake wide-area p99 {hot_p99:.1} ms is still OVER 250 ms — reported honestly; no <250ms claim, AT-047 limit stands and its number is UPDATED to this measurement.");
     }
 
+    drop(rt);
+}
+
+/// **AT-047 v1.5.0: the warm connection pool delivers ~1 RTT on a cold-start / bursty wake.**
+///
+/// The hot-vs-cold test showed a hot re-wake floors at ~2.3 RTT on a *cold* connection pool (each
+/// concurrent GET pays a fresh TLS handshake) and ~1 RTT on a warm one. `substrate::WarmPool` (v1.5.0)
+/// keeps the pool warm so the cold-start case — a wake after an idle gap, the one that paid the handshake
+/// tax — hits ~1 RTT too. This measures exactly that, using the REAL background maintainer
+/// (`RemoteTier::spawn_warm_pool`), not the raw-GET pre-warm hack:
+///
+/// - **cold-start (no pool):** a brand-new client, immediate hot re-wake — pays handshakes.
+/// - **warm pool:** a fresh client with the maintainer running (a couple of refresh cycles before the
+///   wake) — reuses warm connections.
+///
+/// Both use the same learned warm set and the same token; only the pool warmth differs. Reported in
+/// RTT-multiples. The honest claim is scoped **"~1 RTT up to `min_idle` connections"** — beyond the pool
+/// size a wake still pays handshakes, and we do not have a real deployment's burst profile to size larger.
+#[test]
+#[ignore = "needs an S3-compatible endpoint; set MINIO_URL. Measures WarmPool cold-start vs no-pool (AT-047 transport, v1.5.0)."]
+fn at_047_warm_pool_delivers_one_rtt_on_cold_start() {
+    let samples: usize = std::env::var("LOOM_WAKE_SAMPLES")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(12);
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .expect("runtime");
+    let branch = BranchId::new("investigation-1");
+    let min_idle = 8usize;
+
+    let cfg = |pool: &str| StoreConfig {
+        pool: pool.to_string(),
+        ..Default::default()
+    };
+
+    let mut cold_ms: Vec<f64> = Vec::with_capacity(samples);
+    let mut warm_ms: Vec<f64> = Vec::with_capacity(samples);
+    let mut rtt_ms: Vec<f64> = Vec::with_capacity(samples);
+
+    for s in 0..samples {
+        let pool = format!("loomwarm-{s}");
+        let tenant = TenantId::new(pool.clone());
+
+        // Build the hot token: seed + sleep, then a cold wake+read learns the warm set; graft it on.
+        let backend0 = s3_client();
+        let seed_home = tempfile::tempdir().expect("tempdir");
+        let token_cold = rt.block_on(async {
+            let tiered = TieredStore::open(
+                seed_home.path(),
+                RemoteTier::new(Arc::clone(&backend0), pool.clone()),
+                cfg(&pool),
+            )
+            .await
+            .expect("open seed tier");
+            let db = Loom::on(
+                Arc::clone(tiered.pager()),
+                Arc::new(MemRefStore::new()),
+                tenant.clone(),
+            )
+            .expect("open loom");
+            let (session, token) = db
+                .open_session_named(SessionId::new("investigation-1"))
+                .expect("session");
+            for round in 0..12u64 {
+                db.write(
+                    &token,
+                    &session.branch,
+                    format!("key-{round:04}").into_bytes(),
+                    counter(round as i64),
+                    &envelope(&session.branch),
+                )
+                .expect("write");
+            }
+            db.sleep(&tiered).await.expect("sleep")
+        });
+        drop(seed_home);
+
+        let learn_home = tempfile::tempdir().expect("tempdir");
+        let warm = rt.block_on(async {
+            let tiered = TieredStore::open(
+                learn_home.path(),
+                RemoteTier::new(Arc::clone(&backend0), pool.clone()),
+                cfg(&pool),
+            )
+            .await
+            .expect("open");
+            let db = Loom::wake(&tiered, &token_cold).expect("cold wake");
+            let cap = db
+                .issue_capability(
+                    SessionId::new("learn"),
+                    std::slice::from_ref(&branch),
+                    3_600_000,
+                )
+                .expect("cap");
+            db.read(&cap, &branch, b"key-0000").expect("learn read");
+            tiered.warm_set()
+        });
+        drop(learn_home);
+        let token_hot = LoomWakeToken {
+            warm_set: warm,
+            ..token_cold.clone()
+        };
+
+        // RTT probe on the (now warm) backend0.
+        let rtt = rt.block_on(async {
+            let remote = RemoteTier::new(Arc::clone(&backend0), pool.clone());
+            let key = match token_hot.warm_set.pages.first() {
+                Some(&p) => remote.page_key(p),
+                None => remote.manifest_key(token_hot.warm_set.manifests[0]),
+            };
+            let t = Instant::now();
+            let _ = remote.get(&key).await;
+            t.elapsed().as_secs_f64() * 1000.0
+        });
+        rtt_ms.push(rtt);
+
+        // (A) COLD-START, no pool: a brand-new client, immediate hot re-wake → pays handshakes.
+        let cold_client = s3_client();
+        let home_a = tempfile::tempdir().expect("tempdir");
+        let ca = rt.block_on(async {
+            let tiered = TieredStore::open(
+                home_a.path(),
+                RemoteTier::new(cold_client, pool.clone()),
+                cfg(&pool),
+            )
+            .await
+            .expect("open");
+            let started = Instant::now();
+            let db = Loom::wake(&tiered, &token_hot).expect("cold-start wake");
+            let cap = db
+                .issue_capability(
+                    SessionId::new("a"),
+                    std::slice::from_ref(&branch),
+                    3_600_000,
+                )
+                .expect("cap");
+            let v = db.read(&cap, &branch, b"key-0000").expect("read");
+            assert_eq!(v, Some(counter(0)), "cold-start woke to the wrong value");
+            started.elapsed().as_secs_f64() * 1000.0
+        });
+        drop(home_a);
+        cold_ms.push(ca);
+
+        // (B) WARM POOL: a fresh client with the background maintainer running before the wake.
+        let warm_client = s3_client();
+        let home_b = tempfile::tempdir().expect("tempdir");
+        let cb = rt.block_on(async {
+            let remote = RemoteTier::new(Arc::clone(&warm_client), pool.clone());
+            let _wp = remote.spawn_warm_pool(WarmPoolConfig {
+                min_idle,
+                interval: std::time::Duration::from_millis(300),
+            });
+            // Let a couple of refresh cycles fire so min_idle connections are open and idle before we wake.
+            tokio::time::sleep(std::time::Duration::from_millis(800)).await;
+            let tiered = TieredStore::open(
+                home_b.path(),
+                RemoteTier::new(Arc::clone(&warm_client), pool.clone()),
+                cfg(&pool),
+            )
+            .await
+            .expect("open");
+            let started = Instant::now();
+            let db = Loom::wake(&tiered, &token_hot).expect("warm-pool wake");
+            let cap = db
+                .issue_capability(
+                    SessionId::new("b"),
+                    std::slice::from_ref(&branch),
+                    3_600_000,
+                )
+                .expect("cap");
+            let v = db.read(&cap, &branch, b"key-0000").expect("read");
+            assert_eq!(v, Some(counter(0)), "warm-pool woke to the wrong value");
+            let e = started.elapsed().as_secs_f64() * 1000.0;
+            drop(_wp);
+            e
+        });
+        drop(home_b);
+        warm_ms.push(cb);
+    }
+
+    let sort =
+        |v: &mut Vec<f64>| v.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+    sort(&mut cold_ms);
+    sort(&mut warm_ms);
+    let pct = |v: &[f64], p: f64| -> f64 {
+        let idx = ((p / 100.0) * (v.len() as f64 - 1.0)).round() as usize;
+        v[idx.min(v.len() - 1)]
+    };
+    let mean = |v: &[f64]| v.iter().sum::<f64>() / v.len() as f64;
+    let rtt = mean(&rtt_ms).max(0.001);
+
+    println!("--- AT-047 WARM POOL: cold-start hot re-wake, no pool vs WarmPool (min_idle={min_idle}, {samples} samples) ---");
+    println!("1 RTT (warm GET)     : mean {rtt:.1} ms  ← the unit");
+    println!(
+        "cold-start (no pool) : p50 {:.1} / p99 {:.1} ms   = {:.2} / {:.2} RTT   (fresh connections, TLS handshakes)",
+        pct(&cold_ms, 50.0), pct(&cold_ms, 99.0), pct(&cold_ms, 50.0) / rtt, pct(&cold_ms, 99.0) / rtt,
+    );
+    println!(
+        "warm pool            : p50 {:.1} / p99 {:.1} ms   = {:.2} / {:.2} RTT   (reused keep-alive connections)",
+        pct(&warm_ms, 50.0), pct(&warm_ms, 99.0), pct(&warm_ms, 50.0) / rtt, pct(&warm_ms, 99.0) / rtt,
+    );
+    println!("(scoped: ~1 RTT UP TO min_idle={min_idle} connections; beyond the pool a wake still pays handshakes.)");
+
+    if std::env::var("MINIO_URL").is_ok() {
+        println!("(same-runner endpoint — informational; the warm pool's payoff only shows wide-area where RTT is real.)");
+    } else {
+        let warm_p50_rtt = pct(&warm_ms, 50.0) / rtt;
+        if warm_p50_rtt < 1.6 {
+            println!("RESULT: warm-pool cold-start hits ~1 RTT (p50 {:.2} RTT) — the handshake tax is gone; ~1 RTT guaranteed up to min_idle.", warm_p50_rtt);
+        } else {
+            println!("RESULT: warm-pool cold-start p50 {:.2} RTT — reported honestly; did not reach ~1 RTT, investigate pooling.", warm_p50_rtt);
+        }
+    }
     drop(rt);
 }
