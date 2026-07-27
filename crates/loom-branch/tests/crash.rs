@@ -17,6 +17,18 @@
 //! - **It reopens.** No torn state, no ref pointing at a manifest that is not durable.
 //! - **It is a prefix.** Everything a `write` *acknowledged* (returned `Ok` for) is present and correct —
 //!   nothing acknowledged is lost — and nothing past the crash appears.
+//!
+//! # Certification log
+//!
+//! The default sweep samples ~200 crash points (fast, hits every structural boundary); the **exhaustive**
+//! sweep (`AT045_STRIDE=1`) crashes at *literally every byte* and is re-run whenever the write path, ref
+//! store, or commit machinery changes — the guarantee this repo's credibility rests on.
+//!
+//! - **v0.4 — the compaction change to the write path** (`write_all` now appends each indexed vector to
+//!   an in-branch ANN buffer, under a new per-branch write lock) **and the fold** were re-certified at
+//!   `AT045_STRIDE=1`: **both sweeps green** (`at_045_crash_at_any_byte_recovers_to_a_prefix` and
+//!   `at_045_crash_during_fold_never_loses_a_vector`, every byte). The write path is no longer
+//!   byte-identical to v0.3 — it is *fully re-certified*, which is the property that matters.
 
 use std::sync::Arc;
 
