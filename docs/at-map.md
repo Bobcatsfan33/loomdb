@@ -7,7 +7,8 @@
 > A capability is not done when it works. It is done when the test that would have caught it failing
 > is green. Anything else on this page is not a claim, it is a plan.
 
-Status as of **loomdb-v0.2 (in progress)** — L1 → L4 complete, v0.2 underway.
+Status as of **loomdb-v0.4** — L1 → L5 complete; AT-001–047 all green (AT-045 closed in v0.2); v0.3 made
+the HNSW build O(N·log N), v0.4 made the ANN index live and reframed AT-047 as topology.
 
 **The full scoreboard: AT-001 through AT-047 are ALL green or structurally satisfied.** AT-045
 (crash-at-any-byte, LoomDB-shaped) was the one item deferred at the v0.1 tag; it is **closed in v0.2**

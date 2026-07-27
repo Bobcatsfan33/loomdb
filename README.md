@@ -6,7 +6,7 @@
 
 [![CI](https://github.com/Bobcatsfan33/loomdb/actions/workflows/ci.yml/badge.svg)](https://github.com/Bobcatsfan33/loomdb/actions/workflows/ci.yml)
 [![License: Apache 2.0](https://img.shields.io/badge/license-Apache--2.0-blue.svg)](LICENSE)
-[![Built on substrate](https://img.shields.io/badge/engine-substrate%20v1.2.1-purple.svg)](https://github.com/Bobcatsfan33/substrate)
+[![Built on substrate](https://img.shields.io/badge/engine-substrate%20v1.5.0-purple.svg)](https://github.com/Bobcatsfan33/substrate)
 
 </div>
 
@@ -65,18 +65,25 @@ This was written fast, largely by an AI. That should worry you. Enthusiasm is no
 
 **And it caught a broken test.** The prefilter test accused the engine of dropping records; the engine was right and the *test* was wrong (`n as i8` wrapped at 256 and wrote the seed value back). We would rather find that here.
 
-## Status — **loomdb-v0.1**
+## Status — **loomdb-v0.4**
 
-L1 → L4 complete: sessions-as-branches, the record-level merge engine, durable refs + commit DAG,
+L1 → L5 complete: sessions-as-branches, the record-level merge engine, durable refs + commit DAG,
 provenance and taint-and-recall, memory and retrieval, the policy/influence/action layer, bitemporal
-as-of queries (AQL v0), and **loomd — the MCP server**. **148 tests, clippy `-D warnings` clean, four
-model oracles** (branch/merge, taint, retrieval isolation, policy) holding under fuzzing.
+as-of queries (AQL v0), **loomd — the MCP server**, and the L5 airgap/offline certification (the
+no-egress suite, signed offline update bundles, endurance soaks). **176 tests, clippy `-D warnings`
+clean, four model oracles** (branch/merge, taint, retrieval isolation, policy) holding under fuzzing.
 
 **The Q3 demo (docs/04 §3.1) runs verbatim in CI** — no LLM, a scripted agent drives the MCP surface —
 and two moments are asserted as the bar: the influence policy **refuses the injected "suspend every
 account"**, and `taint(S)` returns a two-section plan that **names the account it already suspended, with
-its receipt, first.** The scoreboard is in [`docs/at-map.md`](docs/at-map.md): **AT-001–047 green, with
-exactly one exception (AT-045) deferred to v0.2 with a reason in writing.**
+its receipt, first.** The scoreboard is in [`docs/at-map.md`](docs/at-map.md): **AT-001–047 all green —
+AT-045 (crash at any byte) closed in v0.2, the board full since.**
+
+**The version arc:** v0.1 (L1–L4 + loomd) · v0.2 (L5 airgap certification, offline bundles, soaks;
+AT-045 closed) · v0.3 (the HNSW index build made O(N·log N), proven to 1M on a headroom host) · v0.4
+(the ANN index made **live** via background compaction; the warm-set + warm-pool wake at ~1 RTT to the
+object store; AT-047 reframed as **topology**). Each of the latest three is honestly scoped in the known
+limits below.
 
 ## The action layer — the point, and now real
 
