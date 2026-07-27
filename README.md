@@ -119,10 +119,18 @@ bound stated plainly.
   plus a bounded beam, not a brute-force scan. What v0.3 removed was a large per-insert **constant**,
   paid through the per-operation tree/bincode path plus M scattered write-amplifying leaf writes; it
   **cut the constant and took construction off the per-op store**, and did not replace a scan that was
-  never there.)* Whether a **single** ANN insert then moves inline or to background compaction — now that
-  inserts are O(log N) — is a separate, measured write-path-placement decision (the slice-2c question),
-  deferred to a follow-on rather than folded into the build, because an inline insert would touch the
-  crash-certified write path.
+  never there.)* **v0.4 made the index LIVE (slice 2c, resolved on the number).** The placement — inline
+  on every write vs. background compaction — was decided by measurement (`benches/ann_amplification.rs`):
+  an inline insert added growing amplification (~1.7–2.2× and climbing) and, disqualifyingly, ~220 ms of
+  per-write latency that grows with the graph, on the AT-045-certified write path. So **compaction**: an
+  indexed write appends its vector to an in-branch buffer (reserved, ~1× baseline, same commit);
+  `search_ann` **unions** the graph with a bounded buffer brute-scan, so a freshly-written vector is
+  searchable **immediately — 0 staleness**; and a background fold moves the buffer into the graph off the
+  write path, published by a **compare-and-set** on the head so it never stalls or clobbers a live write.
+  The buffer→graph handoff is one atomic commit — a crash leaves every vector in the buffer *or* the graph,
+  never neither (AT-045 over the fold) — and the fold racing appends and searches loses nothing and
+  double-indexes nothing (a wake-class concurrency gate). Fresh vectors are now live, not an explicit-build
+  snapshot.
 - **The refs file is rewritten in full on every commit** — O(branches), not O(1). Invisible against
   database *size*; it will show on a tenant with a great many branches.
 - **Wake-over-object-storage is now a function of link RTT, not of the algorithm — measured, stated in
@@ -149,15 +157,30 @@ bound stated plainly.
       **~1.03 RTT** (p50 **232 ms** / p99 278 ms). Reusing idle keep-alive connections removes the
       handshake, and the warm read on top is **essentially free** — the hot re-wake *is* the one-round-trip
       hydrate. Measured to Sydney, RTT ≈ 226 ms.
-  - **What that means for the 250 ms bar.** On a warm pool the hot re-wake is **≈ 1×RTT**, so it clears
-    250 ms **wherever `RTT < ~250 ms`** — which includes even Sydney-class intercontinental links at the
-    **median** (p50 232 ms), with the **p99 (278 ms) just over** at that extreme distance because of
-    network tail variance. Nearer wide-area links clear it comfortably at both. The warm-pool condition is
-    what a continuously-loaded server holds naturally; guaranteeing it under bursty load (an explicitly
-    maintained keep-alive pool sized to the hydrate concurrency) is the remaining transport step, and it is
-    infrastructure, not algorithm. The cold-pool first-wake-after-idle is ~2.3 RTT, and the cold
-    *first-ever* wake stays ~4 RTT regardless. An **airgap** deployment does not wake from object storage
-    at all (it runs on local storage), so this bound does not apply to it.
+  - **The warm pool closes the cold-start gap (v1.5.0).** "Warm pool" is no longer a condition to hope
+    for: `substrate::WarmPool` (`RemoteTier::spawn_warm_pool`) holds `min_idle` keep-alive connections
+    open, so a wake after an idle gap finds them warm. Measured wide-area (Sydney): a cold-start hot
+    re-wake with **no pool is 2.88 RTT** (p50 499 ms — the handshake tax), and **with the pool ~1 RTT at
+    the median** (p50 179 ms) — but the **p99 stays ~2 RTT** (345 ms), a second round-trip the tail can
+    still pay at this extreme distance. So, scoped with the same median-vs-tail honesty as the hot/cold
+    number above: the warm pool **removes the cold-start handshake tax and delivers ~1 RTT at the median
+    even to the most extreme link**; the **p99 tail can still pay a second RTT**, and **bursts beyond
+    `min_idle` pay handshakes** (default sized to the hydrate width; no real burst profile yet to size it
+    larger). This hands off cleanly to topology below: in a realistic **in-region** deployment
+    (single-digit-ms RTT), even 2 RTT is comfortably under 250 ms at p99 — the tail only bites cross-planet.
+  - **What that means for the 250 ms bar — it is TOPOLOGY, not code.** With a warm pool the wake is
+    **≈ 1 RTT to your object store**, and no code beats the speed of light: whether 1 RTT clears 250 ms is
+    a function of *distance*. So the honest SLA is exactly that — **"wake ≈ 1 RTT to your object store"** —
+    and the deployment recommendation follows: **co-locate the object tier in-region** with the LoomDB
+    server, where RTT is single-digit-to-low-tens-of-ms and **even the ~2 RTT p99 tail clears 250 ms with
+    wide margin**. The Sydney numbers here are a *deliberately extreme* worst case — server and object
+    store on opposite sides of the planet — chosen to show the floor, not a topology anyone should run: at
+    that distance the **median** clears 250 ms and the **p99 (~345 ms) does not**, which is geography, not
+    an engine gap — and it is precisely the tail the in-region recommendation removes. For a
+    genuinely global fleet, a **regional object-cache tier** (a future feature, not built speculatively)
+    would keep wake ~1 RTT everywhere. The cold *first-ever* wake stays ~4 RTT regardless (the serial
+    chain walk, until the ids are known). An **airgap** deployment does not wake from object storage at all
+    (local storage), so none of this applies to it.
 - **Signature verification is opt-in, and key distribution is not solved here.** With an actor registry,
   every write is signed and verified (AT-026); without one, writes are attributable but not
   authenticated. Where keys come from, how they rotate, and how a compromised one is revoked is out of
