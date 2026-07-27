@@ -174,17 +174,71 @@ fn ann_search_never_returns_a_siblings_vectors() {
     db.build_ann_index(&ltok, &left).unwrap();
     db.build_ann_index(&rtok, &right).unwrap();
 
-    // A query on left must return only L/ keys — never an R/ key.
+    // A query on left must return only L/ keys — never an R/ key. Both retrieval surfaces are checked:
+    // the ANN graph search AND the exact scan, since each is a distinct path that reads the branch fork.
     let q = rv(&mut rng, DIM);
-    for key in db.search_ann(&ltok, &left, &q, 20).unwrap() {
-        let s = String::from_utf8_lossy(&key);
-        assert!(
-            s.starts_with("L/"),
-            "LEAK: left's ANN search returned {s}, a sibling's vector. The index is not isolated."
-        );
+    for search in ["ann", "scan"] {
+        let left_hits = match search {
+            "ann" => db.search_ann(&ltok, &left, &q, 20).unwrap(),
+            _ => db.search_scan(&ltok, &left, &q, 20).unwrap(),
+        };
+        for key in left_hits {
+            let s = String::from_utf8_lossy(&key);
+            assert!(
+                s.starts_with("L/"),
+                "LEAK ({search}): left's search returned {s}, a sibling's vector. Not isolated."
+            );
+        }
+        let right_hits = match search {
+            "ann" => db.search_ann(&rtok, &right, &q, 20).unwrap(),
+            _ => db.search_scan(&rtok, &right, &q, 20).unwrap(),
+        };
+        for key in right_hits {
+            let s = String::from_utf8_lossy(&key);
+            assert!(
+                s.starts_with("R/"),
+                "LEAK ({search}): right's search returned {s}"
+            );
+        }
     }
-    for key in db.search_ann(&rtok, &right, &q, 20).unwrap() {
-        let s = String::from_utf8_lossy(&key);
-        assert!(s.starts_with("R/"), "LEAK: right's ANN search returned {s}");
+}
+
+/// **`search_scan` is exact — it returns precisely the brute-force top-k, and needs no built index.**
+///
+/// The exact fallback the ANN is measured against (`benches/ann_vs_scan.rs`). It scores every index
+/// entry, so it is correct-by-construction; this pins that down against an independent in-RAM brute force
+/// (set-equality, not merely recall ≥ floor) and confirms it works with no `build_ann_index` first —
+/// index entries carry their embedding whether or not a graph was ever folded.
+#[test]
+fn search_scan_returns_the_exact_top_k() {
+    const DIM: usize = 24;
+    const K: usize = 10;
+    let n = 200;
+
+    let db = Loom::in_memory(TenantId::new("acme"))
+        .unwrap()
+        .with_clock(|| NOW);
+    let (session, token) = db.open_session().unwrap();
+    let branch = session.branch.clone();
+    let mut rng = Rng(4242);
+    let items = seed(&db, &token, &branch, &session.id, &mut rng, n, DIM);
+
+    // No build_ann_index: search_scan reads the index entries directly.
+    for _ in 0..15 {
+        let q = rv(&mut rng, DIM);
+        let mut exact: Vec<(&Vec<u8>, f32)> = items
+            .iter()
+            .filter_map(|(k, v)| q.cosine(v).map(|c| (k, c)))
+            .collect();
+        exact.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap());
+        let truth: std::collections::HashSet<Vec<u8>> =
+            exact.iter().take(K).map(|(k, _)| (*k).clone()).collect();
+
+        let got: std::collections::HashSet<Vec<u8>> = db
+            .search_scan(&token, &branch, &q, K)
+            .unwrap()
+            .into_iter()
+            .collect();
+        assert_eq!(got, truth, "search_scan did not return the exact top-{K}");
     }
 }

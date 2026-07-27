@@ -545,6 +545,55 @@ impl Loom {
         Ok(scored.into_iter().map(|(id, _)| id).collect())
     }
 
+    /// **Exact nearest-neighbour retrieval by full scan — the ground-truth fallback ANN accelerates.**
+    ///
+    /// Scores *every* indexed vector on the branch (each `IndexEntry`'s embedding — index entries retain
+    /// their embedding for every indexed record, folded or not, since they are what a rebuild reads) by
+    /// cosine against `query`, and returns the exact top-`k` record keys best-first. Being exhaustive it
+    /// is **exact** — the same ground truth the recall oracle uses — at O(indexed) per query, which is the
+    /// cost `search_ann` exists to accelerate. Same one-fork read and the same branch isolation as
+    /// `search_ann` (a sibling's vectors live in a different tree — AT-040). Empty if nothing was indexed.
+    ///
+    /// This is the "exact fallback" the ANN is measured against ([`build_ann_index`](Self::build_ann_index));
+    /// which of the two is the default retrieval path is a decision read off their measured crossover
+    /// (`benches/ann_vs_scan.rs`), not asserted.
+    pub fn search_scan(
+        &self,
+        token: &CapabilityToken,
+        branch: &BranchId,
+        query: &loom_core::Embedding,
+        k: usize,
+    ) -> Result<Vec<Key>> {
+        self.issuer.authorize(token, branch, self.now())?;
+
+        let head = self.head(branch)?;
+        let store = self.pager.fork(&head)?;
+        let mut tree = Tree::open(&*store)?;
+
+        let mut scored: Vec<(Key, f32)> = Vec::new();
+        for (key, record) in tree.scan()? {
+            if !key.starts_with(loom_core::RESERVED_INDEX_PREFIX) {
+                continue;
+            }
+            let Record::Value(Value::Blob(bytes)) = record else {
+                continue;
+            };
+            let entry = IndexEntry::decode(&bytes).map_err(|source| LoomError::Codec {
+                op: "decode",
+                what: "index entry",
+                source,
+            })?;
+            if let Some(emb) = entry.embedding {
+                if let Some(sim) = query.cosine(&emb) {
+                    scored.push((entry.key, sim));
+                }
+            }
+        }
+        scored.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+        scored.truncate(k);
+        Ok(scored.into_iter().map(|(id, _)| id).collect())
+    }
+
     /// The commit a branch currently points at.
     pub fn head(&self, branch: &BranchId) -> Result<CommitId> {
         self.refs()

@@ -56,3 +56,7 @@ harness = false
 [[bench]]
 name = "ann_amplification"
 harness = false
+
+[[bench]]
+name = "ann_vs_scan"
+harness = false

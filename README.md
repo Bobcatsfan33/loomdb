@@ -99,9 +99,14 @@ writes and quietly omits the account it suspended is not an audit tool — it's 
 We would rather you find these here than in an evaluation. None affects correctness; each is a cost or a
 bound stated plainly.
 
-- **Retrieval's default is an O(entries) scan; the per-branch HNSW index builds in O(N·log N)
-  (v0.3, measured).** The scan is *correct* and branch-isolated (the load-bearing property,
-  oracle-checked). The **HNSW** index accelerates queries and is kept **in the branch**, never a shared
+- **Retrieval's default is an O(entries) scan below a measured ~20k-vector crossover; the per-branch HNSW
+  index accelerates past it and builds in O(N·log N) (v0.3, measured).** The scan is *correct*, exact, and
+  branch-isolated (the load-bearing property, oracle-checked), and a latency bench
+  (`crates/loom-branch/benches/ann_vs_scan.rs`) shows it is also *faster* than the ANN below ~20k indexed
+  vectors (in-memory, DIM=64) — so scan stays the default for small/medium branches, and the accelerator
+  earns its keep at scale (2.6× at 50k, widening); "ANN whenever an index exists" would be 6× slower at
+  1k. (In-memory is the conservative case for the ANN — on object storage the scan's O(N) page reads move
+  the crossover left.) The **HNSW** index is kept **in the branch**, never a shared
   index that would reintroduce the cross-branch leak the isolation was designed out ([invariant
   I-11](docs/invariants.md)), with recall@10 ≥ 0.85 proven against the exact scan. **v0.3 made the build
   scale:** it builds the graph in RAM (unit-normalized vectors, a bare-dot distance, an epoch-tagged
