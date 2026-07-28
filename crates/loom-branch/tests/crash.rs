@@ -29,6 +29,14 @@
 //!   `AT045_STRIDE=1`: **both sweeps green** (`at_045_crash_at_any_byte_recovers_to_a_prefix` and
 //!   `at_045_crash_during_fold_never_loses_a_vector`, every byte). The write path is no longer
 //!   byte-identical to v0.3 — it is *fully re-certified*, which is the property that matters.
+//! - **Phase 2 — the log-structured ref store** (a commit now *appends* a `RefEdit` frame to `refs.log`
+//!   instead of rewriting the whole `Refs`, with periodic compaction into `refs.snapshot`). The entire
+//!   ref write path changed, so all three sweeps were re-driven at `AT045_STRIDE=1` — **every byte,
+//!   green (82.8 s)**: `at_045_crash_at_any_byte_recovers_to_a_prefix` (the append path),
+//!   `at_045_crash_during_fold_never_loses_a_vector`, and the new
+//!   `at_045_crash_during_ref_compaction_recovers_to_a_prefix` (a crash at every byte of a
+//!   snapshot-write-then-log-truncate compaction — the snapshot is durable before the log is cut, so
+//!   recovery always has a consistent baseline and replays the already-incorporated log as no-ops).
 
 use std::sync::Arc;
 
@@ -54,6 +62,27 @@ fn loom_on(vfs: Arc<dyn Vfs>, tenant: &str) -> Result<Loom, Box<dyn std::error::
         Arc::new(ManualClock::new(NOW)),
     )?;
     let refs = FileRefStore::open_with_vfs(vfs, "/db")?;
+    Ok(Loom::on(Arc::new(pager), Arc::new(refs), TenantId::new(tenant))?.with_clock(|| NOW))
+}
+
+/// Like [`loom_on`], but with a **low ref-log compaction floor**, so a compaction happens every few
+/// commits and the byte sweep can crash *during* one. The compaction logic is identical to production;
+/// only the trigger threshold moves (see `FileRefStore::with_compact_floor`).
+fn loom_on_low_floor(
+    vfs: Arc<dyn Vfs>,
+    tenant: &str,
+    floor: u64,
+) -> Result<Loom, Box<dyn std::error::Error>> {
+    let pager = Pager::open_with(
+        vfs.clone(),
+        "/db",
+        StoreConfig {
+            pool: tenant.to_string(),
+            ..Default::default()
+        },
+        Arc::new(ManualClock::new(NOW)),
+    )?;
+    let refs = FileRefStore::open_with_vfs(vfs, "/db")?.with_compact_floor(floor);
     Ok(Loom::on(Arc::new(pager), Arc::new(refs), TenantId::new(tenant))?.with_clock(|| NOW))
 }
 
@@ -324,6 +353,125 @@ fn at_045_crash_during_fold_never_loses_a_vector() {
             Err(_) => Vec::new(),
         };
         verify_fold_recovery(disk, &acked);
+        budget += stride;
+    }
+}
+
+// ── AT-045 over a ref-log COMPACTION: the snapshot-then-truncate handoff survives a crash at any byte ──
+
+/// A low floor so a handful of commits provoke several compactions — small enough that the every-byte
+/// sweep stays tractable, large enough to hold a couple of edits per compaction cycle.
+const COMPACTION_TEST_FLOOR: u64 = 300;
+
+/// Write enough records on `main` that the ref log compacts several times over. Each write is a commit
+/// (a `SetHead` + `RecordCommit` edit), so with a ~300-byte floor a compaction lands every few writes —
+/// squarely inside the swept byte range. Returns the acknowledged `(branch, key)` writes.
+fn run_compaction_workload(db: &Loom) -> Vec<Ack> {
+    let mut acked = Vec::new();
+    let Ok((session, token)) = db.open_session() else {
+        return acked;
+    };
+    let main = session.branch.clone();
+    let sid = session.id.clone();
+    for i in 0..15 {
+        let key = format!("c/{i:02}").into_bytes();
+        let record = if i % 2 == 0 {
+            observation(&format!("c{i}"))
+        } else {
+            claim(&format!("c{i}"))
+        };
+        if db
+            .write(&token, &main, key.clone(), record, &env(&sid, &main))
+            .is_err()
+        {
+            return acked;
+        }
+        acked.push(Ack {
+            branch: main.clone(),
+            key,
+        });
+    }
+    acked
+}
+
+/// Reopen (with the same low floor) and confirm every acknowledged write survived — the exact prefix
+/// guarantee, but exercised across ref-log compactions that a crash may have interrupted mid-snapshot or
+/// mid-truncate.
+fn verify_compaction_recovery(disk: Arc<MemVfs>, acked: &[Ack]) {
+    let db = loom_on_low_floor(reboot(disk), "acme", COMPACTION_TEST_FLOOR).expect(
+        "a rebooted database must REOPEN after a mid-compaction crash — the new snapshot is durable \
+         before the log is truncated, so recovery always has a consistent baseline (I-8)",
+    );
+    for ack in acked {
+        let head = db.head(&ack.branch).unwrap_or_else(|_| {
+            panic!(
+                "AT-045/compaction: acknowledged branch {:?} gone after recovery",
+                ack.branch
+            )
+        });
+        let store = db
+            .pager_for_debug()
+            .fork(&head)
+            .expect("AT-045/compaction: recovered head is not a readable manifest — torn state");
+        let mut tree = loom_branch::Tree::open(&*store)
+            .expect("AT-045/compaction: recovered tree does not open — torn state");
+        assert!(
+            tree.get(&ack.key)
+                .expect("AT-045/compaction: reading an acknowledged key errored — torn state")
+                .is_some(),
+            "AT-045/compaction: acknowledged write {:?} lost across a ref-log compaction",
+            String::from_utf8_lossy(&ack.key)
+        );
+    }
+}
+
+/// **A ref-log compaction survives a crash at every byte boundary.** The workload compacts the ref log
+/// several times; the sweep crashes at each byte, including mid-snapshot-write and mid-truncate, and every
+/// acknowledged write must still be present — the snapshot-before-truncate ordering plus idempotent replay
+/// leave no window in which a committed head is lost.
+#[test]
+fn at_045_crash_during_ref_compaction_recovers_to_a_prefix() {
+    let (probe_disk, probe_vfs) = crashing_mem_vfs(i64::MAX);
+    let total_bytes = {
+        let db = loom_on_low_floor(probe_vfs.clone(), "acme", COMPACTION_TEST_FLOOR).unwrap();
+        let acked = run_compaction_workload(&db);
+        assert!(
+            acked.len() >= 15,
+            "the full compaction workload should acknowledge all writes with an unlimited budget"
+        );
+        // Prove a compaction actually happened: without one, the snapshot is still just the rooted `main`
+        // (an empty commit DAG) and every commit edge lives only in the log. A snapshot that has folded in
+        // commit edges is a snapshot a compaction rewrote.
+        let snap = loom_branch::Refs::decode(
+            &probe_vfs
+                .read(std::path::Path::new("/db/loom/refs.snapshot"))
+                .expect("snapshot exists after the workload"),
+        )
+        .expect("snapshot decodes");
+        assert!(
+            !snap.commits.is_empty(),
+            "the workload must trigger a compaction (the snapshot should have folded in commit edges, \
+             but its DAG is empty — nothing compacted)"
+        );
+        drop(db);
+        i64::MAX - probe_vfs.remaining()
+    };
+    drop(probe_disk);
+    assert!(total_bytes > 0, "the workload must write something");
+
+    let stride: i64 = std::env::var("AT045_STRIDE")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or_else(|| (total_bytes / 200).max(1));
+
+    let mut budget = 0i64;
+    while budget <= total_bytes {
+        let (disk, vfs) = crashing_mem_vfs(budget);
+        let acked = match loom_on_low_floor(vfs.clone(), "acme", COMPACTION_TEST_FLOOR) {
+            Ok(db) => run_compaction_workload(&db),
+            Err(_) => Vec::new(),
+        };
+        verify_compaction_recovery(disk, &acked);
         budget += stride;
     }
 }

@@ -42,7 +42,7 @@ pub use merge::{
     is_reserved, plan_merge, MergeConflict, MergeConflictReport, MergeOutcome, MergePolicy,
     Resolution, RESERVED_PREFIX,
 };
-pub use refs::{FileRefStore, MemRefStore, RefStore, Refs, REFS_FORMAT_VERSION};
+pub use refs::{FileRefStore, MemRefStore, RefEdit, RefStore, Refs, REFS_FORMAT_VERSION};
 pub use session::ReadSet;
 pub use session::{Loom, MergeResult, SessionHandle, DEFAULT_SESSION_TTL_MS, MAIN};
 pub use sleep::LoomWakeToken;

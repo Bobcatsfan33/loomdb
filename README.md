@@ -143,8 +143,12 @@ bound stated plainly.
   never neither (AT-045 over the fold) — and the fold racing appends and searches loses nothing and
   double-indexes nothing (a wake-class concurrency gate). Fresh vectors are now live, not an explicit-build
   snapshot.
-- **The refs file is rewritten in full on every commit** — O(branches), not O(1). Invisible against
-  database *size*; it will show on a tenant with a great many branches.
+- ~~**The refs file is rewritten in full on every commit** — O(branches).~~ **RETIRED (Phase 2):** refs
+  are now **log-structured** — a commit *appends* one `RefEdit` frame (`refs.log`), folded into a
+  `refs.snapshot` by periodic compaction. Per-commit cost went from **41 ms and a 12.4 MB rewrite at 100k
+  branches to ~1.4 ms flat** (O(branches) → O(1), measured `benches/refs_scaling.rs`); recovery reads the
+  snapshot once (~40 ms at 100k). The full ref write path was re-certified at `AT045_STRIDE=1` — every
+  byte, including a crash mid-compaction (`docs/refs-design.md`, `tests/crash.rs`).
 - **Wake-over-object-storage wide-area p99 > 250 ms — REFRAMED as topology-bound, not an engine gap.**
   *(This is the disposition of the v0.1 "wake p99 exceeds the 250 ms bar over a wide-area link" known-limit
   — restated here, not silently dropped, so an evaluator who read the v0.1 list finds where it went. The

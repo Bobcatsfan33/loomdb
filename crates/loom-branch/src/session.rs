@@ -14,7 +14,7 @@
 //! A bypassable audit trail is worse than none, because it is believed.
 
 use crate::merge::{is_reserved, merged_from_key, plan_merge, MergeOutcome, MergePolicy};
-use crate::refs::{FileRefStore, MemRefStore, RefStore, Refs};
+use crate::refs::{FileRefStore, MemRefStore, RefEdit, RefStore, Refs};
 // Only the gated `sleep`/`wake` methods name this type; unused in an airgap build.
 #[cfg(feature = "remote")]
 use crate::sleep::LoomWakeToken;
@@ -138,6 +138,12 @@ pub struct Loom {
     /// negotiable: the manifest is durable **before** the ref that points at it (see `refs.rs`).
     refs: Mutex<Refs>,
     store: Arc<dyn RefStore>,
+    /// **Ref changes not yet flushed to the store**, in the order they happened. A mutation records both
+    /// its in-memory change (to `refs`) and the matching [`RefEdit`] here; `persist` drains them in one
+    /// fsync'd append, so a commit costs O(edits), not O(branches). Drained on every `persist`, and every
+    /// commit flow ends in a `persist`, so an edit is never durable-lost while its in-memory change is
+    /// applied — both become durable together at the append.
+    ref_edits: Mutex<Vec<RefEdit>>,
     /// **The engine-captured read-set** (AT-002).
     ///
     /// Everything a session has read since its last write. The *next* write is derived from all of
@@ -230,6 +236,7 @@ impl Loom {
             actor_keys: None,
             refs: Mutex::new(refs),
             store,
+            ref_edits: Mutex::new(Vec::new()),
             read_sets: Mutex::new(BTreeMap::new()),
             write_lock: Mutex::new(()),
             issuer: TokenIssuer::generate(),
@@ -257,15 +264,28 @@ impl Loom {
         self.refs.lock().unwrap_or_else(|e| e.into_inner())
     }
 
-    /// Persist the refs. **Called after the manifest is already durable, never before.**
+    /// Queue a ref change to be flushed at the next `persist`. The in-memory `refs` is mutated by the
+    /// caller; this records the matching durable delta.
+    fn push_edit(&self, edit: RefEdit) {
+        self.ref_edits
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .push(edit);
+    }
+
+    /// Persist the queued ref changes. **Called after the manifest is already durable, never before.**
     ///
-    /// A crash between the two leaves the refs pointing at the old head and the new manifest
-    /// unreferenced — a lost commit, which GC sweeps. The other ordering would leave a ref pointing
-    /// at a manifest that does not exist, which is a corrupt database. Losing the last transaction
-    /// is recoverable; dangling into the void is not.
+    /// Drains the pending [`RefEdit`]s and appends them to the log in one fsync — O(edits), not
+    /// O(branches). A crash between the manifest commit and this append leaves the refs pointing at the
+    /// old head and the new manifest unreferenced — a lost commit, which GC sweeps. The other ordering
+    /// would leave a ref pointing at a manifest that does not exist, which is a corrupt database. Losing
+    /// the last transaction is recoverable; dangling into the void is not.
     fn persist(&self) -> Result<()> {
-        let refs = self.refs().clone();
-        self.store.save(&refs)
+        let edits = {
+            let mut pending = self.ref_edits.lock().unwrap_or_else(|e| e.into_inner());
+            std::mem::take(&mut *pending)
+        };
+        self.store.apply(&edits)
     }
 
     /// Record a commit's parents. A merge has two; everything else has one.
@@ -276,7 +296,21 @@ impl Loom {
         if parents.is_empty() {
             return;
         }
-        self.refs().commits.entry(commit).or_insert(parents);
+        // Match `or_insert`: only the FIRST recording of a commit's parents takes, and only then is a
+        // durable edit queued — so replaying the log cannot revert a merge's parent set to a single one.
+        let inserted = {
+            let mut refs = self.refs();
+            match refs.commits.entry(commit) {
+                std::collections::btree_map::Entry::Occupied(_) => false,
+                std::collections::btree_map::Entry::Vacant(slot) => {
+                    slot.insert(parents.clone());
+                    true
+                }
+            }
+        };
+        if inserted {
+            self.push_edit(RefEdit::RecordCommit { commit, parents });
+        }
     }
 
     /// Where a branch currently points.
@@ -620,6 +654,10 @@ impl Loom {
             }
             refs.branches.insert(name.to_string(), at);
         }
+        self.push_edit(RefEdit::CreateBranch {
+            name: name.to_string(),
+            at,
+        });
         self.persist()
     }
 
@@ -635,6 +673,10 @@ impl Loom {
             };
             *slot = to;
         }
+        self.push_edit(RefEdit::SetHead {
+            branch: branch.as_str().to_string(),
+            to,
+        });
         self.persist()
     }
 
@@ -1196,13 +1238,21 @@ impl Loom {
         // why it must be durable: losing it across a restart silently restores the double-counting
         // bug (merge twice, and a +3 becomes a +6, and the merge reports success).
         self.record_commit(commit, vec![before, second_parent]);
-        {
+        let added = {
             let mut refs = self.refs();
-            if let Some(parents) = refs.commits.get_mut(&commit) {
-                if !parents.contains(&second_parent) {
+            match refs.commits.get_mut(&commit) {
+                Some(parents) if !parents.contains(&second_parent) => {
                     parents.push(second_parent);
+                    true
                 }
+                _ => false,
             }
+        };
+        if added {
+            self.push_edit(RefEdit::AddParent {
+                commit,
+                parent: second_parent,
+            });
         }
         self.persist()?;
         Ok(commit)

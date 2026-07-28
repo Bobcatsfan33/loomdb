@@ -1,26 +1,27 @@
 //! **The refs before/after: how a single commit's ref-write scales with branch count.**
 //!
-//! The known-limit: `FileRefStore::save` bincode-serializes the **entire** `Refs` — every branch, every
-//! tag, and the whole commit DAG — and atomic-writes it (temp → fsync → rename → fsync dir) on **every**
-//! commit (`set_head` → `persist` → `save`). So each commit costs O(branches + commits), not O(1). This
-//! bench is the *before* number Phase 2 improves on, published on the same axes as the *after* (guardrail
-//! 5): the deliverable is the curve, not an assertion that the curve is bad.
+//! *Before* (pre-Phase-2, recorded in `docs/refs-design.md` and commit `f4ff820`): every commit
+//! serialized the **entire** `Refs` and atomic-wrote it — O(branches + commits), 41 ms and a 12.4 MB
+//! rewrite at 100k branches.
 //!
-//! It measures, at 10 / 1 000 / 100 000 branches (a linear commit DAG of the same size — commits
-//! accumulate too):
-//! - **save** — one `FileRefStore::save`, the exact per-commit ref cost (fsync'd, the real durability
-//!   cost). The substrate manifest commit on top is O(1), a constant offset this isolates away.
-//! - **load** — one `FileRefStore::load`, the cost paid once at startup/recovery (feeds Phase 2's
-//!   "recovery time at 100k branches" measurement).
-//! - **bytes** — the encoded size, the thing being rewritten every commit.
+//! *After* (this bench, the log-structured store): a commit is **one appended [`RefEdit`] frame**,
+//! `FileRefStore::apply` — O(1), independent of branch count. Compaction (`save`, the full snapshot) is
+//! still O(branches), but it is amortized: it runs only when the log outgrows the snapshot, not per
+//! commit. Measured at 10 / 1 000 / 100 000 branches, fsync'd, on-disk, median:
 //!
-//! `cargo bench -p loom-branch --bench refs_scaling`  (100k writes ~11 MB × the sample count — a few
-//! seconds; that cost, paid once per commit, is the whole point).
+//! - **apply** — one per-commit `RefEdit` append. THE number: this is what a commit now pays, and it must
+//!   stay flat as branches grow (vs the old `save` climbing to 41 ms).
+//! - **save** — one full-snapshot write (compaction). Still O(branches), shown for honesty — it is the
+//!   amortized cost, not the per-commit cost.
+//! - **load** — one `load` (snapshot + replayed log): the recovery/startup read at this branch count
+//!   (acceptance bar (e), "recovery time at 100k branches").
+//!
+//! `cargo bench -p loom-branch --bench refs_scaling`
 
 use std::path::PathBuf;
 use std::time::Instant;
 
-use loom_branch::{FileRefStore, RefStore, Refs};
+use loom_branch::{FileRefStore, RefEdit, RefStore, Refs};
 use loom_core::CommitId;
 
 /// A distinct 32-byte commit id derived from `i` (SplitMix64-filled, no RNG state needed).
@@ -39,13 +40,11 @@ fn cid(i: u64) -> CommitId {
 }
 
 /// A `Refs` with `n` branches and an `n`-commit linear DAG — the shape after `n` commits across `n`
-/// branches, which is what a single further commit must rewrite in full.
+/// branches, seeded as the snapshot so `apply`/`save`/`load` are measured at that scale.
 fn refs_with(n: usize) -> Refs {
     let mut refs = Refs::rooted("main", cid(0));
     for i in 1..n as u64 {
         refs.branches.insert(format!("branch-{i:08}"), cid(i));
-        // Linear history: commit i's parent is commit i-1. A real DAG is a mix, but the size — one
-        // entry per commit — is what the full-file rewrite pays, and that is identical.
         refs.commits.insert(cid(i), vec![cid(i - 1)]);
     }
     refs
@@ -75,13 +74,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .and_then(|s| s.parse().ok())
         .unwrap_or(21);
 
-    println!("\n=== Current refs: per-commit save + recovery load vs branch count (fsync'd, on-disk) ===");
-    println!("    the full-file rewrite every commit pays. {samples} samples, median.\n");
+    println!("\n=== Log-structured refs (AFTER): per-commit apply vs compaction save vs recovery load ===");
+    println!("    fsync'd, on-disk, {samples} samples, median. before: save was 4.5/4.4/41.0 ms @ 10/1k/100k.\n");
     println!(
-        "{:>10}  {:>12}  {:>14}  {:>14}",
-        "branches", "encoded", "save med (ms)", "load med (ms)"
+        "{:>10}  {:>12}  {:>15}  {:>15}  {:>14}",
+        "branches", "snapshot", "apply med (ms)", "save med (ms)", "load med (ms)"
     );
-    println!("{}", "-".repeat(56));
+    println!("{}", "-".repeat(74));
 
     for &n in &sizes {
         let refs = refs_with(n);
@@ -89,15 +88,31 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
         let dir = bench_dir(&format!("n{n}"));
         let store = FileRefStore::open(&dir)?;
+        store.save(&refs)?; // seed the snapshot at this scale (also the first compaction baseline)
 
-        // Warm one write so the file exists (atomic_write rename target), then sample.
-        store.save(&refs)?;
+        // apply: the per-commit cost — one SetHead append. With an N-branch snapshot the compaction floor
+        // is well above a handful of small frames, so these samples never trigger a compaction; this is
+        // the pure per-commit append + fsync, which must stay flat as N grows.
+        let mut apply_ms = Vec::with_capacity(samples);
+        for s in 0..samples {
+            let edit = RefEdit::SetHead {
+                branch: "main".into(),
+                to: cid(1_000_000 + s as u64),
+            };
+            let t = Instant::now();
+            store.apply(std::slice::from_ref(&edit))?;
+            apply_ms.push(t.elapsed().as_secs_f64() * 1000.0);
+        }
+
+        // save: the compaction cost (full snapshot) — still O(branches), shown for honesty.
         let mut save_ms = Vec::with_capacity(samples);
         for _ in 0..samples {
             let t = Instant::now();
             store.save(&refs)?;
             save_ms.push(t.elapsed().as_secs_f64() * 1000.0);
         }
+
+        // load: recovery read (snapshot + replay).
         let mut load_ms = Vec::with_capacity(samples);
         for _ in 0..samples {
             let t = Instant::now();
@@ -108,15 +123,19 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         let _ = std::fs::remove_dir_all(&dir);
 
         println!(
-            "{n:>10}  {:>12}  {:>14.3}  {:>14.3}",
+            "{n:>10}  {:>12}  {:>15.3}  {:>15.3}  {:>14.3}",
             format!("{:.1} KB", bytes as f64 / 1024.0),
+            median(apply_ms),
             median(save_ms),
             median(load_ms),
         );
     }
 
     println!("\nReading the result:");
-    println!("  save grows with branches+commits — every commit rewrites the whole file, fsync'd. That is");
-    println!("  the O(branches) per-commit tax Phase 2 removes; the 'after' bench prints on these same axes.");
+    println!("  apply is the per-commit cost now — it must stay ~flat as branches grow (the old save climbed");
+    println!("  to 41 ms at 100k). save is compaction, amortized (runs when the log outgrows the snapshot,");
+    println!(
+        "  not per commit). load is the recovery read at that branch count (acceptance bar e)."
+    );
     Ok(())
 }
