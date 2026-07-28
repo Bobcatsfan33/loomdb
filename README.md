@@ -202,6 +202,11 @@ bound stated plainly.
     would keep wake ~1 RTT everywhere. The cold *first-ever* wake stays ~4 RTT regardless (the serial
     chain walk, until the ids are known). An **airgap** deployment does not wake from object storage at all
     (local storage), so none of this applies to it.
+- **One `Loom` per store directory — no cross-process lock.** The ref store serializes concurrent access
+  *within* a process (which is what makes log compaction safe against concurrent appends), but there is no
+  lock file, so two OS processes opening the same database directory would race on the ref log. The
+  contract is single-process, the same assumption an embedded SQLite/LMDB makes; an advisory lock file
+  would enforce it and is not yet built.
 - **Signature verification is opt-in, and key distribution is not solved here.** With an actor registry,
   every write is signed and verified (AT-026); without one, writes are attributable but not
   authenticated. Where keys come from, how they rotate, and how a compromised one is revoked is out of

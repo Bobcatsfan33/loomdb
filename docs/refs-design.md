@@ -98,3 +98,21 @@ at startup, and the honest cost of holding 100k branches.
   `at_045_crash_during_ref_compaction_recovers_to_a_prefix`).
 - (e) recovery time at 100k branches — **done, ~40 ms** (table above).
 - (f) README Known-limits refs row retired in the same commit that earns it — **done**.
+
+## Post-verification hardening (review findings F1–F3)
+
+- **F1 (fixed — was a real durable-loss bug).** `apply`'s compaction released the store lock around
+  `reconstruct` (the log read) and re-took it for the truncate. A second thread's *acknowledged* append
+  landing in that window was destroyed by the truncate without being folded into the snapshot — durable
+  loss with **no crash involved**, invisible to the single-threaded crash sweep. Fixed by holding the lock
+  across the whole reconstruct→snapshot→truncate. Guarded by
+  `a_concurrent_append_is_never_destroyed_by_a_compaction` (8 threads, unique branch per append, low floor
+  → constant compaction); it destroyed **785 of 1600** acked appends on the pre-fix code and passes on the
+  fix. Ref-store change ⇒ `AT045_STRIDE=1` re-driven, green.
+- **F2 (documented).** The truncate crash-safety argument — idempotent chronological replay makes the
+  truncate an *optimization* not a correctness step, the POSIX size-flush assumption, and the note that
+  `CrashVfs` models "torn at a byte" not "metadata reordered across files" — is written on
+  `write_snapshot_and_reset_log` in `refs.rs`.
+- **F3 (documented).** The **single-process** assumption (one `Loom` per store directory; the store
+  serializes *within* a process but has no cross-process lock file) is stated on the `RefStore` trait and
+  on the README Known-limits list.

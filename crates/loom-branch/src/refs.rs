@@ -301,6 +301,15 @@ fn frames_decode(buf: &[u8]) -> Vec<RefEdit> {
 ///
 /// Two implementations: a local file (log-structured), and — for a database that has been put to sleep in
 /// object storage — in memory, because the refs travel with the data (see `Loom::sleep`).
+///
+/// # Single-process assumption
+///
+/// A `RefStore` serializes concurrent access **within one process** (an internal `Mutex`), which is what
+/// makes compaction safe against concurrent appends. It does **not** provide cross-process exclusion:
+/// there is no lock file, so two `Loom` instances opened on the same directory by two OS processes would
+/// race on the log and corrupt it. The contract is **one `Loom` per store directory at a time** — the
+/// same single-writer assumption a local embedded database (SQLite without WAL, an LMDB env) makes. This
+/// is on the README Known-limits list until an advisory lock file is added.
 pub trait RefStore: Send + Sync + std::fmt::Debug {
     /// Read the refs. `None` if this is a brand-new database.
     fn load(&self) -> Result<Option<Refs>>;
@@ -451,6 +460,33 @@ impl FileRefStore {
     /// Write a fresh snapshot atomically, then truncate the log — the compaction step, and `save`. The
     /// order is load-bearing: the snapshot is durable *before* the log is cut, so a crash between them
     /// replays the old (already-incorporated) log on the new snapshot as no-ops. Assumes the lock is held.
+    ///
+    /// # Crash-safety of the truncate, and its assumptions (stated so it is on paper)
+    ///
+    /// Three cases, all safe:
+    /// - **Crash before the snapshot's rename commits** — the old snapshot and the whole log are intact;
+    ///   nothing changed, compaction just re-runs next time.
+    /// - **Crash after the snapshot but before the truncate** — the new snapshot is durable and the log is
+    ///   still full; on load the full log replays on the new snapshot, and since every [`RefEdit`] is
+    ///   idempotent/last-write-wins and replay is chronological, the already-incorporated edits are no-ops.
+    ///   **No sequence numbers, and no dependence on the truncate being atomic.**
+    /// - **Crash during the truncate** — the log ends up at some length between old and zero. A shortened
+    ///   log is a *prefix* of the frames (truncation removes from the tail), so it still decodes to a run
+    ///   of whole frames plus at most one torn trailing frame that `frames_decode` discards. Every
+    ///   surviving frame is already in the new snapshot ⇒ replaying it is a no-op.
+    ///
+    /// This rests on two assumptions, both true here but worth naming:
+    /// 1. **`truncate` publishes a smaller size, not reordered content** — the file's tail bytes may still
+    ///    be on disk physically, but the observable length shrinks monotonically and `read` returns only
+    ///    up to that length. POSIX `ftruncate` + the containing-dir fsync the [`Vfs`] does give this; a
+    ///    filesystem that reordered the size-update after unrelated writes could violate it, which is why
+    ///    correctness does **not** lean on the truncate at all (case 2 already covers a not-yet-truncated
+    ///    log) — the truncate is an optimization, not a correctness step.
+    /// 2. **The crash model.** The `AT045_STRIDE=1` sweep drives this through `CrashVfs`, which models a
+    ///    write budget running out mid-operation; it does **not** model a filesystem reordering metadata
+    ///    across unrelated files. The argument above holds regardless because it never requires the
+    ///    truncate to have happened — but the *test* coverage is "torn at a byte", not "metadata
+    ///    reordered", and that distinction is recorded here rather than glossed.
     fn write_snapshot_and_reset_log(&self, refs: &Refs, st: &mut FileState) -> Result<()> {
         let bytes = refs.encode()?;
         self.vfs
@@ -506,10 +542,15 @@ impl RefStore for FileRefStore {
         // Compact once the log has outgrown the snapshot (past a floor), so recovery replay stays bounded
         // by ~one snapshot and write amplification stays ~2×. Reconstruct from our own durable state —
         // the store is the source of truth, it does not need the session's in-memory copy.
+        //
+        // **The whole reconstruct → snapshot → truncate runs under the SAME lock**, never releasing it
+        // between the read and the truncate. Releasing it would open a durable-loss window with no crash
+        // involved: a second thread could append an *acknowledged* frame after `reconstruct` read the log
+        // but before the `truncate`, and that frame — folded into no snapshot — would be destroyed. The
+        // lock is safe to hold here because `reconstruct` takes no lock of its own. A compaction blocks
+        // concurrent appends for its duration (~40 ms at 100k branches), which is the right trade.
         if st.log_bytes > st.snapshot_bytes.max(self.compact_floor) {
-            drop(st);
             let refs = self.reconstruct()?.unwrap_or_default();
-            let mut st = self.lock();
             self.write_snapshot_and_reset_log(&refs, &mut st)?;
         }
         Ok(())
@@ -740,6 +781,55 @@ mod tests {
                 .get("main"),
             Some(&final_head),
             "compaction preserved the latest head exactly"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn a_concurrent_append_is_never_destroyed_by_a_compaction() -> Result<()> {
+        // The F1 regression guard. Compaction reconstructs (reads snapshot+log) then truncates the log;
+        // if that ran without holding the lock, a second thread's *acknowledged* append landing between
+        // the read and the truncate would be wiped — folded into no snapshot, gone. Give every append its
+        // OWN branch, so a single destroyed append is a single missing branch at the end (far more
+        // sensitive than a last-write-wins check, which only catches losing the *latest* head). A low
+        // floor makes compaction fire constantly, maximizing the window the bug lived in.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let store = Arc::new(FileRefStore::open(dir.path())?.with_compact_floor(256));
+        store.save(&Refs::rooted("main", commit(0)))?;
+
+        const THREADS: u64 = 8;
+        const STEPS: u64 = 200;
+        let handles: Vec<_> = (0..THREADS)
+            .map(|t| {
+                let store = Arc::clone(&store);
+                std::thread::spawn(move || {
+                    for s in 0..STEPS {
+                        let mut bytes = [0u8; 32];
+                        bytes[..8].copy_from_slice(&t.to_le_bytes());
+                        bytes[8..16].copy_from_slice(&s.to_le_bytes());
+                        store
+                            .apply(&[RefEdit::CreateBranch {
+                                name: format!("b/{t:02}/{s:04}"),
+                                at: CommitId::from_bytes(bytes),
+                            }])
+                            .expect("apply is acknowledged");
+                    }
+                })
+            })
+            .collect();
+        for h in handles {
+            h.join().expect("worker thread panicked");
+        }
+
+        let refs = store.load()?.expect("refs");
+        let created = (THREADS * STEPS) as usize;
+        let present = refs.branches.keys().filter(|k| k.starts_with("b/")).count();
+        assert_eq!(
+            present,
+            created,
+            "{} of {created} acknowledged appends were destroyed by a concurrent compaction — \
+             the reconstruct→truncate window was not under the lock",
+            created - present
         );
         Ok(())
     }

@@ -37,6 +37,11 @@
 //!   `at_045_crash_during_ref_compaction_recovers_to_a_prefix` (a crash at every byte of a
 //!   snapshot-write-then-log-truncate compaction — the snapshot is durable before the log is cut, so
 //!   recovery always has a consistent baseline and replays the already-incorporated log as no-ops).
+//! - **Phase 2 review fix F1 — compaction now holds the lock across reconstruct→truncate** (a concurrent
+//!   acked append could otherwise be truncated away with no crash). A ref-store change, so all three
+//!   sweeps were re-driven at `AT045_STRIDE=1` — **green again**. The bug itself was a *non-crash*
+//!   concurrency loss, caught by `refs::tests::a_concurrent_append_is_never_destroyed_by_a_compaction`,
+//!   not by this crash sweep — recorded here so the split in coverage is explicit.
 
 use std::sync::Arc;
 
