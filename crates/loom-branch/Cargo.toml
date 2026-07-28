@@ -60,3 +60,7 @@ harness = false
 [[bench]]
 name = "ann_vs_scan"
 harness = false
+
+[[bench]]
+name = "refs_scaling"
+harness = false
