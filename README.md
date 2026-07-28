@@ -218,11 +218,11 @@ The architecture of record lives in the substrate repository:
 
 1. [`docs/03`](https://github.com/Bobcatsfan33/substrate/blob/main/docs/03-agent-native-database-architecture.md) — the architecture
 2. [`docs/05`](https://github.com/Bobcatsfan33/substrate/blob/main/docs/05-loomdb-test-spec.md) — the acceptance catalog (AT-001…AT-047) and the integrity invariants
-4. [`docs/at-map.md`](docs/at-map.md) — which AT-IDs are green (AT-001…047, all of them), with the tests
-5. [`docs/invariants.md`](docs/invariants.md) — the rules that must not be "optimized" away
-6. [`docs/threat-model.md`](docs/threat-model.md) — the security posture, and what LoomDB does not defend against
-7. [`docs/operations.md`](docs/operations.md) — running air-gapped: the offline certification, reproducible, and signed update bundles
-3. [`docs/loom-format.md`](docs/loom-format.md) — the on-page record format
+3. [`docs/at-map.md`](docs/at-map.md) — which AT-IDs are green (AT-001…047, all of them), with the tests
+4. [`docs/invariants.md`](docs/invariants.md) — the rules that must not be "optimized" away
+5. [`docs/threat-model.md`](docs/threat-model.md) — the security posture, and what LoomDB does not defend against
+6. [`docs/operations.md`](docs/operations.md) — running air-gapped: the offline certification, reproducible, and signed update bundles
+7. [`docs/loom-format.md`](docs/loom-format.md) — the on-page record format
 
 ## License
 
