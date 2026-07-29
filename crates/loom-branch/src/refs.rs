@@ -302,14 +302,12 @@ fn frames_decode(buf: &[u8]) -> Vec<RefEdit> {
 /// Two implementations: a local file (log-structured), and — for a database that has been put to sleep in
 /// object storage — in memory, because the refs travel with the data (see `Loom::sleep`).
 ///
-/// # Single-process assumption
+/// # Single-process ownership
 ///
-/// A `RefStore` serializes concurrent access **within one process** (an internal `Mutex`), which is what
-/// makes compaction safe against concurrent appends. It does **not** provide cross-process exclusion:
-/// there is no lock file, so two `Loom` instances opened on the same directory by two OS processes would
-/// race on the log and corrupt it. The contract is **one `Loom` per store directory at a time** — the
-/// same single-writer assumption a local embedded database (SQLite without WAL, an LMDB env) makes. This
-/// is on the README Known-limits list until an advisory lock file is added.
+/// A `RefStore` serializes concurrent access **within one process** with an internal `Mutex`.
+/// [`FileRefStore::open`] also holds an operating-system advisory lock for the lifetime of the store,
+/// so a second process fails closed instead of racing the ref log. A custom VFS opened through
+/// [`FileRefStore::open_with_vfs`] must provide equivalent process ownership at its own boundary.
 pub trait RefStore: Send + Sync + std::fmt::Debug {
     /// Read the refs. `None` if this is a brand-new database.
     fn load(&self) -> Result<Option<Refs>>;
@@ -332,6 +330,8 @@ const LEGACY_REFS_FILE: &str = "refs.bin";
 const SNAPSHOT_FILE: &str = "refs.snapshot";
 /// The append-only delta log.
 const LOG_FILE: &str = "refs.log";
+/// Held with an OS advisory lock for the lifetime of a normal file-backed store.
+const PROCESS_LOCK_FILE: &str = "store.lock";
 /// Compact once the log outgrows the snapshot, with this floor so a tiny database never churns: below it,
 /// replaying the whole log on load costs well under a millisecond, so compaction buys nothing.
 const COMPACT_FLOOR_BYTES: u64 = 256 * 1024;
@@ -345,6 +345,9 @@ pub struct FileRefStore {
     snapshot_path: PathBuf,
     log_path: PathBuf,
     legacy_path: PathBuf,
+    /// The open file owns the cross-process advisory lock until this store is dropped. Custom VFS
+    /// callers own equivalent exclusion themselves and therefore store `None`.
+    _process_lock: Option<std::fs::File>,
     /// The log-size floor below which compaction is skipped. Defaults to [`COMPACT_FLOOR_BYTES`]; the
     /// crash suite lowers it so a compaction can be provoked (and crash-swept) after a handful of edits
     /// rather than a quarter-megabyte of them. The compaction *logic* is identical either way.
@@ -362,12 +365,44 @@ struct FileState {
 impl FileRefStore {
     /// Open (creating the directory if absent) a ref store under a database root.
     pub fn open(root: impl AsRef<Path>) -> Result<Self> {
-        FileRefStore::open_with_vfs(std_vfs(), root)
+        use fs2::FileExt as _;
+
+        let root = root.as_ref();
+        let dir = root.join("loom");
+        std::fs::create_dir_all(&dir).map_err(|e| LoomError::CorruptNode {
+            page: 0,
+            detail: format!("cannot create the refs directory {}: {e}", dir.display()),
+        })?;
+        let lock_path = dir.join(PROCESS_LOCK_FILE);
+        let process_lock = std::fs::OpenOptions::new()
+            .create(true)
+            .read(true)
+            .write(true)
+            .truncate(false)
+            .open(&lock_path)
+            .map_err(|e| LoomError::CorruptNode {
+                page: 0,
+                detail: format!("cannot open the process lock {}: {e}", lock_path.display()),
+            })?;
+        process_lock
+            .try_lock_exclusive()
+            .map_err(|_| LoomError::StoreInUse {
+                path: root.display().to_string(),
+            })?;
+        FileRefStore::open_inner(std_vfs(), root, Some(process_lock))
     }
 
     /// Open on a caller-supplied filesystem — which is how the kill-and-restart tests get to cut the
-    /// power in the middle of a ref write.
+    /// power in the middle of a ref write. The caller owns cross-process exclusion for a custom VFS.
     pub fn open_with_vfs(vfs: Arc<dyn Vfs>, root: impl AsRef<Path>) -> Result<Self> {
+        FileRefStore::open_inner(vfs, root, None)
+    }
+
+    fn open_inner(
+        vfs: Arc<dyn Vfs>,
+        root: impl AsRef<Path>,
+        process_lock: Option<std::fs::File>,
+    ) -> Result<Self> {
         let dir = root.as_ref().join("loom");
         vfs.create_dir_all(&dir)
             .map_err(|e| LoomError::CorruptNode {
@@ -378,6 +413,7 @@ impl FileRefStore {
             snapshot_path: dir.join(SNAPSHOT_FILE),
             log_path: dir.join(LOG_FILE),
             legacy_path: dir.join(LEGACY_REFS_FILE),
+            _process_lock: process_lock,
             vfs,
             compact_floor: COMPACT_FLOOR_BYTES,
             state: std::sync::Mutex::new(FileState::default()),
@@ -664,6 +700,19 @@ mod tests {
     }
 
     #[test]
+    fn a_second_file_store_owner_is_refused_until_the_first_drops() -> Result<()> {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let first = FileRefStore::open(dir.path())?;
+
+        let err = FileRefStore::open(dir.path()).expect_err("second owner must fail closed");
+        assert!(matches!(err, LoomError::StoreInUse { .. }));
+
+        drop(first);
+        FileRefStore::open(dir.path()).expect("dropping the owner releases the process lock");
+        Ok(())
+    }
+
+    #[test]
     fn saving_twice_replaces_rather_than_appends() -> Result<()> {
         let dir = tempfile::tempdir().expect("tempdir");
         let store = FileRefStore::open(dir.path())?;
@@ -731,6 +780,7 @@ mod tests {
         bytes.extend_from_slice(&[0u8; 4]); // ...but only 4 follow
         std::fs::write(&log, &bytes).expect("write torn log");
 
+        drop(store);
         let refs = FileRefStore::open(dir.path())?.load()?.expect("refs");
         assert_eq!(
             refs.branches.get("main"),
@@ -773,6 +823,7 @@ mod tests {
             log_len <= COMPACT_FLOOR_BYTES,
             "compaction should keep the log within the floor, but it is {log_len} bytes"
         );
+        drop(store);
         assert_eq!(
             FileRefStore::open(dir.path())?
                 .load()?

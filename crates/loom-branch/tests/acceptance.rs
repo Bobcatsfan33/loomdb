@@ -4,12 +4,16 @@
 //! when the test that would have caught it failing is green.
 
 use ed25519_dalek::{SigningKey, VerifyingKey};
-use loom_branch::{Loom, MergePolicy, MergeResult};
+use loom_branch::{
+    actor_key_fingerprint, ActorRegistryAttestation, Loom, MemRefStore, MergePolicy, MergeResult,
+};
 use loom_core::{
     ActorId, BranchId, Claim, ClaimId, ClaimStatus, Confidence, Interval, LoomError, Method,
     Record, Result, SessionId, SourceRef, TenantId, Timestamp, Value, WriteEnvelope,
 };
 use std::collections::BTreeSet;
+use std::sync::Arc;
+use substrate_pager::{Pager, StoreConfig};
 
 const NOW: u64 = 1_700_000_000_000;
 
@@ -741,6 +745,274 @@ fn at_026_an_unsigned_write_is_refused_when_the_database_authenticates_writers()
     )?;
     assert!(db.read(&token, &session.branch, b"k")?.is_some());
 
+    Ok(())
+}
+
+/// **The production constructor cannot forget authentication or boot with an empty registry.**
+#[test]
+fn at_026_production_construction_requires_and_enforces_actor_keys() -> Result<()> {
+    let empty_path = tempfile::tempdir().expect("temporary database directory");
+    let refused =
+        Loom::open_production(empty_path.path(), TenantId::new("acme"), std::iter::empty());
+    assert!(
+        matches!(refused, Err(LoomError::InvalidSecurityConfiguration { .. })),
+        "production must refuse to construct without at least one trusted actor: {refused:?}"
+    );
+
+    let path = tempfile::tempdir().expect("temporary database directory");
+    let (signing, verifying) = keypair(9);
+    let actor = ActorId::new("agent-1");
+    let db = Loom::open_production(
+        path.path(),
+        TenantId::new("acme"),
+        [(actor.clone(), verifying)],
+    )?
+    .with_clock(|| NOW);
+    let (session, token) = db.open_session()?;
+    let unsigned = WriteEnvelope::new(
+        actor.clone(),
+        session.id.clone(),
+        session.branch.clone(),
+        "unsigned production write",
+    );
+
+    let refused = db.write(
+        &token,
+        &session.branch,
+        b"k".to_vec(),
+        counter(1),
+        &unsigned,
+    );
+    assert!(
+        matches!(refused, Err(LoomError::EnvelopeUnsigned { .. })),
+        "a production database must reject unsigned writes: {refused:?}"
+    );
+
+    let signed = WriteEnvelope::new(
+        actor,
+        session.id.clone(),
+        session.branch.clone(),
+        "authenticated production write",
+    )
+    .signed_by(&signing);
+    db.write(&token, &session.branch, b"k".to_vec(), counter(1), &signed)?;
+    assert_eq!(db.read(&token, &session.branch, b"k")?, Some(counter(1)));
+    Ok(())
+}
+
+/// **Live rotation is atomic; an old key stops working and revocation stops the new one.**
+#[test]
+fn at_026_actor_keys_rotate_and_revoke_without_reopening() -> Result<()> {
+    let (old_signing, old_verifying) = keypair(10);
+    let (new_signing, new_verifying) = keypair(11);
+    let actor = ActorId::new("agent-1");
+    let db = Loom::in_memory(TenantId::new("acme"))?
+        .with_actor_keys([(actor.clone(), old_verifying)])
+        .with_clock(|| NOW);
+    let (session, token) = db.open_session()?;
+
+    let old_envelope = WriteEnvelope::new(
+        actor.clone(),
+        session.id.clone(),
+        session.branch.clone(),
+        "write with the original key",
+    )
+    .signed_by(&old_signing);
+    db.write(
+        &token,
+        &session.branch,
+        b"before-rotation".to_vec(),
+        counter(1),
+        &old_envelope,
+    )?;
+
+    db.rotate_actor_key(actor.clone(), new_verifying)?;
+    let old_after_rotation = db.write(
+        &token,
+        &session.branch,
+        b"old-after-rotation".to_vec(),
+        counter(1),
+        &old_envelope,
+    );
+    assert!(
+        matches!(
+            old_after_rotation,
+            Err(LoomError::EnvelopeSignatureInvalid { .. })
+        ),
+        "the old key remained valid after rotation: {old_after_rotation:?}"
+    );
+
+    let new_envelope = WriteEnvelope::new(
+        actor.clone(),
+        session.id.clone(),
+        session.branch.clone(),
+        "write with the rotated key",
+    )
+    .signed_by(&new_signing);
+    db.write(
+        &token,
+        &session.branch,
+        b"after-rotation".to_vec(),
+        counter(2),
+        &new_envelope,
+    )?;
+
+    assert!(db.revoke_actor_key(&actor)?);
+    let after_revocation = db.write(
+        &token,
+        &session.branch,
+        b"after-revocation".to_vec(),
+        counter(3),
+        &new_envelope,
+    );
+    assert!(
+        matches!(after_revocation, Err(LoomError::UnknownActor { .. })),
+        "the actor remained trusted after revocation: {after_revocation:?}"
+    );
+    Ok(())
+}
+
+/// **A durable production store refuses an actor registry that differs from its external pin.**
+#[test]
+fn at_026_production_restart_requires_the_pinned_actor_registry() -> Result<()> {
+    let path = tempfile::tempdir().expect("temporary database directory");
+    let actor = ActorId::new("agent-1");
+    let (_, original_key) = keypair(12);
+    let (_, unexpected_key) = keypair(13);
+    let expected = actor_key_fingerprint([(actor.clone(), original_key)]);
+
+    let db = Loom::open_production_pinned(
+        path.path(),
+        TenantId::new("acme"),
+        [(actor.clone(), original_key)],
+        &expected,
+    )?;
+    drop(db);
+
+    let refused = Loom::open_production_pinned(
+        path.path(),
+        TenantId::new("acme"),
+        [(actor, unexpected_key)],
+        &expected,
+    );
+    assert!(
+        matches!(
+            &refused,
+            Err(LoomError::InvalidSecurityConfiguration { .. })
+        ),
+        "a changed actor registry was trusted after restart: {refused:?}"
+    );
+    let detail = refused.unwrap_err().to_string();
+    assert!(detail.contains("fingerprint mismatch"), "{detail}");
+    Ok(())
+}
+
+/// **Caller-supplied/tiered storage enforces the same external registry pin.**
+#[test]
+fn at_026_tiered_production_storage_requires_the_pinned_registry() -> Result<()> {
+    let actor = ActorId::new("agent-1");
+    let (_, trusted_key) = keypair(14);
+    let expected = actor_key_fingerprint([(actor.clone(), trusted_key)]);
+    let pager = Arc::new(Pager::in_memory(StoreConfig {
+        pool: "acme".into(),
+        ..Default::default()
+    })?);
+    let store = Arc::new(MemRefStore::new());
+
+    let refused = Loom::on_production_pinned(
+        pager,
+        store,
+        TenantId::new("acme"),
+        [(actor, trusted_key)],
+        &"0".repeat(64),
+    );
+    assert!(
+        matches!(refused, Err(LoomError::InvalidSecurityConfiguration { .. })),
+        "tiered storage bypassed the external registry pin: {refused:?}"
+    );
+    assert_ne!(expected, "0".repeat(64));
+    Ok(())
+}
+
+/// **A signed registry cannot be forged, substituted, or replayed below the deployment floor.**
+#[test]
+fn at_026_production_registry_attestation_is_signed_and_rollback_resistant() -> Result<()> {
+    let tenant = TenantId::new("acme");
+    let actor = ActorId::new("agent-1");
+    let (_, actor_key) = keypair(15);
+    let (_, substituted_key) = keypair(16);
+    let (governance_signing, governance_verifying) = keypair(17);
+    let (rogue_governance, _) = keypair(18);
+    let keys = [(actor.clone(), actor_key)];
+    let attestation =
+        ActorRegistryAttestation::issue(tenant.clone(), 7, keys.clone(), &governance_signing);
+    let attestation = ActorRegistryAttestation::from_json(&attestation.to_json()?)?;
+    assert_eq!(attestation.generation(), 7);
+    assert_eq!(
+        attestation.fingerprint(),
+        actor_key_fingerprint(keys.clone())
+    );
+
+    let path = tempfile::tempdir().expect("temporary database directory");
+    let db = Loom::open_production_attested(
+        path.path(),
+        tenant.clone(),
+        keys.clone(),
+        &attestation,
+        &governance_verifying,
+        7,
+    )?;
+    drop(db);
+
+    let rollback = match Loom::open_production_attested(
+        path.path(),
+        tenant.clone(),
+        keys.clone(),
+        &attestation,
+        &governance_verifying,
+        8,
+    ) {
+        Err(error) => error,
+        Ok(_) => panic!("a signed but stale registry bypassed the generation floor"),
+    };
+    assert!(
+        rollback.to_string().contains("rollback refused"),
+        "{rollback}"
+    );
+
+    let substituted = match Loom::open_production_attested(
+        path.path(),
+        tenant.clone(),
+        [(actor.clone(), substituted_key)],
+        &attestation,
+        &governance_verifying,
+        7,
+    ) {
+        Err(error) => error,
+        Ok(_) => panic!("an unattested actor key registry was trusted"),
+    };
+    assert!(
+        substituted.to_string().contains("fingerprint mismatch"),
+        "{substituted}"
+    );
+
+    let forged =
+        ActorRegistryAttestation::issue(tenant.clone(), 8, keys.clone(), &rogue_governance);
+    let forged_error = match Loom::open_production_attested(
+        path.path(),
+        tenant,
+        keys,
+        &forged,
+        &governance_verifying,
+        7,
+    ) {
+        Err(error) => error,
+        Ok(_) => panic!("a registry signed by an untrusted governance key was trusted"),
+    };
+    assert!(
+        forged_error.to_string().contains("signature is invalid"),
+        "{forged_error}"
+    );
     Ok(())
 }
 

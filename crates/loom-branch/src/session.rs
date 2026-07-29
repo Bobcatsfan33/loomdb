@@ -20,15 +20,16 @@ use crate::refs::{FileRefStore, MemRefStore, RefEdit, RefStore, Refs};
 use crate::sleep::LoomWakeToken;
 use crate::token::{CapabilityToken, TokenIssuer};
 use crate::tree::Tree;
-use ed25519_dalek::VerifyingKey;
+use ed25519_dalek::{Signature, Signer, SigningKey, VerifyingKey};
 use loom_core::{
     is_provenance, latest_node_key, node_storage_key, prov_seq_key, source_index_key, ActorId,
     BranchId, Claim, ClaimStatus, ClaimVersion, CommitId, DerivationNode, IndexEntry, IndexHint,
     Key, LoomError, NodeId, NodeStore, Record, Result, SessionId, SourceRef, TenantId, TrustClass,
     Value, WriteEnvelope,
 };
+use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, RwLock};
 use substrate_pager::{Clock, PageStore, Pager, StoreConfig};
 
 /// A commit clock that never hands out the same instant twice.
@@ -80,6 +81,150 @@ pub const DEFAULT_SESSION_TTL_MS: u64 = 8 * 3_600_000; // 8 hours
 /// The branch a tenant's committed state lives on.
 pub const MAIN: &str = "main";
 
+/// A deterministic fingerprint of an actor-key registry.
+///
+/// Pin this value in deployment configuration or a secrets manager and pass it to
+/// [`Loom::open_production_pinned`]. Actor ordering cannot change the result; actor names and
+/// Ed25519 public-key bytes are length-delimited and domain-separated before hashing.
+pub fn actor_key_fingerprint(keys: impl IntoIterator<Item = (ActorId, VerifyingKey)>) -> String {
+    let keys = keys.into_iter().collect::<BTreeMap<_, _>>();
+    fingerprint_actor_key_map(&keys)
+}
+
+fn fingerprint_actor_key_map(keys: &BTreeMap<ActorId, VerifyingKey>) -> String {
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(b"loomdb-actor-key-registry-v1\0");
+    for (actor, key) in keys {
+        let actor = actor.as_str().as_bytes();
+        hasher.update(&(actor.len() as u64).to_le_bytes());
+        hasher.update(actor);
+        hasher.update(key.as_bytes());
+    }
+    hasher.finalize().to_hex().to_string()
+}
+
+/// Governance-signed evidence authorizing one actor-key registry generation.
+///
+/// The governance verifying key and minimum accepted generation belong in deployment policy, not
+/// in the database. Verifying both prevents registry substitution and rollback to an older, still
+/// correctly signed key set after an actor has been revoked.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ActorRegistryAttestation {
+    tenant: TenantId,
+    generation: u64,
+    fingerprint: String,
+    signature: Vec<u8>,
+}
+
+impl ActorRegistryAttestation {
+    /// Issue an attestation with an offline governance signing key.
+    pub fn issue(
+        tenant: TenantId,
+        generation: u64,
+        keys: impl IntoIterator<Item = (ActorId, VerifyingKey)>,
+        governance_key: &SigningKey,
+    ) -> Self {
+        let fingerprint = actor_key_fingerprint(keys);
+        let payload = actor_registry_attestation_payload(&tenant, generation, &fingerprint);
+        let signature: Signature = governance_key.sign(&payload);
+        ActorRegistryAttestation {
+            tenant,
+            generation,
+            fingerprint,
+            signature: signature.to_bytes().to_vec(),
+        }
+    }
+
+    /// The monotonically increasing registry generation authorized by governance.
+    pub fn generation(&self) -> u64 {
+        self.generation
+    }
+
+    /// The authorized actor-key registry fingerprint.
+    pub fn fingerprint(&self) -> &str {
+        &self.fingerprint
+    }
+
+    /// Serialize the signed manifest for a deployment artifact or secrets manager.
+    pub fn to_json(&self) -> Result<String> {
+        serde_json::to_string(self).map_err(|error| LoomError::InvalidSecurityConfiguration {
+            detail: format!("serialize actor registry attestation: {error}"),
+        })
+    }
+
+    /// Parse a signed manifest supplied by deployment governance.
+    pub fn from_json(json: &str) -> Result<Self> {
+        serde_json::from_str(json).map_err(|error| LoomError::InvalidSecurityConfiguration {
+            detail: format!("parse actor registry attestation: {error}"),
+        })
+    }
+
+    fn verify(
+        &self,
+        expected_tenant: &TenantId,
+        actual_fingerprint: &str,
+        governance_key: &VerifyingKey,
+        minimum_generation: u64,
+    ) -> Result<()> {
+        let payload =
+            actor_registry_attestation_payload(&self.tenant, self.generation, &self.fingerprint);
+        let signature_bytes: [u8; 64] = self.signature.as_slice().try_into().map_err(|_| {
+            LoomError::InvalidSecurityConfiguration {
+                detail: "actor registry governance signature has the wrong length".into(),
+            }
+        })?;
+        governance_key
+            .verify_strict(&payload, &Signature::from_bytes(&signature_bytes))
+            .map_err(|_| LoomError::InvalidSecurityConfiguration {
+                detail: "actor registry governance signature is invalid".into(),
+            })?;
+        if &self.tenant != expected_tenant {
+            return Err(LoomError::InvalidSecurityConfiguration {
+                detail: format!(
+                    "actor registry attestation tenant mismatch (expected {}, actual {})",
+                    expected_tenant.as_str(),
+                    self.tenant.as_str()
+                ),
+            });
+        }
+        if self.generation < minimum_generation {
+            return Err(LoomError::InvalidSecurityConfiguration {
+                detail: format!(
+                    "actor registry rollback refused (minimum generation {minimum_generation}, \
+                     attested generation {})",
+                    self.generation
+                ),
+            });
+        }
+        if self.fingerprint != actual_fingerprint {
+            return Err(LoomError::InvalidSecurityConfiguration {
+                detail: format!(
+                    "actor key registry fingerprint mismatch (attested {}, actual \
+                     {actual_fingerprint})",
+                    self.fingerprint
+                ),
+            });
+        }
+        Ok(())
+    }
+}
+
+fn actor_registry_attestation_payload(
+    tenant: &TenantId,
+    generation: u64,
+    fingerprint: &str,
+) -> Vec<u8> {
+    let tenant = tenant.as_str().as_bytes();
+    let fingerprint = fingerprint.as_bytes();
+    let mut payload = b"loomdb-actor-registry-attestation-v1\0".to_vec();
+    payload.extend_from_slice(&(tenant.len() as u64).to_le_bytes());
+    payload.extend_from_slice(tenant);
+    payload.extend_from_slice(&generation.to_le_bytes());
+    payload.extend_from_slice(&(fingerprint.len() as u64).to_le_bytes());
+    payload.extend_from_slice(fingerprint);
+    payload
+}
+
 /// A handle to an open session.
 #[derive(Clone, Debug)]
 pub struct SessionHandle {
@@ -127,7 +272,7 @@ pub struct Loom {
     /// the key of the actor the envelope *claims to be*. An actor with no registered key is refused
     /// rather than trusted (`UnknownActor`) — fail closed, because failing open here means an attacker
     /// picks an actor name nobody has registered and writes as a ghost.
-    actor_keys: Option<BTreeMap<ActorId, VerifyingKey>>,
+    actor_keys: RwLock<Option<BTreeMap<ActorId, VerifyingKey>>>,
     /// **Everything that must survive a restart, other than the data.**
     ///
     /// Branch heads, tags, and the commit DAG — including the *second parent* of every merge, which
@@ -211,12 +356,167 @@ impl Loom {
         Loom::assemble(Arc::new(pager), Arc::new(refs), tenant)
     }
 
+    /// Open a durable database with the production write-security contract enabled.
+    ///
+    /// Unlike [`Loom::open`] followed by an optional builder call, this constructor cannot return a
+    /// database that accepts unauthenticated writes. A non-empty actor registry is required before
+    /// any store files are opened, and every write is then signature-checked against that registry.
+    pub fn open_production(
+        path: impl AsRef<std::path::Path>,
+        tenant: TenantId,
+        keys: impl IntoIterator<Item = (ActorId, VerifyingKey)>,
+    ) -> Result<Self> {
+        let keys = Self::production_actor_keys(keys)?;
+        let mut loom = Self::open(path, tenant)?;
+        *loom
+            .actor_keys
+            .get_mut()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(keys);
+        Ok(loom)
+    }
+
+    /// Open a durable production database only if its actor registry matches an external pin.
+    ///
+    /// The expected fingerprint belongs outside the database (deployment configuration, a signed
+    /// release manifest, or a secrets manager). This prevents an accidental or unauthorized key-set
+    /// change from becoming trusted merely because a process restarted with different arguments.
+    pub fn open_production_pinned(
+        path: impl AsRef<std::path::Path>,
+        tenant: TenantId,
+        keys: impl IntoIterator<Item = (ActorId, VerifyingKey)>,
+        expected_fingerprint: &str,
+    ) -> Result<Self> {
+        let keys = Self::production_actor_keys(keys)?;
+        let actual = fingerprint_actor_key_map(&keys);
+        if expected_fingerprint != actual {
+            return Err(LoomError::InvalidSecurityConfiguration {
+                detail: format!(
+                    "actor key registry fingerprint mismatch (expected {expected_fingerprint}, \
+                     actual {actual})"
+                ),
+            });
+        }
+        let mut loom = Self::open(path, tenant)?;
+        *loom
+            .actor_keys
+            .get_mut()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(keys);
+        Ok(loom)
+    }
+
+    /// Open a durable production database with governance-signed, rollback-resistant actor keys.
+    ///
+    /// Verification occurs before any store files are opened. `governance_key` is the externally
+    /// pinned trust root; `minimum_generation` is the externally persisted revocation/rotation floor.
+    pub fn open_production_attested(
+        path: impl AsRef<std::path::Path>,
+        tenant: TenantId,
+        keys: impl IntoIterator<Item = (ActorId, VerifyingKey)>,
+        attestation: &ActorRegistryAttestation,
+        governance_key: &VerifyingKey,
+        minimum_generation: u64,
+    ) -> Result<Self> {
+        let keys = Self::production_actor_keys(keys)?;
+        let actual = fingerprint_actor_key_map(&keys);
+        attestation.verify(&tenant, &actual, governance_key, minimum_generation)?;
+        let mut loom = Self::open(path, tenant)?;
+        *loom
+            .actor_keys
+            .get_mut()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(keys);
+        Ok(loom)
+    }
+
     /// Build a database over a caller-supplied pager and ref store.
     ///
     /// This is the seam a tiered (object-storage) LoomDB reaches through, and the seam the
     /// kill-and-restart tests use to cut the power mid-write.
     pub fn on(pager: Arc<Pager>, store: Arc<dyn RefStore>, tenant: TenantId) -> Result<Self> {
         Loom::assemble(pager, store, tenant)
+    }
+
+    /// Build over caller-supplied storage with the production write-security contract enabled.
+    ///
+    /// This is the remote/tiered-storage counterpart to [`Loom::open_production`]. It refuses an
+    /// empty actor registry instead of constructing a database that silently trusts actor names.
+    pub fn on_production(
+        pager: Arc<Pager>,
+        store: Arc<dyn RefStore>,
+        tenant: TenantId,
+        keys: impl IntoIterator<Item = (ActorId, VerifyingKey)>,
+    ) -> Result<Self> {
+        let keys = Self::production_actor_keys(keys)?;
+        let mut loom = Self::on(pager, store, tenant)?;
+        *loom
+            .actor_keys
+            .get_mut()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(keys);
+        Ok(loom)
+    }
+
+    /// Build over caller-supplied storage only if the actor registry matches an external pin.
+    ///
+    /// This is the tiered/object-storage counterpart to [`Loom::open_production_pinned`]; the
+    /// registry is verified before refs are loaded or initialized.
+    pub fn on_production_pinned(
+        pager: Arc<Pager>,
+        store: Arc<dyn RefStore>,
+        tenant: TenantId,
+        keys: impl IntoIterator<Item = (ActorId, VerifyingKey)>,
+        expected_fingerprint: &str,
+    ) -> Result<Self> {
+        let keys = Self::production_actor_keys(keys)?;
+        let actual = fingerprint_actor_key_map(&keys);
+        if expected_fingerprint != actual {
+            return Err(LoomError::InvalidSecurityConfiguration {
+                detail: format!(
+                    "actor key registry fingerprint mismatch (expected {expected_fingerprint}, \
+                     actual {actual})"
+                ),
+            });
+        }
+        let mut loom = Self::on(pager, store, tenant)?;
+        *loom
+            .actor_keys
+            .get_mut()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(keys);
+        Ok(loom)
+    }
+
+    /// Build over caller-supplied storage with governance-signed, rollback-resistant actor keys.
+    ///
+    /// This is the tiered-storage counterpart to [`Loom::open_production_attested`]. Attestation
+    /// verification occurs before refs are loaded or initialized.
+    pub fn on_production_attested(
+        pager: Arc<Pager>,
+        store: Arc<dyn RefStore>,
+        tenant: TenantId,
+        keys: impl IntoIterator<Item = (ActorId, VerifyingKey)>,
+        attestation: &ActorRegistryAttestation,
+        governance_key: &VerifyingKey,
+        minimum_generation: u64,
+    ) -> Result<Self> {
+        let keys = Self::production_actor_keys(keys)?;
+        let actual = fingerprint_actor_key_map(&keys);
+        attestation.verify(&tenant, &actual, governance_key, minimum_generation)?;
+        let mut loom = Self::on(pager, store, tenant)?;
+        *loom
+            .actor_keys
+            .get_mut()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(keys);
+        Ok(loom)
+    }
+
+    fn production_actor_keys(
+        keys: impl IntoIterator<Item = (ActorId, VerifyingKey)>,
+    ) -> Result<BTreeMap<ActorId, VerifyingKey>> {
+        let keys = keys.into_iter().collect::<BTreeMap<_, _>>();
+        if keys.is_empty() {
+            return Err(LoomError::InvalidSecurityConfiguration {
+                detail: "the actor key registry is empty".into(),
+            });
+        }
+        Ok(keys)
     }
 
     fn assemble(pager: Arc<Pager>, store: Arc<dyn RefStore>, tenant: TenantId) -> Result<Self> {
@@ -233,7 +533,7 @@ impl Loom {
 
         Ok(Loom {
             pager,
-            actor_keys: None,
+            actor_keys: RwLock::new(None),
             refs: Mutex::new(refs),
             store,
             ref_edits: Mutex::new(Vec::new()),
@@ -789,15 +1089,74 @@ impl Loom {
         mut self,
         keys: impl IntoIterator<Item = (ActorId, VerifyingKey)>,
     ) -> Self {
-        self.actor_keys = Some(keys.into_iter().collect());
+        *self
+            .actor_keys
+            .get_mut()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(keys.into_iter().collect());
         self
+    }
+
+    /// Atomically replace the complete trusted-actor registry.
+    ///
+    /// A non-empty replacement is required so a configuration mistake cannot accidentally remove
+    /// every production writer. Existing writes finish against either the old registry or the new
+    /// one; no write observes a partially updated set.
+    pub fn replace_actor_keys(
+        &self,
+        keys: impl IntoIterator<Item = (ActorId, VerifyingKey)>,
+    ) -> Result<()> {
+        let keys = Self::production_actor_keys(keys)?;
+        *self
+            .actor_keys
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(keys);
+        Ok(())
+    }
+
+    /// Atomically rotate or add one actor's verifying key.
+    ///
+    /// Refuses to turn authentication on implicitly for an embedded database. Start with
+    /// [`Loom::with_actor_keys`], [`Loom::open_production`], or [`Loom::on_production`].
+    pub fn rotate_actor_key(&self, actor: ActorId, key: VerifyingKey) -> Result<()> {
+        let mut registry = self
+            .actor_keys
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let keys = registry
+            .as_mut()
+            .ok_or_else(|| LoomError::InvalidSecurityConfiguration {
+                detail: "actor authentication is not enabled".into(),
+            })?;
+        keys.insert(actor, key);
+        Ok(())
+    }
+
+    /// Revoke one actor immediately.
+    ///
+    /// Returns whether a key was present. Revoking the final actor is allowed and leaves the
+    /// database sealed against all writes, which is the safe incident-response posture.
+    pub fn revoke_actor_key(&self, actor: &ActorId) -> Result<bool> {
+        let mut registry = self
+            .actor_keys
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let keys = registry
+            .as_mut()
+            .ok_or_else(|| LoomError::InvalidSecurityConfiguration {
+                detail: "actor authentication is not enabled".into(),
+            })?;
+        Ok(keys.remove(actor).is_some())
     }
 
     /// Is this envelope actually from who it says it is?
     ///
     /// A no-op when the database has no actor registry — see the field docs for what that costs.
     fn authenticate(&self, envelope: &WriteEnvelope) -> Result<()> {
-        let Some(keys) = &self.actor_keys else {
+        let registry = self
+            .actor_keys
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let Some(keys) = registry.as_ref() else {
             return Ok(());
         };
 

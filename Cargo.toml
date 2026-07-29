@@ -47,6 +47,7 @@ blake3 = "1.5"
 ed25519-dalek = { version = "2", features = ["rand_core"] }
 proptest = "1.5"
 tempfile = "3"
+fs2 = "0.4"
 
 [profile.release]
 debug = true
