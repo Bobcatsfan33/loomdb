@@ -9,7 +9,7 @@ loom-core = { path = "../loom-core" }
 # forwards through here (see [features]).
 loom-branch = { path = "../loom-branch", default-features = false }
 loom-provenance = { path = "../loom-provenance", default-features = false }
-substrate-pager = { git = "https://github.com/Bobcatsfan33/substrate", tag = "substrate-v1.5.0" }
+substrate-pager.workspace = true
 serde = { version = "1", features = ["derive"] }
 bincode = "1.3"
 blake3 = "1"
