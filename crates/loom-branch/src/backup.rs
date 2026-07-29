@@ -6,6 +6,7 @@
 //! the database mutation lock while this module copies the files, so the refs and content-addressed
 //! pages describe one committed prefix.
 
+use ed25519_dalek::{Signature, Signer, SigningKey, Verifier, VerifyingKey};
 use serde::{Deserialize, Serialize};
 use std::fs::{self, File, OpenOptions};
 use std::io::{Read, Write};
@@ -16,10 +17,16 @@ use std::sync::atomic::{AtomicU64, Ordering};
 pub const BACKUP_FORMAT_VERSION: u32 = 1;
 /// Manifest stored at the root of every completed backup.
 pub const BACKUP_MANIFEST_FILE: &str = "loom-backup-manifest.json";
+/// Detached signature stored beside a signed backup manifest.
+pub const BACKUP_SIGNATURE_FILE: &str = "loom-backup-manifest.sig.json";
+/// Current detached-signature format.
+pub const BACKUP_SIGNATURE_VERSION: u32 = 1;
 
 const PROCESS_LOCK_RELATIVE: &str = "loom/store.lock";
 const MAX_MANIFEST_BYTES: u64 = 16 * 1024 * 1024;
+const MAX_SIGNATURE_BYTES: u64 = 16 * 1024;
 const MAX_BACKUP_FILES: usize = 1_000_000;
+const SIGNATURE_DOMAIN: &[u8] = b"loomdb-backup-manifest-signature-v1\0";
 static PARTIAL_NONCE: AtomicU64 = AtomicU64::new(0);
 
 /// One file covered by a backup manifest.
@@ -42,6 +49,21 @@ pub struct BackupManifest {
     pub tenant: String,
     /// Files in lexicographic relative-path order.
     pub files: Vec<BackupFile>,
+}
+
+/// Detached Ed25519 authenticity record for the exact manifest bytes.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BackupSignature {
+    /// Signature record format version.
+    pub format_version: u32,
+    /// Algorithm identifier. Version 1 supports only `ed25519`.
+    pub algorithm: String,
+    /// Operator-controlled trust-root identifier, bound into the signature.
+    pub key_id: String,
+    /// BLAKE3 of the exact manifest bytes, for audit receipts and fast diagnosis.
+    pub manifest_blake3: String,
+    /// Lowercase hex Ed25519 signature over the domain, key id, and manifest bytes.
+    pub ed25519: String,
 }
 
 /// Backup or restore refusal with an operator-actionable reason.
@@ -74,6 +96,9 @@ pub enum BackupError {
     /// The engine could not flush its durable refs before the backup.
     #[error("backup could not establish a committed prefix: {0}")]
     Engine(String),
+    /// A signing or verification key, signature record, or signature was invalid.
+    #[error("backup authenticity check failed: {0}")]
+    Authenticity(String),
 }
 
 fn io(operation: &'static str, path: &Path, source: std::io::Error) -> BackupError {
@@ -146,7 +171,8 @@ fn walk_files(
             walk_files(root, &path, exclude_manifest, exclude_process_lock, output)?;
         } else if metadata.is_file() {
             let relative = relative_string(root, &path)?;
-            if (exclude_manifest && relative == BACKUP_MANIFEST_FILE)
+            if (exclude_manifest
+                && (relative == BACKUP_MANIFEST_FILE || relative == BACKUP_SIGNATURE_FILE))
                 || (exclude_process_lock && relative == PROCESS_LOCK_RELATIVE)
             {
                 continue;
@@ -247,10 +273,41 @@ fn reject_nested_destination(source: &Path, destination: &Path) -> Result<(), Ba
     Ok(())
 }
 
-fn write_manifest(root: &Path, manifest: &BackupManifest) -> Result<(), BackupError> {
-    let path = root.join(BACKUP_MANIFEST_FILE);
+fn encode_hex(bytes: &[u8]) -> String {
+    let mut output = String::with_capacity(bytes.len() * 2);
+    for byte in bytes {
+        output.push(char::from_digit((byte >> 4) as u32, 16).unwrap_or('0'));
+        output.push(char::from_digit((byte & 0x0f) as u32, 16).unwrap_or('0'));
+    }
+    output
+}
+
+fn decode_hex<const N: usize>(value: &str, what: &str) -> Result<[u8; N], BackupError> {
+    if value.len() != N * 2 || !value.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        return Err(BackupError::Authenticity(format!(
+            "{what} must be exactly {} hexadecimal characters",
+            N * 2
+        )));
+    }
+    let mut output = [0u8; N];
+    for (index, pair) in value.as_bytes().chunks_exact(2).enumerate() {
+        let pair = std::str::from_utf8(pair)
+            .map_err(|error| BackupError::Authenticity(format!("{what}: {error}")))?;
+        output[index] = u8::from_str_radix(pair, 16)
+            .map_err(|error| BackupError::Authenticity(format!("{what}: {error}")))?;
+    }
+    Ok(output)
+}
+
+fn manifest_bytes(manifest: &BackupManifest) -> Result<Vec<u8>, BackupError> {
     let mut bytes = serde_json::to_vec_pretty(manifest)?;
     bytes.push(b'\n');
+    Ok(bytes)
+}
+
+fn write_manifest(root: &Path, manifest: &BackupManifest) -> Result<Vec<u8>, BackupError> {
+    let path = root.join(BACKUP_MANIFEST_FILE);
+    let bytes = manifest_bytes(manifest)?;
     let mut file = OpenOptions::new()
         .create_new(true)
         .write(true)
@@ -259,7 +316,52 @@ fn write_manifest(root: &Path, manifest: &BackupManifest) -> Result<(), BackupEr
     file.write_all(&bytes)
         .map_err(|error| io("write manifest", &path, error))?;
     file.sync_all()
-        .map_err(|error| io("sync manifest", &path, error))
+        .map_err(|error| io("sync manifest", &path, error))?;
+    Ok(bytes)
+}
+
+fn signature_payload(key_id: &str, manifest: &[u8]) -> Vec<u8> {
+    let mut payload =
+        Vec::with_capacity(SIGNATURE_DOMAIN.len() + key_id.len() + 1 + manifest.len());
+    payload.extend_from_slice(SIGNATURE_DOMAIN);
+    payload.extend_from_slice(key_id.as_bytes());
+    payload.push(0);
+    payload.extend_from_slice(manifest);
+    payload
+}
+
+fn write_signature(
+    root: &Path,
+    key_id: &str,
+    key: &SigningKey,
+    manifest: &[u8],
+) -> Result<BackupSignature, BackupError> {
+    if key_id.trim().is_empty() || key_id.len() > 256 || key_id.contains('\0') {
+        return Err(BackupError::Authenticity(
+            "backup signing key id must be 1..=256 characters and contain no NUL".into(),
+        ));
+    }
+    let signature = key.sign(&signature_payload(key_id, manifest));
+    let record = BackupSignature {
+        format_version: BACKUP_SIGNATURE_VERSION,
+        algorithm: "ed25519".into(),
+        key_id: key_id.into(),
+        manifest_blake3: blake3::hash(manifest).to_hex().to_string(),
+        ed25519: encode_hex(&signature.to_bytes()),
+    };
+    let path = root.join(BACKUP_SIGNATURE_FILE);
+    let mut bytes = serde_json::to_vec_pretty(&record)?;
+    bytes.push(b'\n');
+    let mut file = OpenOptions::new()
+        .create_new(true)
+        .write(true)
+        .open(&path)
+        .map_err(|error| io("create signature", &path, error))?;
+    file.write_all(&bytes)
+        .map_err(|error| io("write signature", &path, error))?;
+    file.sync_all()
+        .map_err(|error| io("sync signature", &path, error))?;
+    Ok(record)
 }
 
 fn publish_partial(partial: &Path, destination: &Path) -> Result<(), BackupError> {
@@ -277,6 +379,25 @@ pub(crate) fn create_backup(
     source: &Path,
     destination: &Path,
     tenant: &str,
+) -> Result<BackupManifest, BackupError> {
+    create_backup_inner(source, destination, tenant, None)
+}
+
+pub(crate) fn create_signed_backup(
+    source: &Path,
+    destination: &Path,
+    tenant: &str,
+    key_id: &str,
+    key: &SigningKey,
+) -> Result<BackupManifest, BackupError> {
+    create_backup_inner(source, destination, tenant, Some((key_id, key)))
+}
+
+fn create_backup_inner(
+    source: &Path,
+    destination: &Path,
+    tenant: &str,
+    signer: Option<(&str, &SigningKey)>,
 ) -> Result<BackupManifest, BackupError> {
     if destination.exists() {
         return Err(BackupError::DestinationExists(
@@ -304,7 +425,10 @@ pub(crate) fn create_backup(
             tenant: tenant.to_string(),
             files,
         };
-        write_manifest(&partial, &manifest)?;
+        let encoded = write_manifest(&partial, &manifest)?;
+        if let Some((key_id, key)) = signer {
+            write_signature(&partial, key_id, key, &encoded)?;
+        }
         publish_partial(&partial, destination)?;
         Ok(manifest)
     })();
@@ -315,7 +439,7 @@ pub(crate) fn create_backup(
     result
 }
 
-fn load_manifest(root: &Path) -> Result<BackupManifest, BackupError> {
+fn load_manifest_bytes(root: &Path) -> Result<Vec<u8>, BackupError> {
     let path = root.join(BACKUP_MANIFEST_FILE);
     let metadata =
         fs::symlink_metadata(&path).map_err(|error| io("stat manifest", &path, error))?;
@@ -330,8 +454,11 @@ fn load_manifest(root: &Path) -> Result<BackupManifest, BackupError> {
             metadata.len()
         )));
     }
-    let bytes = fs::read(&path).map_err(|error| io("read manifest", &path, error))?;
-    let manifest: BackupManifest = serde_json::from_slice(&bytes)?;
+    fs::read(&path).map_err(|error| io("read manifest", &path, error))
+}
+
+fn decode_manifest(bytes: &[u8]) -> Result<BackupManifest, BackupError> {
+    let manifest: BackupManifest = serde_json::from_slice(bytes)?;
     if manifest.format_version != BACKUP_FORMAT_VERSION {
         return Err(BackupError::Integrity(format!(
             "backup format {} is unsupported; this build accepts {}",
@@ -349,6 +476,10 @@ fn load_manifest(root: &Path) -> Result<BackupManifest, BackupError> {
         )));
     }
     Ok(manifest)
+}
+
+fn load_manifest(root: &Path) -> Result<BackupManifest, BackupError> {
+    decode_manifest(&load_manifest_bytes(root)?)
 }
 
 fn hash_file(path: &Path) -> Result<(u64, String), BackupError> {
@@ -378,6 +509,11 @@ fn hash_file(path: &Path) -> Result<(u64, String), BackupError> {
 pub fn verify_backup(root: impl AsRef<Path>) -> Result<BackupManifest, BackupError> {
     let root = root.as_ref();
     let manifest = load_manifest(root)?;
+    verify_manifest_files(root, &manifest)?;
+    Ok(manifest)
+}
+
+fn verify_manifest_files(root: &Path, manifest: &BackupManifest) -> Result<(), BackupError> {
     let mut declared_paths = std::collections::BTreeSet::new();
     for record in &manifest.files {
         checked_relative(&record.path)?;
@@ -427,6 +563,95 @@ pub fn verify_backup(root: impl AsRef<Path>) -> Result<BackupManifest, BackupErr
             )));
         }
     }
+    Ok(())
+}
+
+fn load_signature(root: &Path) -> Result<BackupSignature, BackupError> {
+    let path = root.join(BACKUP_SIGNATURE_FILE);
+    let metadata = fs::symlink_metadata(&path).map_err(|error| {
+        if error.kind() == std::io::ErrorKind::NotFound {
+            BackupError::Authenticity(format!(
+                "required signature file {BACKUP_SIGNATURE_FILE} is missing"
+            ))
+        } else {
+            io("stat signature", &path, error)
+        }
+    })?;
+    if !metadata.is_file() || metadata.file_type().is_symlink() {
+        return Err(BackupError::Authenticity(
+            "backup signature must be a regular file".into(),
+        ));
+    }
+    if metadata.len() > MAX_SIGNATURE_BYTES {
+        return Err(BackupError::Authenticity(format!(
+            "backup signature is {} bytes, over the {MAX_SIGNATURE_BYTES}-byte cap",
+            metadata.len()
+        )));
+    }
+    let bytes = fs::read(&path).map_err(|error| io("read signature", &path, error))?;
+    serde_json::from_slice(&bytes)
+        .map_err(|error| BackupError::Authenticity(format!("signature record is invalid: {error}")))
+}
+
+fn verify_signature(
+    root: &Path,
+    manifest: &[u8],
+    expected_key_id: &str,
+    public_key: &VerifyingKey,
+) -> Result<BackupSignature, BackupError> {
+    let record = load_signature(root)?;
+    if record.format_version != BACKUP_SIGNATURE_VERSION {
+        return Err(BackupError::Authenticity(format!(
+            "signature format {} is unsupported; this build accepts {}",
+            record.format_version, BACKUP_SIGNATURE_VERSION
+        )));
+    }
+    if record.algorithm != "ed25519" {
+        return Err(BackupError::Authenticity(format!(
+            "signature algorithm {:?} is unsupported",
+            record.algorithm
+        )));
+    }
+    if record.key_id != expected_key_id {
+        return Err(BackupError::Authenticity(format!(
+            "backup was signed by key {:?}, not expected key {:?}",
+            record.key_id, expected_key_id
+        )));
+    }
+    let digest = blake3::hash(manifest).to_hex().to_string();
+    if record.manifest_blake3 != digest {
+        return Err(BackupError::Authenticity(format!(
+            "signed manifest digest mismatch: expected {}, found {}",
+            record.manifest_blake3, digest
+        )));
+    }
+    let bytes = decode_hex::<64>(&record.ed25519, "Ed25519 signature")?;
+    let signature = Signature::from_bytes(&bytes);
+    public_key
+        .verify(&signature_payload(&record.key_id, manifest), &signature)
+        .map_err(|error| {
+            BackupError::Authenticity(format!(
+                "Ed25519 signature did not verify for key {:?}: {error}",
+                record.key_id
+            ))
+        })?;
+    Ok(record)
+}
+
+/// Verify both the Ed25519 authenticity record and every content digest in a backup.
+///
+/// `expected_key_id` is supplied by the deployment's trust-root policy. Binding it into the signed
+/// payload prevents a valid signature from being relabelled as a different key during rotation.
+pub fn verify_signed_backup(
+    root: impl AsRef<Path>,
+    expected_key_id: &str,
+    public_key: &VerifyingKey,
+) -> Result<BackupManifest, BackupError> {
+    let root = root.as_ref();
+    let bytes = load_manifest_bytes(root)?;
+    verify_signature(root, &bytes, expected_key_id, public_key)?;
+    let manifest = decode_manifest(&bytes)?;
+    verify_manifest_files(root, &manifest)?;
     Ok(manifest)
 }
 
@@ -442,13 +667,34 @@ pub fn restore_backup(
 ) -> Result<BackupManifest, BackupError> {
     let backup = backup.as_ref();
     let destination = destination.as_ref();
+    let manifest = verify_backup(backup)?;
+    restore_verified_backup(backup, destination, manifest)
+}
+
+/// Restore a backup only after its expected Ed25519 trust root and every file digest verify.
+pub fn restore_signed_backup(
+    backup: impl AsRef<Path>,
+    destination: impl AsRef<Path>,
+    expected_key_id: &str,
+    public_key: &VerifyingKey,
+) -> Result<BackupManifest, BackupError> {
+    let backup = backup.as_ref();
+    let destination = destination.as_ref();
+    let manifest = verify_signed_backup(backup, expected_key_id, public_key)?;
+    restore_verified_backup(backup, destination, manifest)
+}
+
+fn restore_verified_backup(
+    backup: &Path,
+    destination: &Path,
+    manifest: BackupManifest,
+) -> Result<BackupManifest, BackupError> {
     if destination.exists() {
         return Err(BackupError::DestinationExists(
             destination.display().to_string(),
         ));
     }
     reject_nested_destination(backup, destination)?;
-    let manifest = verify_backup(backup)?;
     let partial = partial_path(destination)?;
     fs::create_dir(&partial).map_err(|error| io("create partial restore", &partial, error))?;
 
