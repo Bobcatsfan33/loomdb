@@ -238,7 +238,9 @@ bound stated plainly.
   write is signed and verified (AT-026); without one, writes are attributable but not authenticated.
   Governance attestations authorize a registry and prevent rollback, but the PKI/HSM workflow that
   proves who may receive an actor key remains external. (Signed **offline update bundles** —
-  `loom-bundle` — solve authenticity for updates *into* an enclave, offline; see
+  `loom-bundle` — solve authenticity and exact kind/id/version authorization for updates *into* an
+  enclave, offline. Software releases additionally carry reproducible-build, SPDX, checksum, and
+  GitHub provenance evidence; non-exportable HSM integration remains deployment-owned. See
   [`docs/operations.md`](docs/operations.md).)
 - **Multi-tenancy is a signed-token router, one substrate pool per tenant.** Cross-tenant isolation is
   structural — the token carries its tenant *inside its signature*, the router routes by it, and a

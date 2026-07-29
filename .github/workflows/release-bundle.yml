@@ -1,75 +1,248 @@
-name: release-bundle
+name: release bundle
 
-# Sign a release artifact into a verifiable offline update bundle (docs/operations.md).
-#
-# The production signing key never lives in the repo. It is provided here ONLY as the
-# `LOOM_BUNDLE_SIGNING_KEY` repository secret, written to a throwaway file at build time and deleted
-# immediately after signing. The workflow runs only on a published release or a manual dispatch — both
-# owner-triggered on the main repository, where the secret exists — so a fork can never invoke it.
+# A release is created only after the exact tagged source has produced an
+# air-gap binary, an exact-claim offline bundle, SBOM, checksums, and build
+# provenance. The native Ed25519 signature is what an enclave verifies without
+# a network; GitHub provenance is complementary procurement evidence.
 on:
-  workflow_dispatch:
-    inputs:
-      payload_path:
-        description: "Path to the file to sign (default: the freshly built loomd binary)"
-        required: false
-  release:
-    types: [published]
+  pull_request:
+    paths:
+      - ".github/workflows/release-bundle.yml"
+      - "crates/loom-bundle/**"
+      - "crates/loom-mcp/**"
+      - "Cargo.toml"
+      - "Cargo.lock"
+      - "docs/operations.md"
+  push:
+    tags:
+      - "v*"
+
+concurrency:
+  group: loomdb-release-${{ github.ref }}
+  cancel-in-progress: false
+
+permissions:
+  contents: read
 
 jobs:
-  sign:
-    name: sign + verify the release bundle
+  verify-source:
+    name: verify release source and workflow
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v5
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09
 
-      - name: Build loomd and the bundle tool (release)
-        run: cargo build --release -p loom-mcp -p loom-bundle
+      - uses: dtolnay/rust-toolchain@2c7215f132e9ebf062739d9130488b56d53c060c
+        with:
+          toolchain: 1.89.0
 
-      - name: Sign the release bundle
-        env:
-          # Mapped from the secret into the step's environment. GitHub masks it in logs; we also never
-          # echo it, write it with printf (not a command that could log), and delete it right after.
-          LOOM_BUNDLE_SIGNING_KEY: ${{ secrets.LOOM_BUNDLE_SIGNING_KEY }}
+      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32
+        with:
+          shared-key: release-source-1.89.0
+
+      - name: validate workflow semantics
+        run: go run github.com/rhysd/actionlint/cmd/actionlint@v1.7.12 .github/workflows/release-bundle.yml
+
+      - name: exact-claim bundle gates
+        run: cargo test --locked -p loom-bundle
+
+      - name: air-gap release source compiles without object storage
+        shell: bash
         run: |
-          set -eu
-          if [ -z "${LOOM_BUNDLE_SIGNING_KEY:-}" ]; then
-            echo "::error::LOOM_BUNDLE_SIGNING_KEY secret is not set — cannot sign a release bundle. Set it in repo secrets (64 hex chars)."
+          set -euo pipefail
+          cargo build --locked --release -p loom-mcp --no-default-features --features airgap
+          cargo tree --locked -p loom-mcp --no-default-features --features airgap -e no-dev > airgap-tree.txt
+          if grep -iE 'object_store|substrate-store' airgap-tree.txt; then
+            echo "::error::release loomd contains an object-storage client"
             exit 1
           fi
+
+  release:
+    name: build, sign, verify, attest, and publish
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: verify-source
+    runs-on: ubuntu-latest
+    environment: production-release
+    permissions:
+      contents: write
+      id-token: write
+      attestations: write
+    env:
+      RELEASE_TAG: ${{ github.ref_name }}
+      SOURCE_DATE_EPOCH: "0"
+      CARGO_PROFILE_RELEASE_DEBUG: "0"
+      CARGO_INCREMENTAL: "0"
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: validate the immutable release ref
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [[ ! "${RELEASE_TAG}" =~ ^v[0-9]+\.[0-9]+\.[0-9]+([.-][0-9A-Za-z.-]+)?$ ]]; then
+            echo "::error::release tag must be an explicit semantic version, got ${RELEASE_TAG}"
+            exit 1
+          fi
+          test "$(git rev-list -n 1 "${RELEASE_TAG}")" = "${GITHUB_SHA}"
+          echo "SOURCE_DATE_EPOCH=$(git show -s --format=%ct "${GITHUB_SHA}")" >> "${GITHUB_ENV}"
+          echo "BUNDLE_ID=loomd-${GITHUB_SHA:0:12}" >> "${GITHUB_ENV}"
+
+      - uses: dtolnay/rust-toolchain@2c7215f132e9ebf062739d9130488b56d53c060c
+        with:
+          toolchain: 1.89.0
+
+      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32
+        with:
+          shared-key: release-1.89.0
+
+      - name: refuse vulnerable locked dependencies
+        uses: rustsec/audit-check@69366f33c96575abad1ee0dba8212993eecbe998
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: prove the release binary is the air-gap build
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo tree --locked -p loom-mcp --no-default-features --features airgap -e no-dev > airgap-tree.txt
+          if grep -iE 'object_store|substrate-store' airgap-tree.txt; then
+            echo "::error::release loomd contains an object-storage client"
+            exit 1
+          fi
+
+      - name: build locked release artifacts
+        env:
+          RUSTFLAGS: --remap-path-prefix=${{ github.workspace }}=.
+        shell: bash
+        run: |
+          set -euo pipefail
+          CARGO_TARGET_DIR=target/repro-a \
+            cargo build --locked --release -p loom-mcp --no-default-features --features airgap
+          CARGO_TARGET_DIR=target/repro-b \
+            cargo build --locked --release -p loom-mcp --no-default-features --features airgap
+          cmp target/repro-a/release/loomd target/repro-b/release/loomd
+          cargo build --locked --release -p loom-bundle
+          install -d -m 0755 dist
+          install -m 0755 target/repro-a/release/loomd dist/loomd
+          install -m 0755 target/release/loom-bundle-tool dist/loom-bundle-tool
+
+      - name: sign only the reviewed loomd binary and verify exact claims
+        env:
+          LOOM_BUNDLE_SIGNING_KEY: ${{ secrets.LOOM_BUNDLE_SIGNING_KEY }}
+          LOOM_BUNDLE_PUBLIC_KEY: ${{ vars.LOOM_BUNDLE_PUBLIC_KEY }}
+        shell: bash
+        run: |
+          set -euo pipefail
           umask 077
-          printf '%s' "$LOOM_BUNDLE_SIGNING_KEY" > signing.key
-          PAYLOAD="${{ github.event.inputs.payload_path }}"
-          [ -z "$PAYLOAD" ] && PAYLOAD=target/release/loomd
-          ./target/release/loom-bundle-tool sign \
+          trap 'rm -f signing.key public.key' EXIT
+          if [[ ! "${LOOM_BUNDLE_SIGNING_KEY:-}" =~ ^[0-9A-Fa-f]{64}$ ]]; then
+            echo "::error::production-release environment requires a 64-hex LOOM_BUNDLE_SIGNING_KEY secret"
+            exit 1
+          fi
+          if [[ ! "${LOOM_BUNDLE_PUBLIC_KEY:-}" =~ ^[0-9A-Fa-f]{64}$ ]]; then
+            echo "::error::production-release environment requires a 64-hex LOOM_BUNDLE_PUBLIC_KEY variable"
+            exit 1
+          fi
+          printf '%s\n' "${LOOM_BUNDLE_SIGNING_KEY}" > signing.key
+          printf '%s\n' "${LOOM_BUNDLE_PUBLIC_KEY}" > public.key
+          cp public.key dist/loom-release.pub
+          CREATED_MS="$((SOURCE_DATE_EPOCH * 1000))"
+          dist/loom-bundle-tool sign \
             --key signing.key \
             --kind software \
-            --id "loomd-${GITHUB_SHA::12}" \
-            --version "${GITHUB_REF_NAME:-manual}" \
-            --in "$PAYLOAD" \
-            --out loomd.bundle
-          rm -f signing.key
-          echo "signed $PAYLOAD into loomd.bundle"
+            --id "${BUNDLE_ID}" \
+            --version "${RELEASE_TAG}" \
+            --created-ms "${CREATED_MS}" \
+            --in dist/loomd \
+            --out dist/loomd.bundle
+          dist/loom-bundle-tool verify \
+            --public public.key \
+            --require-kind software \
+            --require-id "${BUNDLE_ID}" \
+            --require-version "${RELEASE_TAG}" \
+            --in dist/loomd.bundle
 
-      - name: Verify the signed bundle against the public key
-        # The public key is safe in the clear; verification is skipped (not failed) if it is not set,
-        # so a first run before the operator has published the public key still produces the bundle.
-        env:
-          LOOM_BUNDLE_PUBLIC_KEY: ${{ secrets.LOOM_BUNDLE_PUBLIC_KEY }}
-        run: |
-          set -eu
-          if [ -z "${LOOM_BUNDLE_PUBLIC_KEY:-}" ]; then
-            echo "::warning::LOOM_BUNDLE_PUBLIC_KEY not set — skipping self-verification. Publish the public key so releases self-verify."
-            exit 0
-          fi
-          printf '%s' "$LOOM_BUNDLE_PUBLIC_KEY" > public.key
-          ./target/release/loom-bundle-tool verify --public public.key --in loomd.bundle
-          rm -f public.key
-
-      - name: Upload the signed bundle
-        uses: actions/upload-artifact@v4
+      - name: generate SPDX SBOM
+        uses: anchore/sbom-action@e22c389904149dbc22b58101806040fa8d37a610
         with:
-          name: loomd-bundle
-          path: loomd.bundle
+          path: dist
+          format: spdx-json
+          output-file: dist/loomd.spdx.json
+          syft-version: v1.50.0
+          upload-artifact: false
+
+      - name: write checksums and release receipt
+        shell: bash
+        run: |
+          set -euo pipefail
+          (
+            cd dist
+            sha256sum \
+              loomd \
+              loom-bundle-tool \
+              loomd.bundle \
+              loom-release.pub \
+              loomd.spdx.json > SHA256SUMS
+          )
+          LOOMD_SHA256="$(sha256sum dist/loomd | cut -d' ' -f1)"
+          BUNDLE_SHA256="$(sha256sum dist/loomd.bundle | cut -d' ' -f1)"
+          PUBLIC_KEY_SHA256="$(sha256sum dist/loom-release.pub | cut -d' ' -f1)"
+          jq -n \
+            --arg release_tag "${RELEASE_TAG}" \
+            --arg source_revision "${GITHUB_SHA}" \
+            --arg bundle_id "${BUNDLE_ID}" \
+            --arg kind "software" \
+            --arg loomd_sha256 "${LOOMD_SHA256}" \
+            --arg bundle_sha256 "${BUNDLE_SHA256}" \
+            --arg public_key_sha256 "${PUBLIC_KEY_SHA256}" \
+            '{
+              schema_version: 1,
+              release_tag: $release_tag,
+              source_revision: $source_revision,
+              bundle_id: $bundle_id,
+              kind: $kind,
+              loomd_sha256: $loomd_sha256,
+              bundle_sha256: $bundle_sha256,
+              public_key_sha256: $public_key_sha256
+            }' > dist/release-receipt.json
+          sha256sum dist/release-receipt.json >> dist/SHA256SUMS
+
+      - name: publish build provenance for every released file
+        uses: actions/attest-build-provenance@e8998f949152b193b063cb0ec769d69d929409be
+        with:
+          subject-path: |
+            dist/loomd
+            dist/loom-bundle-tool
+            dist/loomd.bundle
+            dist/loom-release.pub
+            dist/loomd.spdx.json
+            dist/release-receipt.json
+            dist/SHA256SUMS
+
+      - name: retain the complete evidence set
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: loomdb-${{ github.ref_name }}
+          path: dist
           if-no-files-found: error
+          retention-days: 90
+
+      - name: create the release only after every gate passes
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          gh release create "${RELEASE_TAG}" \
+            dist/loomd \
+            dist/loom-bundle-tool \
+            dist/loomd.bundle \
+            dist/loom-release.pub \
+            dist/loomd.spdx.json \
+            dist/release-receipt.json \
+            dist/SHA256SUMS \
+            --verify-tag \
+            --generate-notes \
+            --title "LoomDB ${RELEASE_TAG}"

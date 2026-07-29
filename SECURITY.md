@@ -14,8 +14,11 @@ severity issues within thirty days.
 ## Supported versions
 
 Until the project reaches 1.0, only the latest tagged release receives security fixes. Release notes
-will identify any required on-disk migration. Consumers should verify signed release artifacts and
-their accompanying checksums before installation.
+will identify any required on-disk migration. Consumers should verify the
+offline bundle against an independently provisioned release key **and** require
+the exact approved kind, id, and version before installation. Online
+procurement pipelines should also verify the GitHub build attestation and
+checksums attached to the release.
 
 ## Security boundary
 
