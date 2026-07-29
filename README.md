@@ -166,6 +166,18 @@ bound stated plainly.
   branches to ~1.4 ms flat** (O(branches) → O(1), measured `benches/refs_scaling.rs`); recovery reads the
   snapshot once (~40 ms at 100k). The full ref write path was re-certified at `AT045_STRIDE=1` — every
   byte, including a crash mid-compaction (`docs/refs-design.md`, `tests/crash.rs`).
+- **Phase 3 operations are partially closed, not complete.** File-backed stores now have an online
+  backup boundary: it holds branch mutation and ANN-maintenance publication, flushes refs, copies one
+  committed prefix, excludes the live process lock, and writes an allow-list manifest with a BLAKE3
+  digest and length for every file. Verification refuses missing, extra, changed, non-regular, or
+  symlinked files; restore verifies first, requires the expected tenant in `loomctl`, never overwrites,
+  and publishes through one directory rename. A write-storm test restores a value from a valid committed
+  prefix. `loomctl inspect`, `verify`, `backup`, `verify-backup`, and `restore` are available and
+  read-only against existing stores. **Still open:** OpenTelemetry metrics/tracing, provenance-chain and
+  `taint` diagnostic views in `loomctl`, scheduled backup retention, and a restore drill on each target
+  filesystem/object-store topology. The digest manifest detects damage relative to itself; backup
+  authenticity still requires an immutable/off-account control plane or an external signature over the
+  manifest. See [`docs/backup-restore.md`](docs/backup-restore.md).
 - **Wake-over-object-storage wide-area p99 > 250 ms — REFRAMED as topology-bound, not an engine gap.**
   *(This is the disposition of the v0.1 "wake p99 exceeds the 250 ms bar over a wide-area link" known-limit
   — restated here, not silently dropped, so an evaluator who read the v0.1 list finds where it went. The
@@ -247,7 +259,8 @@ The architecture of record lives in the substrate repository:
 4. [`docs/invariants.md`](docs/invariants.md) — the rules that must not be "optimized" away
 5. [`docs/threat-model.md`](docs/threat-model.md) — the security posture, and what LoomDB does not defend against
 6. [`docs/operations.md`](docs/operations.md) — running air-gapped: the offline certification, reproducible, and signed update bundles
-7. [`docs/loom-format.md`](docs/loom-format.md) — the on-page record format
+7. [`docs/backup-restore.md`](docs/backup-restore.md) — consistent backups, verification, restore, and drills
+8. [`docs/loom-format.md`](docs/loom-format.md) — the on-page record format
 
 ## License
 
