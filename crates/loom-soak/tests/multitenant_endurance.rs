@@ -215,7 +215,7 @@ fn soak_b_multitenant_isolation_holds_under_churn_and_memory_is_flat() {
                 loop {
                     let p = progress.load(Ordering::Relaxed);
                     let pct = (p * 100) / total;
-                    if pct != last_pct && pct % 5 == 0 {
+                    if pct != last_pct && pct.is_multiple_of(5) {
                         gate.sample(&format!("{pct}%"));
                         last_pct = pct;
                     }

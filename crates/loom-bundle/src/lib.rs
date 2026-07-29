@@ -332,7 +332,7 @@ pub fn hex_encode(bytes: &[u8]) -> String {
 }
 
 fn hex_decode(s: &str, what: &'static str) -> Result<Vec<u8>> {
-    if s.len() % 2 != 0 {
+    if !s.len().is_multiple_of(2) {
         return Err(BundleError::Hex {
             what,
             detail: format!("odd number of hex digits ({})", s.len()),
