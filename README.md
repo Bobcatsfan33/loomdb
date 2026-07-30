@@ -45,6 +45,23 @@ db.rewind(&token, &h1, &session.base)?;
 
 A million idle sessions are a million manifests: bytes in object storage, no compute. That's what makes speculation affordable, and it comes from the engine underneath — [**substrate**](https://github.com/Bobcatsfan33/substrate), where a fork costs **98 nanoseconds** regardless of database size.
 
+For a deployed service, use `Loom::open_production(path, tenant, actor_keys)`. It refuses to open
+with an empty actor registry and requires every write envelope to carry an Ed25519 signature that
+matches the claimed actor. `Loom::open` remains available for trusted, single-process embedding where
+actor names are attributable but not cryptographically authenticated. A running service can rotate
+or revoke keys atomically through `replace_actor_keys`, `rotate_actor_key`, and `revoke_actor_key`;
+an old or revoked key stops authorizing writes without reopening the store.
+
+For restart-time configuration integrity, pin `actor_key_fingerprint(keys)` outside the database and
+use `Loom::open_production_pinned`. The store refuses a different registry before opening; key
+rotation therefore requires an explicit update to the externally approved fingerprint. Tiered
+deployments use `Loom::on_production_pinned` for the same check over caller-supplied storage.
+For stronger governance, `ActorRegistryAttestation::issue` signs the tenant, registry fingerprint,
+and a monotonically increasing generation with an offline governance key.
+`Loom::open_production_attested` and `Loom::on_production_attested` verify that signature and an
+externally persisted minimum generation before touching storage, so a valid old registry cannot be
+replayed after revocation.
+
 ## Four things that are unusual
 
 **Merge happens at record granularity, not page granularity.** Two agents writing two unrelated facts that land in the same 64 KiB page must **not** conflict. A merge engine that reports conflicts between things that don't conflict is a merge engine that lies, and an agent will either escalate for nothing or learn to ignore conflicts. Substrate's page-level diff is a *prefilter*; the merge is over records.
@@ -202,16 +219,15 @@ bound stated plainly.
     would keep wake ~1 RTT everywhere. The cold *first-ever* wake stays ~4 RTT regardless (the serial
     chain walk, until the ids are known). An **airgap** deployment does not wake from object storage at all
     (local storage), so none of this applies to it.
-- **One `Loom` per store directory — no cross-process lock.** The ref store serializes concurrent access
-  *within* a process (which is what makes log compaction safe against concurrent appends), but there is no
-  lock file, so two OS processes opening the same database directory would race on the ref log. The
-  contract is single-process, the same assumption an embedded SQLite/LMDB makes; an advisory lock file
-  would enforce it and is not yet built.
-- **Signature verification is opt-in, and key distribution is not solved here.** With an actor registry,
-  every write is signed and verified (AT-026); without one, writes are attributable but not
-  authenticated. Where keys come from, how they rotate, and how a compromised one is revoked is out of
-  scope. (Signed **offline update bundles** — `loom-bundle` — do solve authenticity for updates *into* an
-  enclave, offline; see [`docs/operations.md`](docs/operations.md).)
+- **One `Loom` per store directory.** The normal file-backed open path holds an OS advisory lock for the
+  lifetime of the store, so a second process is refused before it can race the ref log. Custom VFS
+  implementations must enforce equivalent ownership at their own boundary.
+- **Signature verification is opt-in, and key issuance is external.** With an actor registry, every
+  write is signed and verified (AT-026); without one, writes are attributable but not authenticated.
+  Governance attestations authorize a registry and prevent rollback, but the PKI/HSM workflow that
+  proves who may receive an actor key remains external. (Signed **offline update bundles** —
+  `loom-bundle` — solve authenticity for updates *into* an enclave, offline; see
+  [`docs/operations.md`](docs/operations.md).)
 - **Multi-tenancy is a signed-token router, one substrate pool per tenant.** Cross-tenant isolation is
   structural — the token carries its tenant *inside its signature*, the router routes by it, and a
   tampered or unregistered tenant gets a byte-identical `Unauthorized` (no existence oracle), held under

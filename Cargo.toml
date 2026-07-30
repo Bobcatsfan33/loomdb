@@ -17,7 +17,7 @@ members = [
 [workspace.package]
 version = "0.1.0"
 edition = "2021"
-rust-version = "1.82"
+rust-version = "1.85"
 license = "Apache-2.0"
 repository = "https://github.com/Bobcatsfan33/loomdb"
 homepage = "https://github.com/Bobcatsfan33/loomdb"
@@ -25,13 +25,13 @@ homepage = "https://github.com/Bobcatsfan33/loomdb"
 [workspace.dependencies]
 # --- the engine ---
 #
-# Pinned to a TAG, not a branch. Substrate's API is frozen at v1.0 and semver applies
-# (substrate/docs/substrate-api.md); a floating dependency on a storage engine is a way to
-# discover a format change in production.
-substrate-pager = { git = "https://github.com/Bobcatsfan33/substrate", tag = "substrate-v1.5.0" }
-substrate-wal = { git = "https://github.com/Bobcatsfan33/substrate", tag = "substrate-v1.5.0" }
-substrate-store = { git = "https://github.com/Bobcatsfan33/substrate", tag = "substrate-v1.5.0" }
-substrate-security = { git = "https://github.com/Bobcatsfan33/substrate", tag = "substrate-v1.5.0" }
+# Pinned to an immutable revision, never a branch. This reviewed commit upgrades the
+# object-storage chain to quick-xml 0.41 and closes RUSTSEC-2026-0194/0195. Move the pin
+# to the next signed Substrate release tag after the dependency PR is merged and released.
+substrate-pager = { git = "https://github.com/Bobcatsfan33/substrate", rev = "d73fb0325218a991e35c16700e5c66d2fde8ae90" }
+substrate-wal = { git = "https://github.com/Bobcatsfan33/substrate", rev = "d73fb0325218a991e35c16700e5c66d2fde8ae90" }
+substrate-store = { git = "https://github.com/Bobcatsfan33/substrate", rev = "d73fb0325218a991e35c16700e5c66d2fde8ae90" }
+substrate-security = { git = "https://github.com/Bobcatsfan33/substrate", rev = "d73fb0325218a991e35c16700e5c66d2fde8ae90" }
 
 # --- internal ---
 loom-core = { path = "crates/loom-core", version = "0.1.0" }
@@ -47,6 +47,7 @@ blake3 = "1.5"
 ed25519-dalek = { version = "2", features = ["rand_core"] }
 proptest = "1.5"
 tempfile = "3"
+fs2 = "0.4"
 
 [profile.release]
 debug = true

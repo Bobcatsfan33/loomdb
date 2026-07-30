@@ -22,6 +22,7 @@ serde_json.workspace = true
 blake3.workspace = true
 getrandom = "0.2"
 ed25519-dalek.workspace = true
+fs2.workspace = true
 
 [dev-dependencies]
 substrate-pager = { workspace = true, features = ["test-util"] }
@@ -33,7 +34,7 @@ tempfile.workspace = true
 # only `substrate-store` — so both are dev-dependencies and never reach a shipped binary. (The
 # persistence test itself is `#![cfg(feature = "remote")]`, so an airgap test build skips it too.)
 tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
-object_store = "0.11"
+object_store = "0.14.1"
 
 [features]
 # The remote tier is on by default: a normal build can sleep a tenant to object storage and wake it.

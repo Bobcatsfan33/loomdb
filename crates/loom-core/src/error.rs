@@ -13,6 +13,26 @@ pub type Result<T> = std::result::Result<T, LoomError>;
 #[derive(Debug, thiserror::Error)]
 #[non_exhaustive]
 pub enum LoomError {
+    /// A production constructor was called without the controls it promises.
+    #[error(
+        "invalid production security configuration: {detail}. Supply at least one registered \
+         actor verifying key; production databases never accept unauthenticated writes."
+    )]
+    InvalidSecurityConfiguration {
+        /// The unsafe or incomplete setting.
+        detail: String,
+    },
+
+    /// Another process already owns the mutable files for this store.
+    #[error(
+        "the LoomDB store at {path} is already open by another process. Close the other process \
+         before opening this store; sharing one store directory between processes can corrupt refs."
+    )]
+    StoreInUse {
+        /// The database root whose process lock could not be acquired.
+        path: String,
+    },
+
     /// The envelope carries no signature, and this database requires one.
     #[error(
         "the write envelope for actor {actor} is not signed, and this database has an actor \

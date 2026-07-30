@@ -44,7 +44,10 @@ pub use merge::{
 };
 pub use refs::{FileRefStore, MemRefStore, RefEdit, RefStore, Refs, REFS_FORMAT_VERSION};
 pub use session::ReadSet;
-pub use session::{Loom, MergeResult, SessionHandle, DEFAULT_SESSION_TTL_MS, MAIN};
+pub use session::{
+    actor_key_fingerprint, ActorRegistryAttestation, Loom, MergeResult, SessionHandle,
+    DEFAULT_SESSION_TTL_MS, MAIN,
+};
 pub use sleep::LoomWakeToken;
 pub use tenancy::Tenancy;
 pub use token::{CapabilityToken, TokenClaims, TokenIssuer};
