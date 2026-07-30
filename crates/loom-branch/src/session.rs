@@ -2088,6 +2088,40 @@ impl Loom {
         crate::backup::create_backup(root, destination.as_ref(), self.tenant.as_str())
     }
 
+    /// Create an online backup whose exact manifest bytes carry a detached Ed25519 signature.
+    ///
+    /// The signature is written inside the private partial directory before the atomic publish, so
+    /// a completed signed backup never exists without its authenticity record. `key_id` is bound
+    /// into the signature and should identify the deployment trust root/version, not contain secret
+    /// material. Key custody and rotation remain the caller's responsibility.
+    pub fn backup_to_signed(
+        &self,
+        destination: impl AsRef<std::path::Path>,
+        key_id: &str,
+        signing_key: &ed25519_dalek::SigningKey,
+    ) -> std::result::Result<crate::backup::BackupManifest, crate::backup::BackupError> {
+        let root = self.store_root.as_ref().ok_or_else(|| {
+            crate::backup::BackupError::Unsupported(
+                "online backup requires a database opened with Loom::open or a production variant"
+                    .into(),
+            )
+        })?;
+        let _maintenance = self
+            .maintenance_lock
+            .write()
+            .unwrap_or_else(|error| error.into_inner());
+        let _wg = self.write_guard();
+        self.persist()
+            .map_err(|error| crate::backup::BackupError::Engine(error.to_string()))?;
+        crate::backup::create_signed_backup(
+            root,
+            destination.as_ref(),
+            self.tenant.as_str(),
+            key_id,
+            signing_key,
+        )
+    }
+
     /// The underlying pager. Debug and diagnostics only.
     #[doc(hidden)]
     pub fn pager_for_debug(&self) -> &Arc<Pager> {

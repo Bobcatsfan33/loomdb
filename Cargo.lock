@@ -1324,6 +1324,7 @@ dependencies = [
 name = "loomctl"
 version = "0.1.0"
 dependencies = [
+ "ed25519-dalek",
  "loom-branch",
  "loom-core",
  "serde",

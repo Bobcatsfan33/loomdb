@@ -1,6 +1,10 @@
 //! Phase 3 operational gate: online backup/restore is a consistent, verified prefix.
 
-use loom_branch::{restore_backup, verify_backup, BackupError, Loom};
+use ed25519_dalek::SigningKey;
+use loom_branch::{
+    restore_backup, restore_signed_backup, verify_backup, verify_signed_backup, BackupError, Loom,
+    BACKUP_MANIFEST_FILE, BACKUP_SIGNATURE_FILE,
+};
 use loom_core::{ActorId, BranchId, Record, SessionId, TenantId, Value, WriteEnvelope};
 use std::io::Write as _;
 use std::sync::{mpsc, Arc};
@@ -134,5 +138,85 @@ fn backup_and_restore_never_overwrite_existing_paths() -> Result<(), Box<dyn std
         restore_backup(&backup, &restored),
         Err(BackupError::DestinationExists(_))
     ));
+    Ok(())
+}
+
+#[test]
+fn signed_backup_binds_manifest_key_identity_and_restore() -> Result<(), Box<dyn std::error::Error>>
+{
+    let source = tempfile::tempdir()?;
+    let parent = tempfile::tempdir()?;
+    let backup = parent.path().join("snapshot");
+    let restored = parent.path().join("restored");
+    let key = SigningKey::from_bytes(&[41u8; 32]);
+    let db = Loom::open(source.path(), TenantId::new("acme"))?;
+
+    let created = db.backup_to_signed(&backup, "backup-root-2026-q3", &key)?;
+    assert!(backup.join(BACKUP_SIGNATURE_FILE).is_file());
+    assert_eq!(
+        verify_signed_backup(&backup, "backup-root-2026-q3", &key.verifying_key())?,
+        created
+    );
+    assert_eq!(
+        restore_signed_backup(
+            &backup,
+            &restored,
+            "backup-root-2026-q3",
+            &key.verifying_key(),
+        )?,
+        created
+    );
+
+    let wrong_id = verify_signed_backup(&backup, "backup-root-old", &key.verifying_key())
+        .expect_err("the trust-root id is part of authorization");
+    assert!(matches!(wrong_id, BackupError::Authenticity(_)));
+
+    let wrong_key = SigningKey::from_bytes(&[42u8; 32]);
+    let error = verify_signed_backup(&backup, "backup-root-2026-q3", &wrong_key.verifying_key())
+        .expect_err("a different trust root must not verify");
+    assert!(matches!(error, BackupError::Authenticity(_)));
+    Ok(())
+}
+
+#[test]
+fn signed_backup_rejects_a_self_consistent_manifest_rewrite(
+) -> Result<(), Box<dyn std::error::Error>> {
+    let source = tempfile::tempdir()?;
+    let parent = tempfile::tempdir()?;
+    let backup = parent.path().join("snapshot");
+    let key = SigningKey::from_bytes(&[91u8; 32]);
+    let db = Loom::open(source.path(), TenantId::new("acme"))?;
+    db.backup_to_signed(&backup, "backup-root", &key)?;
+
+    // Whitespace keeps the JSON and all file digests valid, but changes the exact bytes the
+    // deployment trust root approved. An attacker able to rewrite both data and manifest cannot
+    // mint the replacement signature.
+    let manifest_path = backup.join(BACKUP_MANIFEST_FILE);
+    let mut manifest = std::fs::read(&manifest_path)?;
+    manifest.extend_from_slice(b" ");
+    std::fs::write(&manifest_path, manifest)?;
+
+    assert!(
+        verify_backup(&backup).is_ok(),
+        "the unsigned integrity check intentionally accepts equivalent JSON"
+    );
+    let error = verify_signed_backup(&backup, "backup-root", &key.verifying_key())
+        .expect_err("rewritten manifest bytes must invalidate authenticity");
+    assert!(matches!(error, BackupError::Authenticity(_)));
+    Ok(())
+}
+
+#[test]
+fn signed_verification_refuses_a_missing_signature() -> Result<(), Box<dyn std::error::Error>> {
+    let source = tempfile::tempdir()?;
+    let parent = tempfile::tempdir()?;
+    let backup = parent.path().join("snapshot");
+    let key = SigningKey::from_bytes(&[17u8; 32]);
+    let db = Loom::open(source.path(), TenantId::new("acme"))?;
+    db.backup_to(&backup)?;
+
+    let error = verify_signed_backup(&backup, "backup-root", &key.verifying_key())
+        .expect_err("unsigned backup must not pass the signed production door");
+    assert!(matches!(error, BackupError::Authenticity(_)));
     Ok(())
 }

@@ -9,6 +9,10 @@ fn run(arguments: &[&str]) -> Output {
         .expect("loomctl must execute")
 }
 
+fn hex(bytes: &[u8]) -> String {
+    bytes.iter().map(|byte| format!("{byte:02x}")).collect()
+}
+
 #[test]
 fn operator_can_inspect_verify_backup_and_restore_without_overwriting(
 ) -> Result<(), Box<dyn std::error::Error>> {
@@ -108,5 +112,72 @@ fn operator_can_inspect_verify_backup_and_restore_without_overwriting(
         restored.to_str().ok_or("restore path is not UTF-8")?,
     ]);
     assert!(!overwrite.status.success());
+    Ok(())
+}
+
+#[test]
+fn production_backup_commands_require_the_expected_trust_root(
+) -> Result<(), Box<dyn std::error::Error>> {
+    let parent = tempfile::tempdir()?;
+    let source = parent.path().join("source");
+    let backup = parent.path().join("backup");
+    let restored = parent.path().join("restored");
+    let signing_file = parent.path().join("backup-signing.hex");
+    let public_file = parent.path().join("backup-public.hex");
+    let signing = ed25519_dalek::SigningKey::from_bytes(&[73u8; 32]);
+    std::fs::write(&signing_file, format!("{}\n", hex(&signing.to_bytes())))?;
+    std::fs::write(
+        &public_file,
+        format!("{}\n", hex(signing.verifying_key().as_bytes())),
+    )?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        std::fs::set_permissions(&signing_file, std::fs::Permissions::from_mode(0o600))?;
+    }
+    let db = Loom::open(&source, TenantId::new("acme"))?;
+    drop(db);
+
+    let backup_result = run(&[
+        "backup-signed",
+        "--path",
+        source.to_str().ok_or("source path is not UTF-8")?,
+        "--tenant",
+        "acme",
+        "--out",
+        backup.to_str().ok_or("backup path is not UTF-8")?,
+        "--signing-key-file",
+        signing_file.to_str().ok_or("key path is not UTF-8")?,
+        "--key-id",
+        "backup-root-2026-q3",
+    ]);
+    assert!(backup_result.status.success(), "{backup_result:?}");
+
+    let wrong_root = run(&[
+        "verify-backup-signed",
+        "--path",
+        backup.to_str().ok_or("backup path is not UTF-8")?,
+        "--public-key-file",
+        public_file.to_str().ok_or("public key path is not UTF-8")?,
+        "--key-id",
+        "retired-root",
+    ]);
+    assert!(!wrong_root.status.success());
+
+    let restore = run(&[
+        "restore-signed",
+        "--path",
+        backup.to_str().ok_or("backup path is not UTF-8")?,
+        "--expected-tenant",
+        "acme",
+        "--out",
+        restored.to_str().ok_or("restore path is not UTF-8")?,
+        "--public-key-file",
+        public_file.to_str().ok_or("public key path is not UTF-8")?,
+        "--key-id",
+        "backup-root-2026-q3",
+    ]);
+    assert!(restore.status.success(), "{restore:?}");
+    assert!(restored.is_dir());
     Ok(())
 }
