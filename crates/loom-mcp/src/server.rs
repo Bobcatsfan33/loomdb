@@ -11,6 +11,8 @@
 //!   the agent's tool list, so an agent driving `tools/call` cannot find or reach it.
 
 use std::sync::Arc;
+#[cfg(feature = "observability")]
+use std::time::Instant;
 
 use loom_action::{ActionGateway, ActionRecord, AgentStore};
 use loom_branch::{CapabilityToken, Loom, MergePolicy};
@@ -24,6 +26,8 @@ use loom_provenance::Provenance;
 use serde_json::{json, Value as Json};
 
 use crate::protocol::{codes, Request, Response};
+#[cfg(feature = "observability")]
+use crate::telemetry::{RequestObservation, RequestObserver};
 
 /// The server. One tenant, one engine, one policy, one gateway.
 pub struct LoomServer {
@@ -32,6 +36,8 @@ pub struct LoomServer {
     gateway: ActionGateway,
     tenant: String,
     now: u64,
+    #[cfg(feature = "observability")]
+    observer: Option<Arc<dyn RequestObserver>>,
 }
 
 impl LoomServer {
@@ -49,7 +55,17 @@ impl LoomServer {
             gateway,
             tenant: tenant.into(),
             now,
+            #[cfg(feature = "observability")]
+            observer: None,
         }
+    }
+
+    /// Attach a request observer. Telemetry is impossible to attach unless the binary was compiled
+    /// with `observability`, keeping the disabled and air-gap paths free of exporter code.
+    #[cfg(feature = "observability")]
+    pub fn with_observer(mut self, observer: Arc<dyn RequestObserver>) -> Self {
+        self.observer = Some(observer);
+        self
     }
 
     /// The engine, for the operator paths that are not agent tools.
@@ -71,8 +87,10 @@ impl LoomServer {
 
     /// **Handle one JSON-RPC request.** This is the whole MCP surface an agent can reach.
     pub fn handle(&self, req: &Request) -> Response {
+        #[cfg(feature = "observability")]
+        let started = Instant::now();
         let id = req.id.clone();
-        match req.method.as_str() {
+        let response = match req.method.as_str() {
             "initialize" => Response::ok(
                 id,
                 json!({
@@ -88,7 +106,22 @@ impl LoomServer {
                 codes::METHOD_NOT_FOUND,
                 format!("no such method '{other}'"),
             ),
+        };
+        #[cfg(feature = "observability")]
+        if let Some(observer) = &self.observer {
+            let tool = req
+                .params
+                .get("name")
+                .and_then(Json::as_str)
+                .unwrap_or("none");
+            observer.record(RequestObservation {
+                method: &req.method,
+                tool,
+                duration: started.elapsed(),
+                response: &response,
+            });
         }
+        response
     }
 
     /// **The agent's entire menu.** Note what is *not* here: no `action.execute`, no `admin.*`, nothing
