@@ -210,7 +210,7 @@ jobs:
           sha256sum dist/release-receipt.json >> dist/SHA256SUMS
 
       - name: publish build provenance for every released file
-        uses: actions/attest-build-provenance@e8998f949152b193b063cb0ec769d69d929409be
+        uses: actions/attest-build-provenance@0f67c3f4856b2e3261c31976d6725780e5e4c373
         with:
           subject-path: |
             dist/loomd
