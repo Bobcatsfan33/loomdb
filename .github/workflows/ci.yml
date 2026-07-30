@@ -19,6 +19,31 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
+  enterprise-readiness:
+    name: enterprise evidence and decision integrity
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065
+        with:
+          python-version: "3.13"
+      - run: python3 scripts/verify_enterprise_readiness.py
+      - name: open blocking gates cannot be represented as approved
+        run: |
+          python3 - <<'PY'
+          import json
+          from pathlib import Path
+
+          source = Path("docs/enterprise-readiness.json")
+          document = json.loads(source.read_text())
+          document["assessment"]["deploymentDecision"] = "approved"
+          Path("/tmp/loomdb-false-approval.json").write_text(json.dumps(document))
+          PY
+          if python3 scripts/verify_enterprise_readiness.py /tmp/loomdb-false-approval.json; then
+            echo "::error::readiness gate accepted a false production approval"
+            exit 1
+          fi
+
   msrv:
     name: declared MSRV builds the locked workspace
     runs-on: ubuntu-latest

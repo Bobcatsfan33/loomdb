@@ -265,6 +265,8 @@ The architecture of record lives in the substrate repository:
 6. [`docs/operations.md`](docs/operations.md) — running air-gapped: the offline certification, reproducible, and signed update bundles
 7. [`docs/backup-restore.md`](docs/backup-restore.md) — consistent backups, verification, restore, and drills
 8. [`docs/loom-format.md`](docs/loom-format.md) — the on-page record format
+9. [`docs/procurement-readiness.md`](docs/procurement-readiness.md) — the expiring, CI-validated
+   enterprise evidence index and open production gates
 
 ## License
 
