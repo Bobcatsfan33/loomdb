@@ -166,34 +166,67 @@ signature it can check **offline**, against a public key it already holds.
 ### What the enclave does (verify, offline)
 
 ```sh
-loom-bundle-tool verify --public /keys/loom-release.pub --in policy-2026-07.bundle
+loom-bundle-tool verify \
+  --public /keys/loom-release.pub \
+  --require-kind policy \
+  --require-id policy-2026-07 \
+  --require-version 3 \
+  --in policy-2026-07.bundle
 #   → VERIFIED: bundle "policy-2026-07" kind=policy version=3 (…) — safe to apply.
 #   exit 0  → apply it.   any non-zero exit → DO NOT apply.
 ```
 
-`verify` checks **both** that the signature is valid over the bundle's manifest *and* that the
-payload's BLAKE3 hash matches the hash inside that signed manifest — so a genuine signature over one
-payload can never be reused to bless a swapped one. `inspect` prints the manifest without verifying.
+`verify` checks that the signature is valid over the bundle's manifest, that
+the payload's BLAKE3 hash matches the hash inside that signed manifest, and
+that the signed `kind`, `id`, and `version` exactly match the approved change.
+That last gate matters: an authentic old software release or authentic policy
+bundle is still not authorized at a different update door. `inspect` prints the
+manifest without verifying and is never an approval step.
 
-### How a release is signed (the key never touches the repo)
+### How a software release is built and signed
 
-Signing reads the private key from a **file path**, which the release pipeline
-(`.github/workflows/release-bundle.yml`) fills from the `LOOM_BUNDLE_SIGNING_KEY` repository secret,
-writes to a throwaway file, and deletes immediately after signing. The key never enters the source, a
-commit, or a build log.
+The `production-release` GitHub environment owns the
+`LOOM_BUNDLE_SIGNING_KEY` secret, the independently distributed
+`LOOM_BUNDLE_PUBLIC_KEY` variable, required approvers, and a deployment audit
+trail. A protected semantic-version tag starts
+`.github/workflows/release-bundle.yml`; there is no arbitrary payload or manual
+signing input.
 
 ```sh
-# What the pipeline runs (the key file is populated from the secret, not committed):
+# The pipeline signs only the locked, feature-amputated air-gap binary:
 loom-bundle-tool sign --key "$KEY_PATH" \
   --kind software --id "loomd-<sha>" --version "<tag>" \
-  --in target/release/loomd --out loomd.bundle
+  --in dist/loomd --out dist/loomd.bundle
+
+# It then proves the private key matches the separately configured public key
+# and that every authorized claim survived signing:
+loom-bundle-tool verify --public "$PUBLIC_KEY_PATH" \
+  --require-kind software --require-id "loomd-<sha>" \
+  --require-version "<tag>" --in dist/loomd.bundle
 ```
 
 The production keypair is generated **offline** by the operator
-(`loom-bundle-tool keygen --out-secret … --out-public …`); only the public half is distributed to
-enclaves, and only the secret *path* is handed to the pipeline. The mechanism (sign/verify, payload-swap
-rejection, tamper rejection, format-version gating) is covered by `loom-bundle`'s unit tests, which run
-in the ordinary `test` job with a throwaway dev key.
+(`loom-bundle-tool keygen --out-secret … --out-public …`). The private half is
+entered only into the protected environment; the public half and its
+fingerprint are distributed to enclaves through a separate, authenticated
+trust-root ceremony. The public key attached to a release is evidence and a
+convenience copy, not a trust-on-first-use authority.
+
+The workflow refuses vulnerable locked Rust dependencies, proves the release
+dependency graph contains no object-storage client, pins Rust 1.89.0 and every
+third-party action, and uses the tagged commit time plus remapped source paths.
+It compiles `loomd` twice into independent target directories and requires the
+binaries to be byte-identical. Only after that reproducibility gate and
+exact-claim self-verification does it emit an
+SPDX SBOM, SHA-256 checksums, a release receipt, and GitHub build provenance,
+then create the GitHub release with those artifacts. The native bundle remains
+the offline authenticity mechanism; GitHub provenance is complementary
+procurement evidence.
+
+An exported Ed25519 seed in a protected CI environment is the current signing
+boundary. Organizations that require a non-exportable HSM/KMS key must replace
+that step with their approved signer while preserving the exact manifest bytes
+and all verification gates; HSM integration is not claimed by this repository.
 
 ---
 
@@ -205,4 +238,5 @@ in the ordinary `test` job with a throwaway dev key.
 | `loomd` links no object store | `cargo tree -p loom-mcp --no-default-features --features airgap -e no-dev \| grep object_store` | no output |
 | Clock/licence never stop serving | `cargo test -p loom-soak --test airgap_endurance` | green |
 | Isolation holds under churn | `cargo test -p loom-soak --test multitenant_endurance` | green |
-| Update authenticity | `loom-bundle-tool verify --public <key> --in <bundle>` | exit 0 only if genuine |
+| Update authorization | `loom-bundle-tool verify --public <key> --require-kind <kind> --require-id <id> --require-version <version> --in <bundle>` | exit 0 only if genuine and exactly approved |
+| Release provenance | `gh attestation verify <artifact> --repo Bobcatsfan33/loomdb` | tagged workflow identity and matching subject digest |

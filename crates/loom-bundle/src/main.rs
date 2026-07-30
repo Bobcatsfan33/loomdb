@@ -8,7 +8,8 @@
 //! loom-bundle-tool keygen --out-secret dev.key --out-public dev.pub
 //! loom-bundle-tool sign   --key dev.key --kind policy --id policy-2026-07 --version 3 \
 //!                         --in policy.bin --out policy.bundle
-//! loom-bundle-tool verify --public dev.pub --in policy.bundle
+//! loom-bundle-tool verify --public dev.pub --in policy.bundle \
+//!                         --require-kind policy --require-id policy-2026-07 --require-version 3
 //! loom-bundle-tool inspect --in policy.bundle
 //! ```
 
@@ -64,7 +65,7 @@ enum Command {
         #[arg(long)]
         out: PathBuf,
     },
-    /// Verify a bundle against a public key. Exit 0 if it may be applied, non-zero otherwise.
+    /// Verify a bundle and require the exact signed claims approved for this operation.
     Verify {
         /// Path to the hex verifying (public) key.
         #[arg(long)]
@@ -72,6 +73,15 @@ enum Command {
         /// The bundle file.
         #[arg(long = "in")]
         input: PathBuf,
+        /// Exact signed bundle id from the approved change record.
+        #[arg(long)]
+        require_id: String,
+        /// Exact signed artifact kind expected at this update door.
+        #[arg(long)]
+        require_kind: String,
+        /// Exact signed version approved for installation.
+        #[arg(long)]
+        require_version: String,
     },
     /// Print a bundle's manifest without verifying it.
     Inspect {
@@ -139,7 +149,7 @@ fn run(cli: Cli) -> std::result::Result<(), String> {
             let bytes = bundle.to_bytes().map_err(describe)?;
             write_bytes(&out, &bytes)?;
             eprintln!(
-                "signed bundle {:?} ({}, v{}) → {} ({} payload bytes, hash {})",
+                "signed bundle {:?} ({}, version={}) → {} ({} payload bytes, hash {})",
                 bundle.manifest.id,
                 bundle.manifest.kind,
                 bundle.manifest.version,
@@ -150,11 +160,19 @@ fn run(cli: Cli) -> std::result::Result<(), String> {
             Ok(())
         }
 
-        Command::Verify { public, input } => {
+        Command::Verify {
+            public,
+            input,
+            require_id,
+            require_kind,
+            require_version,
+        } => {
             let pub_hex = read_to_string(&public)?;
             let verifying = verifying_key_from_hex(&pub_hex).map_err(describe)?;
             let bundle = Bundle::from_bytes(&read_bytes(&input)?).map_err(describe)?;
-            bundle.verify(&verifying).map_err(describe)?;
+            bundle
+                .verify_for(&verifying, &require_id, &require_kind, &require_version)
+                .map_err(describe)?;
             println!(
                 "VERIFIED: bundle {:?} kind={} version={} ({} bytes) — safe to apply.",
                 bundle.manifest.id,

@@ -73,6 +73,20 @@ pub enum BundleError {
         actual: String,
     },
 
+    /// The bundle is authentic but is not the exact artifact the operator authorized.
+    #[error(
+        "the signed bundle's {claim} is {actual:?}, but this operation requires {expected:?}. \
+         The bundle may be genuine, but it is not authorized for this operation. Do NOT apply it."
+    )]
+    ClaimMismatch {
+        /// The manifest field that did not match.
+        claim: &'static str,
+        /// The exact value required by the change authorization.
+        expected: String,
+        /// The signed value carried by the bundle.
+        actual: String,
+    },
+
     /// A key was not 32 bytes.
     #[error("expected a 32-byte {what} key, got {len} bytes")]
     KeyLength {
@@ -226,6 +240,27 @@ impl Bundle {
         Ok(())
     }
 
+    /// Verify authenticity and bind it to the exact artifact approved for this
+    /// operation.
+    ///
+    /// A valid signature says that the release key signed *some* bundle. It
+    /// does not by itself prevent a genuine policy, model, old software
+    /// release, or differently named artifact from being supplied at the
+    /// wrong update door. Production appliers must call this method with the
+    /// id, kind, and version from the approved change record.
+    pub fn verify_for(
+        &self,
+        public: &VerifyingKey,
+        required_id: &str,
+        required_kind: &str,
+        required_version: &str,
+    ) -> Result<()> {
+        self.verify(public)?;
+        require_claim("id", required_id, &self.manifest.id)?;
+        require_claim("kind", required_kind, &self.manifest.kind)?;
+        require_claim("version", required_version, &self.manifest.version)
+    }
+
     /// Serialize the whole bundle to bytes for transport on physical media.
     pub fn to_bytes(&self) -> Result<Vec<u8>> {
         bincode::serialize(self).map_err(|e| BundleError::Codec {
@@ -241,6 +276,17 @@ impl Bundle {
             detail: e.to_string(),
         })
     }
+}
+
+fn require_claim(claim: &'static str, expected: &str, actual: &str) -> Result<()> {
+    if expected == actual {
+        return Ok(());
+    }
+    Err(BundleError::ClaimMismatch {
+        claim,
+        expected: expected.to_owned(),
+        actual: actual.to_owned(),
+    })
 }
 
 /// Load a 32-byte Ed25519 **signing** key from a hex string (64 hex chars). This is what the release
@@ -286,7 +332,7 @@ pub fn hex_encode(bytes: &[u8]) -> String {
 }
 
 fn hex_decode(s: &str, what: &'static str) -> Result<Vec<u8>> {
-    if s.len() % 2 != 0 {
+    if !s.len().is_multiple_of(2) {
         return Err(BundleError::Hex {
             what,
             detail: format!("odd number of hex digits ({})", s.len()),
@@ -375,6 +421,35 @@ mod tests {
         match bundle.verify(&other.verifying_key()) {
             Err(BundleError::Signature) => {}
             other => panic!("the wrong key must reject, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn an_authentic_bundle_for_a_different_operation_is_refused() {
+        let key = dev_key();
+        let bundle = Bundle::create(
+            "loomd-abc123",
+            "software",
+            "v1.2.3",
+            0,
+            b"binary".to_vec(),
+            &key,
+        )
+        .unwrap();
+
+        bundle
+            .verify_for(&key.verifying_key(), "loomd-abc123", "software", "v1.2.3")
+            .unwrap();
+
+        for (id, kind, version, claim) in [
+            ("loomd-other", "software", "v1.2.3", "id"),
+            ("loomd-abc123", "policy", "v1.2.3", "kind"),
+            ("loomd-abc123", "software", "v1.2.2", "version"),
+        ] {
+            match bundle.verify_for(&key.verifying_key(), id, kind, version) {
+                Err(BundleError::ClaimMismatch { claim: actual, .. }) => assert_eq!(actual, claim),
+                other => panic!("a wrong signed claim must be refused, got {other:?}"),
+            }
         }
     }
 
