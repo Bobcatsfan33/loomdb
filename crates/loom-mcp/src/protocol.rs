@@ -61,6 +61,8 @@ pub mod codes {
     /// The engine refused: out of token scope, policy deny, stale evidence. Not a protocol error — a
     /// decision the client asked for and got.
     pub const DENIED: i64 = -32000;
+    /// The configured request-size or request-rate budget was exhausted.
+    pub const RESOURCE_EXHAUSTED: i64 = -32001;
 }
 
 impl Response {

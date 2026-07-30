@@ -240,3 +240,54 @@ and all verification gates; HSM integration is not claimed by this repository.
 | Isolation holds under churn | `cargo test -p loom-soak --test multitenant_endurance` | green |
 | Update authorization | `loom-bundle-tool verify --public <key> --require-kind <kind> --require-id <id> --require-version <version> --in <bundle>` | exit 0 only if genuine and exactly approved |
 | Release provenance | `gh attestation verify <artifact> --repo Bobcatsfan33/loomdb` | tagged workflow identity and matching subject digest |
+
+## Request admission and secure defaults
+
+`loomd` is one tenant per process and starts with a deny-by-default policy. Production supplies a
+JSON-encoded `PolicySet` through `LOOM_POLICY_FILE`; the same reviewed policy is compiled into both
+the MCP influence checks and the operator action gateway. The file must be a regular file (not a
+symlink/device), at most 1 MiB, not group/world-writable on Unix, contain a 1–128 byte version, and
+contain no more than 10,000 bounded rules. Invalid or ambiguous configuration stops startup.
+
+The legacy permissive development posture is available only with
+`LOOM_ALLOW_PERMISSIVE_POLICY=true`; never set it in a production workload. It is mutually exclusive
+with `LOOM_POLICY_FILE` and emits a supervisor-visible warning.
+
+Every input frame is read with a hard allocation bound and then passes a per-process token bucket:
+
+| Variable | Default | Accepted range |
+|---|---:|---:|
+| `LOOM_MAX_REQUEST_BYTES` | 1 MiB | 256 bytes–16 MiB |
+| `LOOM_REQUESTS_PER_SECOND` | 100 | 1–100,000 |
+| `LOOM_REQUEST_BURST` | 200 | 1–1,000,000 |
+
+Invalid values stop startup with exit code 2. Oversized and rate-limited requests return JSON-RPC
+`-32001` without entering the engine. Put connection limits, cgroups, tenant storage quotas, and
+network DDoS controls in the supervisor or gateway; the stdio daemon cannot enforce those host-level
+budgets.
+
+## Optional OpenTelemetry
+
+Telemetry is compiled out by default and is structurally forbidden in an `airgap` build. Build the
+connected deployment explicitly:
+
+```sh
+cargo build --locked --release -p loom-mcp --features observability
+```
+
+Set `LOOM_OTEL_ENABLED=true` and configure the OTLP/HTTP exporter with the standard
+`OTEL_EXPORTER_OTLP_*` variables. An invalid enable flag or exporter initialization error stops
+startup; explicit operator intent never silently degrades to an unobserved process. The instruments
+are:
+
+- `loomd.rpc.requests`
+- `loomd.rpc.failures`
+- `loomd.rpc.denied`
+- `loomd.rpc.duration` (seconds)
+- `loomd.rpc` spans
+
+Dimensions are allow-listed to known RPC methods, known tool names, and `ok`/`denied`/`error`.
+Tenant IDs, request IDs, arguments, tokens, keys, source text, and response bodies are never exported.
+Route OTLP through the enterprise Collector for mTLS, batching, redaction, and backend fan-out. Alert
+on denial/error rate and latency SLO burn; retain telemetry under the same access and evidence policy
+as other security-relevant operational logs.

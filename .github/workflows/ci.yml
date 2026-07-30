@@ -153,6 +153,12 @@ jobs:
             exit 1
           fi
           echo "OK: loomd airgap binary has no object-storage client compiled in."
+          if cargo tree -p loom-mcp --no-default-features --features airgap -e no-dev \
+               | grep -iE 'opentelemetry|reqwest|prost'; then
+            echo "::error::airgap amputation FAILED — optional telemetry/export dependencies leaked into loomd."
+            exit 1
+          fi
+          echo "OK: loomd airgap binary has zero telemetry/export dependencies."
           echo "loomctl dependency graph (no-dev):"
           cargo tree -p loomctl -e no-dev
           if cargo tree -p loomctl -e no-dev | grep -iE 'object_store|substrate-store'; then
@@ -160,6 +166,23 @@ jobs:
             exit 1
           fi
           echo "OK: loomctl has no object-storage client compiled in."
+
+  observability:
+    name: optional OTLP telemetry
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09
+      - uses: dtolnay/rust-toolchain@2c7215f132e9ebf062739d9130488b56d53c060c
+        with:
+          toolchain: stable
+      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32
+      - run: cargo test -p loom-mcp --features observability
+      - name: exporter is absent when observability is disabled
+        run: |
+          if cargo tree -p loom-mcp -e no-dev | grep -iE 'opentelemetry|opentelemetry-otlp'; then
+            echo "::error::telemetry dependencies leaked into the default loomd graph"
+            exit 1
+          fi
 
   # L5 no-egress certification: the WHOLE suite passes with no route to the outside world. This proves
   # nothing in LoomDB needs egress — sleep/wake tests use the in-memory object-store backend, and the

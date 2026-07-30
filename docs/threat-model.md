@@ -66,13 +66,17 @@ Each of these is a real gap. None is hidden.
    returns no receipt (AT-032) — a connector that fabricates a receipt is outside the model.
 
 4. **Side channels and timing.** The cross-tenant guarantee (AT-039) is about *identifiers and
-   errors* — a tenant cannot name or confirm another's data. It does not analyze timing, cache, or
-   resource side channels between co-located tenants. Co-tenancy hardening is future work.
+   errors* — a tenant cannot name or confirm another's data. One process/pool per tenant plus bounded
+   request size and a per-process token bucket prevent one tenant from entering another tenant's
+   trusted process or consuming an unbounded request buffer. They do not analyze timing, shared-host
+   cache, memory-bandwidth, or kernel-scheduler side channels. High-assurance deployments must use
+   dedicated nodes or confidential-compute isolation where those channels are in scope.
 
-5. **Denial of service.** The taint walk is bounded (AT-025) so a hostile DAG cannot hang the auditor,
-   and the *benchmark harness* now refuses to fill its own disk — but LoomDB does not rate-limit an
-   agent, bound a tenant's storage, or defend the service against a flood. That belongs to the layer in
-   front.
+5. **Denial of service.** The taint walk is bounded (AT-025), `loomd` drains newline-delimited requests
+   without allocating beyond `LOOM_MAX_REQUEST_BYTES`, and each single-tenant process enforces
+   `LOOM_REQUESTS_PER_SECOND` with `LOOM_REQUEST_BURST`. These are admission controls, not a complete
+   DDoS defense: connection limits, CPU/memory cgroups, tenant storage quotas, and upstream network
+   flood protection still belong to the deployment platform.
 
 6. **AT-045 at LoomDB granularity.** Data commits ride substrate's 50,000-cycle crash suite. The durable
    **ref write** — a second object with its own ordering (invariant I-8) — is enforced and unit-tested
