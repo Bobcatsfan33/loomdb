@@ -30,6 +30,7 @@
 #![cfg_attr(test, allow(clippy::unwrap_used, clippy::expect_used, clippy::panic))]
 
 pub mod ann;
+pub mod backup;
 pub mod merge;
 mod refs;
 pub mod session;
@@ -38,6 +39,10 @@ pub mod tenancy;
 pub mod token;
 pub mod tree;
 
+pub use backup::{
+    restore_backup, verify_backup, BackupError, BackupFile, BackupManifest, BACKUP_FORMAT_VERSION,
+    BACKUP_MANIFEST_FILE,
+};
 pub use merge::{
     is_reserved, plan_merge, MergeConflict, MergeConflictReport, MergeOutcome, MergePolicy,
     Resolution, RESERVED_PREFIX,

@@ -29,6 +29,7 @@ use loom_core::{
 };
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
+use std::path::PathBuf;
 use std::sync::{Arc, Mutex, RwLock};
 use substrate_pager::{Clock, PageStore, Pager, StoreConfig};
 
@@ -242,22 +243,16 @@ pub struct SessionHandle {
 /// even when their bytes are identical (substrate docs/02 §9.1). That is not a check we perform; it
 /// is a property of where the bytes are written.
 ///
-/// # What L1 does not persist yet, said plainly
-///
-/// **Branch refs and the commit DAG live in memory.** The *data* is durable — every commit is a
-/// substrate manifest, fsync'd, crash-safe, and every merge writes its bookkeeping into the tree. But
-/// the map from branch name to head, and the multi-parent merge edges, are rebuilt only for the life
-/// of the process.
-///
-/// So: **a restart loses your branch names.** The commits are all still there and still readable by
-/// id; nothing is corrupted and nothing is lost. But you cannot yet ask "where is branch h2" after a
-/// restart.
-///
-/// This is a real gap and it is written down here rather than discovered later. Persisting both — the
-/// refs, and the DAG (which can be rebuilt from the `merged-from` records already in each tree) — is
-/// a prerequisite for L2, because the provenance layer needs to walk history across restarts.
+/// File-backed databases persist branch refs and the multi-parent commit DAG in a checksummed,
+/// log-structured ref store. The manifest is durable before the ref that names it, so a crash may
+/// leave unreachable content-addressed pages but never a ref into missing state.
 pub struct Loom {
     pager: Arc<Pager>,
+    /// Root of the file-backed store. `None` for in-memory or caller-supplied storage.
+    ///
+    /// Online backup is intentionally available only when LoomDB owns this complete local storage
+    /// boundary; a custom pager/ref-store pair must provide its own atomic snapshot primitive.
+    store_root: Option<PathBuf>,
     /// The public keys of the actors allowed to write, if this database authenticates its writers.
     ///
     /// # Why this is optional, and what it costs to leave it empty
@@ -311,6 +306,13 @@ pub struct Loom {
     /// read → advance; the fold's expensive rebuild happens *outside* it, so a fold never stalls the
     /// write path.
     write_lock: Mutex<()>,
+    /// Coordinates operations that traverse or reclaim the complete store with ANN rebuilds that
+    /// intentionally prepare content-addressed pages outside [`Self::write_lock`].
+    ///
+    /// Rebuilds take a read lock through publication. Backup and GC take the write lock before the
+    /// head-mutation lock, so they cannot copy/delete an unpublished rebuild and then let its ref
+    /// become live.
+    maintenance_lock: RwLock<()>,
     issuer: TokenIssuer,
     tenant: TenantId,
     now_ms: Box<dyn Fn() -> u64 + Send + Sync>,
@@ -353,7 +355,9 @@ impl Loom {
             Arc::new(CommitClock::new()),
         )?;
         let refs = FileRefStore::open(path)?;
-        Loom::assemble(Arc::new(pager), Arc::new(refs), tenant)
+        let mut loom = Loom::assemble(Arc::new(pager), Arc::new(refs), tenant)?;
+        loom.store_root = Some(path.to_path_buf());
+        Ok(loom)
     }
 
     /// Open a durable database with the production write-security contract enabled.
@@ -533,12 +537,14 @@ impl Loom {
 
         Ok(Loom {
             pager,
+            store_root: None,
             actor_keys: RwLock::new(None),
             refs: Mutex::new(refs),
             store,
             ref_edits: Mutex::new(Vec::new()),
             read_sets: Mutex::new(BTreeMap::new()),
             write_lock: Mutex::new(()),
+            maintenance_lock: RwLock::new(()),
             issuer: TokenIssuer::generate(),
             tenant,
             now_ms: Box::new(|| {
@@ -678,6 +684,10 @@ impl Loom {
     /// holds, or `0` if it lost every race to a burst of writes (the buffer stays; the next fold wins).
     pub fn ann_fold(&self, token: &CapabilityToken, branch: &BranchId) -> Result<usize> {
         self.issuer.authorize(token, branch, self.now())?;
+        let _maintenance = self
+            .maintenance_lock
+            .read()
+            .unwrap_or_else(|error| error.into_inner());
         const MAX_RETRIES: usize = 8;
         for _ in 0..MAX_RETRIES {
             let head = self.head(branch)?;
@@ -991,6 +1001,7 @@ impl Loom {
         &self,
         session: SessionId,
     ) -> Result<(SessionHandle, CapabilityToken)> {
+        let _wg = self.write_guard();
         let base = self.head(&BranchId::new(MAIN))?;
         let branch = BranchId::new(session.as_str());
 
@@ -1057,6 +1068,7 @@ impl Loom {
     ) -> Result<(BranchId, CapabilityToken)> {
         self.issuer.authorize(token, from, self.now())?;
 
+        let _wg = self.write_guard();
         let head = self.head(from)?;
         let new_branch = BranchId::new(name);
         self.create_branch(new_branch.as_str(), head)?;
@@ -2024,10 +2036,56 @@ impl Loom {
     /// Roots come from the branch tree — every branch and every tag. Handing GC an incomplete set of
     /// roots is how you delete a customer's data, so we never assemble one by hand.
     pub fn gc(&self) -> Result<substrate_pager::GcStats> {
+        let _maintenance = self
+            .maintenance_lock
+            .write()
+            .unwrap_or_else(|error| error.into_inner());
+        let _wg = self.write_guard();
         // Roots come from the refs — every branch AND every tag. Handing GC an incomplete set of
         // roots is how you delete a customer's data, so we never assemble one by hand.
         let roots = self.refs().roots();
         Ok(self.pager.gc(&roots)?)
+    }
+
+    /// Verify every page and manifest reachable from every branch and tag.
+    ///
+    /// This is an integrity audit, not a repair. It takes the maintenance and mutation boundaries so
+    /// the live-root set cannot change underneath the scrub.
+    pub fn verify_integrity(&self) -> Result<substrate_pager::CorruptionReport> {
+        let _maintenance = self
+            .maintenance_lock
+            .write()
+            .unwrap_or_else(|error| error.into_inner());
+        let _wg = self.write_guard();
+        let roots = self.refs().roots();
+        Ok(self.pager.scrub(&roots)?)
+    }
+
+    /// Create an online, content-verified backup of a file-backed LoomDB.
+    ///
+    /// The same mutation lock used by branch writes is held from the final ref-log flush through the
+    /// copy, so the backup names one consistent committed prefix. Content-addressed orphan pages from
+    /// an abandoned background rebuild may be copied, but no copied ref can point at a missing page.
+    /// In-memory and caller-supplied storage are refused because LoomDB does not own a complete local
+    /// snapshot boundary for them.
+    pub fn backup_to(
+        &self,
+        destination: impl AsRef<std::path::Path>,
+    ) -> std::result::Result<crate::backup::BackupManifest, crate::backup::BackupError> {
+        let root = self.store_root.as_ref().ok_or_else(|| {
+            crate::backup::BackupError::Unsupported(
+                "online backup requires a database opened with Loom::open or a production variant"
+                    .into(),
+            )
+        })?;
+        let _maintenance = self
+            .maintenance_lock
+            .write()
+            .unwrap_or_else(|error| error.into_inner());
+        let _wg = self.write_guard();
+        self.persist()
+            .map_err(|error| crate::backup::BackupError::Engine(error.to_string()))?;
+        crate::backup::create_backup(root, destination.as_ref(), self.tenant.as_str())
     }
 
     /// The underlying pager. Debug and diagnostics only.
