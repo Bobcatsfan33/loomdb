@@ -3,8 +3,14 @@
 //! One line in, one line out — newline-delimited JSON, the simplest transport MCP allows. The engine
 //! is in-process; this is a single-tenant daemon. Real deployments put a transport and a tenant router
 //! in front of it, but the protocol surface an agent sees is exactly what this serves.
+//!
+//! The process serves exactly one tenant (`LOOM_TENANT`) out of exactly one store
+//! (`LOOM_DATA_DIR`). That 1:1:1 shape is what makes cross-tenant reach structurally impossible
+//! rather than a runtime filter, and it is the contract the reference host profile in
+//! `deploy/reference` renders. See `docs/host-profile.md`.
 
 use std::io::{BufReader, Write};
+use std::path::PathBuf;
 use std::sync::Arc;
 
 use loom_action::ActionGateway;
@@ -30,7 +36,7 @@ fn main() -> std::io::Result<()> {
         std::process::exit(2);
     });
     let tenant = std::env::var("LOOM_TENANT").unwrap_or_else(|_| "default".into());
-    let db = match Loom::in_memory(TenantId::new(tenant.as_str())) {
+    let db = match open_engine(&tenant) {
         Ok(db) => Arc::new(db),
         Err(e) => {
             eprintln!("loomd: could not open engine: {e}");
@@ -111,6 +117,50 @@ fn main() -> std::io::Result<()> {
         })?;
     }
     Ok(())
+}
+
+/// Open this process's single tenant store.
+///
+/// Without `LOOM_DATA_DIR` the daemon stays in-memory: nothing survives the process, which is right
+/// for the demo and for tests but is not a deployment. With `LOOM_DATA_DIR` the daemon opens a
+/// durable store at that path, so a restarted host reopens the same committed state.
+///
+/// The directory is validated fail-closed: it must be a real directory — not a symlink an attacker
+/// could repoint at another tenant's store between restarts — and it must not be world-writable. A
+/// misconfigured data directory stops startup rather than silently serving the wrong store.
+///
+/// Unlike `LOOM_POLICY_FILE`, the *group* write bit is permitted here. A reviewed policy file has one
+/// owner and no reason to be group-writable, but a data directory does: Kubernetes applies `fsGroup`
+/// to a mounted volume by granting the group write access, so requiring `g-w` would stop every
+/// non-root pod with a persistent volume — including the one the reference profile renders. Exclusion
+/// of a second writer is enforced where it actually can be: the exclusive advisory lock on
+/// `<store>/loom/store.lock`, which fails closed for a second process whatever the directory mode.
+fn open_engine(tenant: &str) -> Result<Loom, String> {
+    let tenant = TenantId::new(tenant);
+    let Some(data_dir) = std::env::var_os("LOOM_DATA_DIR") else {
+        return Loom::in_memory(tenant).map_err(|error| error.to_string());
+    };
+    let path = PathBuf::from(data_dir);
+    let metadata = std::fs::symlink_metadata(&path)
+        .map_err(|error| format!("cannot inspect LOOM_DATA_DIR {}: {error}", path.display()))?;
+    if !metadata.file_type().is_dir() {
+        return Err(format!(
+            "LOOM_DATA_DIR {} must be an existing directory, not a symlink, file, or device",
+            path.display()
+        ));
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        if metadata.permissions().mode() & 0o002 != 0 {
+            return Err(format!(
+                "LOOM_DATA_DIR {} must not be world-writable",
+                path.display()
+            ));
+        }
+    }
+    Loom::open(&path, tenant)
+        .map_err(|error| format!("cannot open store at {}: {error}", path.display()))
 }
 
 fn load_policy() -> Result<PolicySet, String> {

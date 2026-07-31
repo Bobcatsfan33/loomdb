@@ -1,0 +1,52 @@
+# Reference production image for loomDB.
+#
+# Non-root, no shell, no package manager, no object-storage client. The engine is the only thing in
+# the final layer besides the two operator tools the deployment path needs: `loom-bundle-tool` to
+# verify the signed release bundle offline before serving, and `loomctl` for read-only diagnostics
+# and verified backups.
+#
+# The front door is NOT in this image. `loomd` speaks newline-delimited JSON-RPC over stdio and ships
+# no network listener; terminating TLS and authorizing clients belongs to the host (see
+# docs/host-profile.md). Keeping the proxy out of this image keeps that boundary visible.
+#
+# Build:
+#   podman build -f deploy/reference/Containerfile -t loomd:local .
+#
+# Two operator responsibilities this file cannot discharge:
+#   1. Pin both base images by digest (`FROM rust@sha256:...`) against your mirrored registry. The
+#      versioned tags below are reproducible-by-convention, not immutable.
+#   2. Record the resulting image digest in deploy/reference/profile.json. Deployment manifests
+#      reference the image only by digest; scripts/verify_host_profile.py enforces that.
+
+# Rust 1.89.0 is the declared MSRV (Cargo.toml `rust-version`). Do not float this.
+FROM rust:1.89.0-bookworm AS build
+
+WORKDIR /src
+COPY . .
+
+# --locked: build exactly the reviewed dependency graph.
+# --no-default-features --features airgap: the amputation. loom-branch's remote sleep/wake path is
+# the only code in the workspace that links an object-storage client, and it is compiled out here.
+# The `airgap` CI job proves the resulting graph contains neither object_store nor substrate-store.
+RUN cargo build --locked --release \
+        -p loom-mcp --no-default-features --features airgap \
+    && cargo build --locked --release -p loom-bundle -p loomctl \
+    && strip target/release/loomd target/release/loom-bundle-tool target/release/loomctl
+
+# Distroless: no shell, no package manager, nothing for a compromised process to exec. The `nonroot`
+# variant runs as uid/gid 65532, which is the identity deploy/reference/profile.json declares.
+FROM gcr.io/distroless/cc-debian12:nonroot
+
+COPY --from=build /src/target/release/loomd /usr/local/bin/loomd
+COPY --from=build /src/target/release/loom-bundle-tool /usr/local/bin/loom-bundle-tool
+COPY --from=build /src/target/release/loomctl /usr/local/bin/loomctl
+
+# Must match hardening.runAsUser / hardening.runAsGroup in profile.json.
+USER 65532:65532
+
+# The engine writes only to its tenant's data directory, which the host mounts. Everything else,
+# including this root filesystem, is read-only at runtime (readOnlyRootFilesystem: true).
+# LOOM_TENANT, LOOM_DATA_DIR, and LOOM_POLICY_FILE are supplied per tenant by the host; loomd
+# deliberately has no defaults for them that would let a misconfigured deployment serve the wrong
+# store or an empty policy.
+ENTRYPOINT ["/usr/local/bin/loomd"]

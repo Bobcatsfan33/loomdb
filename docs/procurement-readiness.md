@@ -44,8 +44,16 @@ telemetry routing, privacy/residency, and human incident response. A managed off
 move those responsibilities into its own audited control environment before answering CAIQ as a cloud
 service provider.
 
-Run the exact gate locally:
+For the deployment-owned half, [`host-profile.md`](host-profile.md) is the supported reference posture:
+network identity and authenticated TLS, process and filesystem isolation, resource ceilings,
+default-deny networking, digest-pinned artifacts with offline bundle verification, and
+one-tenant-per-process-and-store routing — rendered as configuration in
+[`deploy/reference`](../deploy/reference) and gated in CI. It is a reference, not a deployed or
+independently assessed environment, and it does not change the decision above.
+
+Run the exact gates locally:
 
 ```sh
 python3 scripts/verify_enterprise_readiness.py
+python3 scripts/verify_host_profile.py
 ```

@@ -94,9 +94,20 @@
       "title": "Identity, authorization, and tenant isolation",
       "status": "partial",
       "frameworks": ["owasp-asvs-5.0.0", "csa-ccm-caiq-4.1", "csa-ai-caiq-1.0.2"],
-      "evidence": ["SECURITY.md", "docs/threat-model.md", "docs/at-map.md"],
+      "evidence": [
+        "SECURITY.md",
+        "docs/threat-model.md",
+        "docs/at-map.md",
+        "docs/host-profile.md",
+        "deploy/reference/profile.json",
+        "deploy/reference/kubernetes/30-tenant-alpha.yaml",
+        "deploy/reference/systemd/loomd@.service",
+        "scripts/verify_host_profile.py",
+        "crates/loom-mcp/tests/host_profile.rs"
+      ],
       "gaps": [
-        "The host deployment must provide network identity, TLS, process isolation, and one-pool-per-tenant routing."
+        "A supported reference host profile now renders network identity, authenticated TLS, process and filesystem isolation, resource ceilings, default-deny networking, and one-tenant-per-process-and-store routing, gated by scripts/verify_host_profile.py. The deploying organization must still substitute its own trust domain, client identities, artifact digests, and secret material, and no such deployment has been independently assessed.",
+        "loomd opens its store with Loom::open, not Loom::open_production_attested, so writes over the MCP surface are attributable but not signature-authenticated. The reference profile mounts an externally managed actor registry read-only but does not make the daemon enforce it."
       ]
     },
     {

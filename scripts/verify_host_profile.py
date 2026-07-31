@@ -1,0 +1,445 @@
+#!/usr/bin/env python3
+"""Gate the reference production host profile.
+
+Three checks, in order:
+
+1. **The committed profile is valid** and the rendered Kubernetes/systemd artifacts are current, so
+   what a reviewer reads is what the declaration produces.
+2. **The rendered text upholds the controls that live in the output**, not just in the declaration —
+   one tenant per manifest, no permissive-policy escape hatch anywhere, every image by digest.
+3. **The gate actually fires.** Every unsafe posture is applied to an in-memory copy of the profile
+   and must be rejected. A validator nobody has watched fail is not evidence; this is the same
+   discipline as the false-approval check in the enterprise-readiness job.
+
+Run it:
+    python3 scripts/verify_host_profile.py
+"""
+
+from __future__ import annotations
+
+import copy
+import json
+import pathlib
+import sys
+from typing import Any, Callable
+
+sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent))
+
+from render_host_profile import (  # noqa: E402
+    PROFILE,
+    RENDER_ROOT,
+    ProfileError,
+    drift,
+    render,
+    validate,
+)
+
+
+def load_raw() -> dict[str, Any]:
+    return json.loads(PROFILE.read_text(encoding="utf-8"))
+
+
+# ── 2. invariants that live in the rendered output ───────────────────────────────────────────────
+
+
+def check_rendered(profile: dict[str, Any], artifacts: dict[str, str]) -> list[str]:
+    """Assert the emitted configuration cannot express the postures the profile forbids."""
+    problems: list[str] = []
+    tenants = profile["tenants"]
+
+    for relative, content in sorted(artifacts.items()):
+        # The permissive development policy must never be *configured*. A comment may explain why it
+        # is absent, so this looks for the variable being set — as a Kubernetes env entry or as a
+        # systemd assignment — rather than for the word appearing anywhere.
+        for pattern in (
+            "name: LOOM_ALLOW_PERMISSIVE_POLICY",
+            "LOOM_ALLOW_PERMISSIVE_POLICY=",
+            "LOOM_ALLOW_PERMISSIVE_POLICY:",
+        ):
+            if pattern in content:
+                problems.append(f"{relative} configures LOOM_ALLOW_PERMISSIVE_POLICY ({pattern!r})")
+        # Every image reference is a digest. A mutable tag would break the immutable-artifact control.
+        for line in content.splitlines():
+            stripped = line.strip()
+            if stripped.startswith(("image:", "- image:")):
+                reference = stripped.split(":", 1)[1].strip()
+                if "@sha256:" not in reference:
+                    problems.append(f"{relative} pins an image by tag, not digest: {reference}")
+        if "runAsUser: 0" in content or "runAsUser: root" in content:
+            problems.append(f"{relative} would run as root")
+
+    # ── THE CROSS-TENANT ROUTING CHECK, on the rendered bytes ───────────────────────────────────
+    # A tenant's manifest must name that tenant and no other. If a rendering bug or a hand edit ever
+    # put two tenants' identities or stores in one workload, this fails — the guarantee is checked on
+    # the artifact that gets applied, not only on the declaration it came from.
+    for tenant in tenants:
+        relative = f"kubernetes/30-tenant-{tenant['name']}.yaml"
+        content = artifacts.get(relative)
+        if content is None:
+            problems.append(f"{relative} was not rendered")
+            continue
+        if f"LOOM_TENANT\n              value: {tenant['tenantId']}" not in content:
+            problems.append(f"{relative} does not set LOOM_TENANT to {tenant['tenantId']}")
+        if content.count("name: LOOM_TENANT") != 1:
+            problems.append(f"{relative} sets LOOM_TENANT more than once")
+        if content.count("name: LOOM_DATA_DIR") != 1:
+            problems.append(f"{relative} sets LOOM_DATA_DIR more than once")
+        for other in tenants:
+            if other["name"] == tenant["name"]:
+                continue
+            if other["tenantId"] in content:
+                problems.append(
+                    f"{relative} names another tenant's id {other['tenantId']!r}; one process "
+                    "must serve exactly one tenant"
+                )
+            if other["dataDir"] in content:
+                problems.append(
+                    f"{relative} names another tenant's data directory {other['dataDir']!r}"
+                )
+
+    namespace = artifacts["kubernetes/00-namespace.yaml"]
+    if "pod-security.kubernetes.io/enforce: restricted" not in namespace:
+        problems.append("the namespace does not enforce the restricted Pod Security Standard")
+    if "automountServiceAccountToken: false" not in namespace:
+        problems.append("the service account still mounts a token")
+
+    policy = artifacts["kubernetes/10-network-policy.yaml"]
+    # Default deny: an empty pod selector plus both policy types, with no rules under the deny object.
+    if "podSelector: {}" not in policy:
+        problems.append("the network policy does not select every pod for default deny")
+    deny = policy.split("---")[0]
+    for required in ("- Ingress", "- Egress"):
+        if required not in deny:
+            problems.append(f"the default-deny network policy is missing policyType {required}")
+    if "ingress:" in deny or "egress:" in deny:
+        problems.append(
+            "the default-deny network policy carries rules; it must deny by naming both policy "
+            "types with no rules at all"
+        )
+
+    front_door = artifacts["kubernetes/20-front-door-config.yaml"]
+    declared = profile["frontDoor"]
+    if "require_client_certificate: true" not in front_door:
+        problems.append("the front door does not require a client certificate")
+    # Scalars are emitted quoted (see to_yaml); accept either form so the check tracks the control and
+    # not the quoting style.
+    if not any(
+        f"address: {form}" in front_door
+        for form in (declared["bridgeBindAddress"], f'"{declared["bridgeBindAddress"]}"')
+    ):
+        problems.append("the stdio bridge is not bound to loopback")
+    if not any(
+        f"address: {form}" in front_door
+        for form in (declared["adminBindAddress"], f'"{declared["adminBindAddress"]}"')
+    ):
+        problems.append("the proxy admin interface is not bound to loopback")
+    # Every authorized client must be an *authenticated* identity, not merely a valid certificate.
+    for identity in declared["authorizedClientIdentities"]:
+        if identity not in front_door:
+            problems.append(f"the front door does not authorize {identity}")
+    if "authenticated:" not in front_door:
+        problems.append(
+            "the front door authorizes by something other than an authenticated principal; a valid "
+            "certificate alone must not be sufficient"
+        )
+
+    unit = artifacts["systemd/loomd@.service"]
+    for required in ("ProtectSystem=strict", "NoNewPrivileges=yes", "IPAddressDeny=any"):
+        if required not in unit:
+            problems.append(f"the systemd unit is missing {required}")
+    if "CapabilityBoundingSet=\n" not in unit:
+        problems.append("the systemd unit does not empty the capability bounding set")
+
+    problems.extend(check_container_image(profile))
+    return problems
+
+
+def check_container_image(profile: dict[str, Any]) -> list[str]:
+    """The image build must match the identity and posture the manifests assume."""
+    problems: list[str] = []
+    path = RENDER_ROOT / "Containerfile"
+    if not path.is_file():
+        return [f"{path.name} is missing"]
+    content = path.read_text(encoding="utf-8")
+    hardening = profile["hardening"]
+
+    expected_user = f"USER {hardening['runAsUser']}:{hardening['runAsGroup']}"
+    if expected_user not in content:
+        problems.append(
+            f"Containerfile does not declare '{expected_user}'; the image identity must match the "
+            "runAsUser/runAsGroup the manifests enforce"
+        )
+    if "USER root" in content or "USER 0" in content:
+        problems.append("Containerfile runs as root")
+    # The image must be the amputated build: no object-storage client compiled in.
+    if "--no-default-features" not in content or "airgap" not in content:
+        problems.append(
+            "Containerfile does not build loomd air-gapped "
+            "('--no-default-features --features airgap')"
+        )
+    if "--locked" not in content:
+        problems.append("Containerfile does not build --locked against the reviewed graph")
+    for line in content.splitlines():
+        if line.startswith("FROM ") and ":latest" in line:
+            problems.append(f"Containerfile floats a base image on :latest: {line.strip()}")
+    return problems
+
+
+# ── 3. the gate must fire ───────────────────────────────────────────────────────────────────────
+
+
+def with_change(mutate: Callable[[dict[str, Any]], None]) -> dict[str, Any]:
+    document = load_raw()
+    mutate(document)
+    return document
+
+
+def unsafe_postures() -> list[tuple[str, Callable[[dict[str, Any]], None]]]:
+    """Every posture the reference profile must refuse to express."""
+
+    def share_tenant_id(document: dict[str, Any]) -> None:
+        document["tenants"][1]["tenantId"] = document["tenants"][0]["tenantId"]
+
+    def share_data_dir(document: dict[str, Any]) -> None:
+        document["tenants"][1]["dataDir"] = document["tenants"][0]["dataDir"]
+
+    def nest_data_dir(document: dict[str, Any]) -> None:
+        document["tenants"][1]["dataDir"] = document["tenants"][0]["dataDir"] + "/nested"
+
+    def share_volume(document: dict[str, Any]) -> None:
+        document["tenants"][1]["volumeClaim"] = document["tenants"][0]["volumeClaim"]
+
+    def share_name(document: dict[str, Any]) -> None:
+        document["tenants"][1]["name"] = document["tenants"][0]["name"]
+
+    def run_as_root(document: dict[str, Any]) -> None:
+        document["hardening"]["runAsUser"] = 0
+
+    def writable_root(document: dict[str, Any]) -> None:
+        document["hardening"]["readOnlyRootFilesystem"] = False
+
+    def allow_privilege_escalation(document: dict[str, Any]) -> None:
+        document["hardening"]["allowPrivilegeEscalation"] = True
+
+    def keep_capabilities(document: dict[str, Any]) -> None:
+        document["hardening"]["dropCapabilities"] = ["NET_BIND_SERVICE"]
+
+    def unconfined_seccomp(document: dict[str, Any]) -> None:
+        document["hardening"]["seccompProfile"] = "Unconfined"
+
+    def unconfined_apparmor(document: dict[str, Any]) -> None:
+        document["hardening"]["apparmorProfile"] = "unconfined"
+
+    def mount_token(document: dict[str, Any]) -> None:
+        document["hardening"]["automountServiceAccountToken"] = True
+
+    def stale_token_justification(document: dict[str, Any]) -> None:
+        document["hardening"]["serviceAccountTokenJustification"] = "used to be needed"
+
+    def anonymous_clients(document: dict[str, Any]) -> None:
+        document["frontDoor"]["requireClientCertificate"] = False
+
+    def any_valid_certificate(document: dict[str, Any]) -> None:
+        document["frontDoor"]["authorizedClientIdentities"] = []
+
+    def weak_tls(document: dict[str, Any]) -> None:
+        document["frontDoor"]["minimumTlsVersion"] = "TLSv1_0"
+
+    def expose_the_bridge(document: dict[str, Any]) -> None:
+        document["frontDoor"]["bridgeBindAddress"] = "0.0.0.0"
+
+    def expose_admin(document: dict[str, Any]) -> None:
+        document["frontDoor"]["adminBindAddress"] = "0.0.0.0"
+
+    def mutable_image(document: dict[str, Any]) -> None:
+        document["image"]["digest"] = "latest"
+
+    def unpinned_proxy(document: dict[str, Any]) -> None:
+        document["frontDoor"]["image"]["digest"] = "v1.31-latest"
+
+    def drop_bundle_verification(document: dict[str, Any]) -> None:
+        del document["image"]["bundle"]["publicKeyPath"]
+
+    def ship_an_object_store_client(document: dict[str, Any]) -> None:
+        document["image"]["build"] = "--release"
+
+    def bake_in_the_policy(document: dict[str, Any]) -> None:
+        document["externalMounts"]["policy"]["source"] = "image"
+
+    def writable_secret(document: dict[str, Any]) -> None:
+        document["externalMounts"]["policy"]["mode"] = "0460"
+
+    def writable_trust_root(document: dict[str, Any]) -> None:
+        document["externalMounts"]["trustRoot"]["readOnly"] = False
+
+    def overlapping_mounts(document: dict[str, Any]) -> None:
+        document["externalMounts"]["trustRoot"]["mountPath"] = document["externalMounts"]["policy"][
+            "mountPath"
+        ]
+
+    def policy_outside_the_mount(document: dict[str, Any]) -> None:
+        document["tenants"][0]["policyFile"] = "/tmp/policy.json"
+
+    def permissive_policy_file(document: dict[str, Any]) -> None:
+        document["tenants"][0]["policyFile"] = "/etc/loomd/policy/permissive.json"
+
+    def no_policy_at_all(document: dict[str, Any]) -> None:
+        del document["tenants"][0]["policyFile"]
+
+    def unbounded_requests(document: dict[str, Any]) -> None:
+        document["limits"]["maxRequestBytes"] = 1024 * 1024 * 1024
+
+    def no_process_limit(document: dict[str, Any]) -> None:
+        del document["limits"]["processes"]
+
+    def invented_metric(document: dict[str, Any]) -> None:
+        document["observability"]["instruments"].append("loomd.rpc.tenant_detail")
+
+    def unbounded_cardinality(document: dict[str, Any]) -> None:
+        document["observability"]["forbiddenDimensions"].remove("tenant")
+
+    def plaintext_telemetry(document: dict[str, Any]) -> None:
+        document["observability"]["otlpEndpoint"] = "http://collector:4317"
+
+    def telemetry_without_an_exporter(document: dict[str, Any]) -> None:
+        # No `observability` feature in the build, so LOOM_OTEL_ENABLED would configure nothing.
+        document["observability"]["enabled"] = True
+
+    def exporter_linked_but_unused(document: dict[str, Any]) -> None:
+        # The mirror image: attack surface carried for a pipeline that is switched off.
+        document["image"]["build"] = "--no-default-features --features airgap,observability"
+
+    def telemetry_off_without_a_reason(document: dict[str, Any]) -> None:
+        del document["observability"]["disabledReason"]
+
+    def widen_egress_to_the_front_door(document: dict[str, Any]) -> None:
+        # Start from a *valid* connected profile, so this posture tests the egress rule and not the
+        # telemetry coupling that would otherwise reject it first.
+        document["observability"]["enabled"] = True
+        document["image"]["build"] = "--no-default-features --features airgap,observability"
+        document["observability"].pop("disabledReason", None)
+        document["egressAllowed"].append(
+            {
+                "description": "oops",
+                "namespace": "anywhere",
+                "port": document["frontDoor"]["listenPort"],
+            }
+        )
+
+    def egress_without_telemetry(document: dict[str, Any]) -> None:
+        document["egressAllowed"].append(
+            {"description": "unused hole", "namespace": "observability", "port": 4317}
+        )
+
+    def no_tenants(document: dict[str, Any]) -> None:
+        document["tenants"] = []
+
+    return [
+        ("two tenants share one tenant id", share_tenant_id),
+        ("two tenants share one data directory", share_data_dir),
+        ("one tenant's store nests inside another's", nest_data_dir),
+        ("two tenants share one volume claim", share_volume),
+        ("two tenants share one workload name", share_name),
+        ("the engine runs as root", run_as_root),
+        ("the root filesystem is writable", writable_root),
+        ("privilege escalation is allowed", allow_privilege_escalation),
+        ("capabilities are retained", keep_capabilities),
+        ("seccomp is unconfined", unconfined_seccomp),
+        ("AppArmor is unconfined", unconfined_apparmor),
+        ("a service-account token is mounted without justification", mount_token),
+        ("a justification outlives the token it described", stale_token_justification),
+        ("the front door accepts anonymous clients", anonymous_clients),
+        ("any valid certificate is authorized", any_valid_certificate),
+        ("TLS below 1.2 is permitted", weak_tls),
+        ("the stdio bridge is exposed off-host", expose_the_bridge),
+        ("the proxy admin interface is exposed", expose_admin),
+        ("the engine image is a mutable tag", mutable_image),
+        ("the proxy image is a mutable tag", unpinned_proxy),
+        ("offline bundle verification is dropped", drop_bundle_verification),
+        ("the image ships an object-storage client", ship_an_object_store_client),
+        ("the policy is baked into the image", bake_in_the_policy),
+        ("a mounted secret is group-writable", writable_secret),
+        ("the trust root is mounted writable", writable_trust_root),
+        ("two external mounts overlap", overlapping_mounts),
+        ("the policy comes from outside the read-only mount", policy_outside_the_mount),
+        ("a permissive policy is named", permissive_policy_file),
+        ("a tenant has no policy at all", no_policy_at_all),
+        ("request size is unbounded beyond the engine's range", unbounded_requests),
+        ("no process limit is set", no_process_limit),
+        ("a metric the daemon never emits is wired", invented_metric),
+        ("tenant identity is allowed into telemetry dimensions", unbounded_cardinality),
+        ("telemetry leaves in plaintext", plaintext_telemetry),
+        ("telemetry is enabled with no exporter compiled in", telemetry_without_an_exporter),
+        ("the exporter is linked into a build that never uses it", exporter_linked_but_unused),
+        ("telemetry is disabled with no reason recorded", telemetry_off_without_a_reason),
+        ("egress is opened while telemetry is disabled", egress_without_telemetry),
+        ("egress is widened to the front-door port", widen_egress_to_the_front_door),
+        ("no tenant is declared", no_tenants),
+    ]
+
+
+def run() -> int:
+    # 1. the committed profile is valid and the rendered artifacts are current
+    raw = load_raw()
+    profile = validate(copy.deepcopy(raw))
+    artifacts = render(profile)
+    stale = drift(artifacts)
+    if stale:
+        print(
+            "host profile artifacts are stale; run "
+            "`python3 scripts/render_host_profile.py --write`:",
+            file=sys.stderr,
+        )
+        for relative in stale:
+            print(f"  {relative}", file=sys.stderr)
+        return 1
+    for relative in sorted(artifacts):
+        target = RENDER_ROOT / relative
+        if target.is_symlink() or not target.is_file():
+            print(f"rendered artifact is not a regular file: {relative}", file=sys.stderr)
+            return 1
+
+    # 2. the rendered output upholds the controls that live in the output
+    problems = check_rendered(profile, artifacts)
+    if problems:
+        print("rendered host profile violates its own controls:", file=sys.stderr)
+        for problem in problems:
+            print(f"  {problem}", file=sys.stderr)
+        return 1
+
+    # 3. the gate must fire on every unsafe posture
+    accepted: list[str] = []
+    for description, mutate in unsafe_postures():
+        try:
+            validate(with_change(mutate))
+        except ProfileError:
+            continue
+        except (KeyError, TypeError, ValueError) as error:
+            # A tamper that trips a different guard is still a rejection, but the profile gate should
+            # be the thing that names it. Surface it rather than counting it as a pass.
+            print(
+                f"  NOTE: {description!r} was rejected by {type(error).__name__}: {error}",
+                file=sys.stderr,
+            )
+            continue
+        accepted.append(description)
+    if accepted:
+        print("the host-profile gate ACCEPTED unsafe postures:", file=sys.stderr)
+        for description in accepted:
+            print(f"  {description}", file=sys.stderr)
+        return 1
+
+    print(
+        "host profile gate passed: "
+        f"{len(profile['tenants'])} tenants, {len(artifacts)} rendered artifacts current, "
+        f"{len(unsafe_postures())} unsafe postures rejected"
+    )
+    return 0
+
+
+if __name__ == "__main__":
+    try:
+        raise SystemExit(run())
+    except (OSError, json.JSONDecodeError, ProfileError) as error:
+        print(f"host profile verification failed: {error}", file=sys.stderr)
+        raise SystemExit(1) from error

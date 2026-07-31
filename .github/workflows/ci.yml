@@ -44,6 +44,41 @@ jobs:
             exit 1
           fi
 
+  host-profile:
+    name: reference host profile upholds its controls
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065
+        with:
+          python-version: "3.13"
+      # Validates deploy/reference/profile.json, proves the committed Kubernetes and systemd
+      # artifacts still match it byte for byte, checks the controls that live in the rendered text,
+      # and applies every unsafe posture to require it is rejected.
+      - run: python3 scripts/verify_host_profile.py
+      - name: the profile gate cannot be satisfied by an unsafe posture
+        run: |
+          python3 - <<'PY'
+          import json
+          import pathlib
+          import sys
+
+          sys.path.insert(0, "scripts")
+          from render_host_profile import ProfileError, validate
+
+          # The control this repository cares about most: two tenants must never share one store.
+          # If the gate ever accepts this, the one-tenant-per-process guarantee is decoration.
+          document = json.loads(pathlib.Path("deploy/reference/profile.json").read_text())
+          document["tenants"][1]["dataDir"] = document["tenants"][0]["dataDir"]
+          try:
+              validate(document)
+          except ProfileError as error:
+              print(f"correctly rejected: {error}")
+          else:
+              print("::error::host profile gate accepted two tenants sharing one data directory")
+              raise SystemExit(1)
+          PY
+
   msrv:
     name: declared MSRV builds the locked workspace
     runs-on: ubuntu-latest
