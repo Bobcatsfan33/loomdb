@@ -1,0 +1,138 @@
+{
+  "schemaVersion": 1,
+  "profile": "loomdb-reference-host",
+  "description": "Supported reference production host profile for loomDB. Declarative source of truth; scripts/render_host_profile.py renders the committed Kubernetes and systemd artifacts from it.",
+  "namespace": "loomdb-reference",
+  "image": {
+    "repository": "ghcr.io/bobcatsfan33/loomd",
+    "digest": "sha256:0000000000000000000000000000000000000000000000000000000000000000",
+    "digestIsPlaceholder": true,
+    "build": "--no-default-features --features airgap",
+    "bundle": {
+      "kind": "software",
+      "id": "loomd-air-gap",
+      "version": "v0.4.0",
+      "publicKeyPath": "/etc/loomd/trust/loom-release.pub",
+      "payloadPath": "/usr/local/bin/loomd",
+      "bundlePath": "/etc/loomd/trust/loomd.bundle"
+    }
+  },
+  "frontDoor": {
+    "kind": "mtls-terminating-proxy",
+    "implementation": "envoy",
+    "image": {
+      "repository": "docker.io/envoyproxy/envoy",
+      "digest": "sha256:1111111111111111111111111111111111111111111111111111111111111111",
+      "digestIsPlaceholder": true
+    },
+    "identity": "spiffe://example.org/ns/loomdb-reference/sa/loomd",
+    "trustDomain": "example.org",
+    "listenPort": 8443,
+    "requireClientCertificate": true,
+    "minimumTlsVersion": "TLSv1_3",
+    "healthPort": 9902,
+    "adminBindAddress": "127.0.0.1",
+    "bridgeBindAddress": "127.0.0.1",
+    "bridgePort": 9090,
+    "authorizedClientIdentities": [
+      "spiffe://example.org/ns/agent-runtime/sa/agent-gateway"
+    ]
+  },
+  "hardening": {
+    "runAsUser": 65532,
+    "runAsGroup": 65532,
+    "runAsNonRoot": true,
+    "readOnlyRootFilesystem": true,
+    "allowPrivilegeEscalation": false,
+    "dropCapabilities": ["ALL"],
+    "seccompProfile": "RuntimeDefault",
+    "apparmorProfile": "runtime/default",
+    "seLinuxType": "container_t",
+    "automountServiceAccountToken": false,
+    "serviceAccountTokenJustification": null
+  },
+  "limits": {
+    "cpu": "2",
+    "memory": "4Gi",
+    "ephemeralStorage": "1Gi",
+    "openFiles": 4096,
+    "processes": 256,
+    "maxRequestBytes": 1048576,
+    "requestsPerSecond": 100,
+    "requestBurst": 200
+  },
+  "externalMounts": {
+    "policy": {
+      "description": "Reviewed PolicySet, owned and rotated outside this repository.",
+      "source": "secret",
+      "secretName": "loomd-policy",
+      "mountPath": "/etc/loomd/policy",
+      "readOnly": true,
+      "mode": "0440"
+    },
+    "actorRegistry": {
+      "description": "Governance-signed actor registry and its rollback floor.",
+      "source": "secret",
+      "secretName": "loomd-actor-registry",
+      "mountPath": "/etc/loomd/actors",
+      "readOnly": true,
+      "mode": "0440"
+    },
+    "trustRoot": {
+      "description": "Release trust root: the independently distributed loomDB public key and the signed bundle.",
+      "source": "secret",
+      "secretName": "loomd-trust-root",
+      "mountPath": "/etc/loomd/trust",
+      "readOnly": true,
+      "mode": "0440"
+    },
+    "frontDoorIdentity": {
+      "description": "Workload certificate, key, and client CA for the mTLS front door.",
+      "source": "secret",
+      "secretName": "loomd-frontdoor-identity",
+      "mountPath": "/etc/loomd/identity",
+      "readOnly": true,
+      "mode": "0440"
+    }
+  },
+  "observability": {
+    "enabled": false,
+    "disabledReason": "The reference image is built --no-default-features --features airgap, which compiles the OTLP exporter out entirely. Telemetry is not 'configured off' here; there is no exporter in the binary to enable. To collect metrics, build --no-default-features --features airgap,observability (telemetry with still no object-storage client), set image.build to match, set enabled to true, and add the collector to egressAllowed.",
+    "otlpEndpoint": "https://otel-collector.observability.svc:4317",
+    "instruments": [
+      "loomd.rpc.requests",
+      "loomd.rpc.failures",
+      "loomd.rpc.denied",
+      "loomd.rpc.duration"
+    ],
+    "forbiddenDimensions": [
+      "tenant",
+      "tenant_id",
+      "request_id",
+      "arguments",
+      "token",
+      "key",
+      "source_text",
+      "response_body"
+    ]
+  },
+  "egressAllowed": [],
+  "tenants": [
+    {
+      "name": "alpha",
+      "tenantId": "alpha-corp",
+      "dataDir": "/var/lib/loomd/alpha",
+      "volumeClaim": "loomd-data-alpha",
+      "storage": "50Gi",
+      "policyFile": "/etc/loomd/policy/alpha.json"
+    },
+    {
+      "name": "beta",
+      "tenantId": "beta-industries",
+      "dataDir": "/var/lib/loomd/beta",
+      "volumeClaim": "loomd-data-beta",
+      "storage": "50Gi",
+      "policyFile": "/etc/loomd/policy/beta.json"
+    }
+  ]
+}

@@ -70,13 +70,24 @@ Each of these is a real gap. None is hidden.
    request size and a per-process token bucket prevent one tenant from entering another tenant's
    trusted process or consuming an unbounded request buffer. They do not analyze timing, shared-host
    cache, memory-bandwidth, or kernel-scheduler side channels. High-assurance deployments must use
-   dedicated nodes or confidential-compute isolation where those channels are in scope.
+   dedicated nodes or confidential-compute isolation where those channels are in scope; the reference
+   host profile ([host-profile.md](host-profile.md)) does **not** provide them, and says so.
 
 5. **Denial of service.** The taint walk is bounded (AT-025), `loomd` drains newline-delimited requests
    without allocating beyond `LOOM_MAX_REQUEST_BYTES`, and each single-tenant process enforces
    `LOOM_REQUESTS_PER_SECOND` with `LOOM_REQUEST_BURST`. These are admission controls, not a complete
    DDoS defense: connection limits, CPU/memory cgroups, tenant storage quotas, and upstream network
-   flood protection still belong to the deployment platform.
+   flood protection belong to the deployment platform. The reference host profile now *renders* the
+   host half of that — CPU/memory/pid/file ceilings, a default-deny network policy, and an
+   authenticated front door that owns connection lifecycle — but rendering a ceiling is not the same as
+   proving throughput under attack, and no load or flood test backs these numbers.
+
+6. **Write authenticity through `loomd`.** Signature-checked writes (AT-026) are a library capability:
+   `Loom::open_production_attested` refuses an unknown actor and verifies a governance-signed registry.
+   The `loomd` daemon does not use it — it opens with `Loom::open` — so writes arriving over MCP are
+   attributable but **not** signature-authenticated, per §3.1. The reference host profile mounts an
+   externally managed actor registry read-only, which stages the material; it does not make the daemon
+   enforce it. Wiring that constructor into `loomd` is outstanding work.
 
 6. **AT-045 at LoomDB granularity.** Data commits ride substrate's 50,000-cycle crash suite. The durable
    **ref write** — a second object with its own ordering (invariant I-8) — is enforced and unit-tested

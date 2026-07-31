@@ -240,6 +240,54 @@ and all verification gates; HSM integration is not claimed by this repository.
 | Isolation holds under churn | `cargo test -p loom-soak --test multitenant_endurance` | green |
 | Update authorization | `loom-bundle-tool verify --public <key> --require-kind <kind> --require-id <id> --require-version <version> --in <bundle>` | exit 0 only if genuine and exactly approved |
 | Release provenance | `gh attestation verify <artifact> --repo Bobcatsfan33/loomdb` | tagged workflow identity and matching subject digest |
+| Host profile upholds its controls | `python3 scripts/verify_host_profile.py` | valid, no drift, 40 unsafe postures rejected |
+| Restart reopens the store; a second process cannot take it | `cargo test -p loom-mcp --test host_profile` | green |
+
+## The reference host profile
+
+Everything in this document is about the engine and its artifact. The *deployment* around it — network
+identity, TLS, process isolation, resource ceilings, one-pool-per-tenant routing — is the host's, and
+the supported reference posture for it is [host-profile.md](host-profile.md), rendered from
+[`deploy/reference/profile.json`](../deploy/reference/profile.json):
+
+```sh
+python3 scripts/verify_host_profile.py          # validate, check drift, reject 40 unsafe postures
+python3 scripts/render_host_profile.py --write  # regenerate after editing profile.json
+```
+
+Read it before deploying. It is a reference posture, not a production approval.
+
+## One tenant, one store
+
+Each `loomd` process serves exactly one tenant out of exactly one store:
+
+| Variable | Meaning |
+|---|---|
+| `LOOM_TENANT` | The tenant this process serves. Defaults to `default`. |
+| `LOOM_DATA_DIR` | The durable store. **Unset means in-memory** — nothing survives the process. |
+
+Both are read once at startup, so no request can name a tenant or a store, and no request can reach
+another tenant's data. With `LOOM_DATA_DIR` set, the daemon opens a durable store and a restarted host
+reopens the same committed state.
+
+The directory is validated fail-closed: it must be a real directory (not a symlink that could be
+repointed at another tenant's store between restarts) and must not be world-writable. A missing
+directory — a mount that failed to attach — stops startup rather than silently serving an empty store.
+`crates/loom-mcp/tests/host_profile.rs` proves each of these at the process boundary.
+
+Group-writable is deliberately **allowed** here, unlike for the policy file. Kubernetes applies
+`fsGroup` to a mounted volume by granting the group write access, so a `g+w` store is the normal state
+for a non-root pod with a persistent volume; rejecting it would stop the reference profile from
+running. A second writer is excluded where it actually can be — the advisory lock below — not by the
+directory mode.
+
+Two further operational facts follow from the engine being one stdio stream per tenant:
+
+- **A second process cannot take an owned store.** `FileRefStore::open` holds an exclusive advisory
+  lock on `<store>/loom/store.lock`; the loser exits with "already open by another process". Releasing
+  the owner releases the lock, so a clean restart reacquires it.
+- **Capability tokens do not survive a restart.** The token issuer key is generated per process, so
+  clients must re-open a session after the daemon restarts.
 
 ## Request admission and secure defaults
 
