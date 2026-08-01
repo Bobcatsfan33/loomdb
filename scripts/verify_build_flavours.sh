@@ -64,7 +64,8 @@ rejects() {
     local output
     if output=$(cargo check --quiet -p loom-mcp "$@" 2>&1); then
         fail "$label was ACCEPTED; it must not compile"
-    elif printf '%s' "$output" | grep -q "$expected"; then
+    # Substring match in the shell, never `printf | grep -q`: see the note above `absent`.
+    elif [ "${output#*"$expected"}" != "$output" ]; then
         pass "$label is rejected, naming: ${expected}"
     else
         fail "$label failed for the wrong reason (expected '$expected' in the error)"
@@ -85,15 +86,27 @@ rejects "no posture, telemetry only" "exactly one storage posture" \
 # distinguishes the flavours; a symbol check cannot, because link-time dead-code elimination can
 # strip an unused client from a connected binary too (docs/operations.md says so).
 
+WORK="$(mktemp -d)"
+trap 'rm -rf "$WORK"' EXIT
+
+# Graphs are written to files, and every check greps the FILE.
+#
+# Not `printf '%s' "$graph" | grep -q …`: `grep -q` exits at the first match and closes the pipe, so
+# `printf` takes EPIPE and — under `set -o pipefail` — the pipeline reports failure even though the
+# pattern *was* found. In `present` that shows up as a spurious FAIL; in `absent` it would have shown
+# up as a spurious **OK**, quietly blessing a leaked object-storage client. This checker exists to
+# make that class of thing impossible, so it must not contain a fail-open path of its own.
 graph() {
-    cargo tree -p "$1" --no-default-features --features "$2" -e no-dev 2>/dev/null
+    local package="$1" features="$2" out="$WORK/$3"
+    cargo tree -p "$package" --no-default-features --features "$features" -e no-dev >"$out" 2>/dev/null
+    printf '%s' "$out"
 }
 
 absent() {
-    local label="$1" pattern="$2" graph="$3"
-    if printf '%s' "$graph" | grep -qiE "$pattern"; then
+    local label="$1" pattern="$2" file="$3"
+    if grep -qiE "$pattern" "$file"; then
         printf '  FAIL %s links %s:\n' "$label" "$pattern" >&2
-        printf '%s' "$graph" | grep -iE "$pattern" | sed 's/^/       /' >&2
+        grep -iE "$pattern" "$file" | sed 's/^/       /' >&2
         FAILURES=$((FAILURES + 1))
     else
         pass "$label links no $pattern"
@@ -101,8 +114,8 @@ absent() {
 }
 
 present() {
-    local label="$1" pattern="$2" graph="$3"
-    if printf '%s' "$graph" | grep -qiE "$pattern"; then
+    local label="$1" pattern="$2" file="$3"
+    if grep -qiE "$pattern" "$file"; then
         pass "$label links $pattern, as its flavour claims"
     else
         fail "$label does NOT link $pattern; the flavour advertises telemetry it cannot emit"
@@ -111,9 +124,9 @@ present() {
 
 note "3. dependency graphs match what each flavour claims"
 
-AIRGAP_GRAPH="$(graph loom-mcp airgap)"
-AIRGAP_OTLP_GRAPH="$(graph loom-mcp airgap,observability)"
-CONNECTED_GRAPH="$(graph loom-mcp remote)"
+AIRGAP_GRAPH="$(graph loom-mcp airgap airgap.tree)"
+AIRGAP_OTLP_GRAPH="$(graph loom-mcp airgap,observability airgap-otlp.tree)"
+CONNECTED_GRAPH="$(graph loom-mcp remote connected.tree)"
 
 # The property an enclave actually needs, in BOTH air-gap flavours. Telemetry is never a reason to
 # reintroduce an object-storage client.
@@ -132,7 +145,8 @@ absent "connected" 'opentelemetry' "$CONNECTED_GRAPH"
 
 # loomctl performs local diagnostics and signed backups and never sleeps or wakes a tenant, so it
 # has no business linking an object-storage client in any profile — including its ordinary build.
-LOOMCTL_GRAPH="$(cargo tree -p loomctl -e no-dev 2>/dev/null)"
+LOOMCTL_GRAPH="$WORK/loomctl.tree"
+cargo tree -p loomctl -e no-dev >"$LOOMCTL_GRAPH" 2>/dev/null
 absent "loomctl" 'object_store|substrate-store' "$LOOMCTL_GRAPH"
 
 # ── 4. the shipped air-gap binaries build, not just check ───────────────────────────────────────
