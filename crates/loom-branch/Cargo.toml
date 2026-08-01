@@ -20,7 +20,7 @@ serde.workspace = true
 bincode.workspace = true
 serde_json.workspace = true
 blake3.workspace = true
-getrandom = "0.2"
+getrandom = "0.4"
 ed25519-dalek.workspace = true
 # Trust-root custody: which keys may still authorize a backup. Pure Ed25519 + serde, no transport,
 # so it never adds an edge an air-gap build has to amputate.
