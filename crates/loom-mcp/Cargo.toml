@@ -17,6 +17,9 @@ loom-branch = { path = "../loom-branch", default-features = false }
 loom-provenance = { path = "../loom-provenance", default-features = false }
 loom-memory = { path = "../loom-memory", default-features = false }
 loom-policy = { path = "../loom-policy" }
+# Trust-root custody for the actor-governance role. Verification only: loomd holds no private key
+# and reaches no KMS, so this crate carries no transport.
+loom-keys.workspace = true
 loom-action = { path = "../loom-action" }
 # Verification only: loomd checks the governance signature over a mounted actor registry and the
 # per-write envelope signatures that registry authorizes. It holds no signing key.

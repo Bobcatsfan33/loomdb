@@ -1,0 +1,20 @@
+[package]
+name = "loom-keys"
+description = "Trust-root custody: a signer interface, a named-key register, and offline verification for every loomDB signing role."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+# Verification must work inside an enclave with no network and no KMS reachable, so this crate has
+# no transport of any kind: Ed25519, serde, and the filesystem. A backend that talks to a remote HSM
+# implements `Signer` in its own crate and never enters a verifier's dependency graph.
+ed25519-dalek.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true

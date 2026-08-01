@@ -18,6 +18,7 @@ use ed25519_dalek::VerifyingKey;
 use loom_action::ActionGateway;
 use loom_branch::{ActorRegistryAttestation, Loom};
 use loom_core::{ActorId, TenantId};
+use loom_keys::{KeyDirectory, KeyRole};
 #[cfg(feature = "observability")]
 use loom_mcp::OtlpTelemetry;
 use loom_mcp::{
@@ -190,12 +191,37 @@ fn open_engine(tenant: &str, registry: Option<ActorRegistry>) -> Result<Loom, St
     // THE ATTESTED OPEN. The governance signature, the tenant binding, the rollback floor, and the
     // registry fingerprint are all checked *before* any store file is opened, and the resulting
     // database refuses a write from an actor it does not know rather than trusting the name.
+    // ── CUSTODY DECIDES *WHICH* GOVERNANCE KEY, BEFORE THE STORE IS TOUCHED ────────────────────
+    //
+    // The attestation carries no key id — adding one would change a signed format, and an
+    // attestation issued before custody existed must keep verifying. So each trusted governance
+    // root is tried against the exact bytes governance signed, newest generation first, and the one
+    // that verified is named in the startup log.
+    //
+    // Revoked and staged roots are never tried. That is the entire mechanism by which a revoked
+    // governance key stops authorizing writers: its material still verifies, and this loop simply
+    // never offers it.
+    let trusted = registry
+        .governance
+        .verify_any(
+            &registry.attestation.signed_bytes(),
+            registry.attestation.signature(),
+        )
+        .map_err(|error| {
+            format!("the actor registry attestation was not signed by a trusted governance key: {error}")
+        })?;
+    let governance_key = trusted.verifying_key().map_err(|error| error.to_string())?;
+    eprintln!(
+        "loomd: actor registry attested by governance key {:?} (generation {}, {} backend)",
+        trusted.key_id, trusted.generation, trusted.backend
+    );
+
     Loom::open_production_attested(
         &path,
         tenant,
         registry.keys,
         &registry.attestation,
-        &registry.governance_key,
+        &governance_key,
         registry.minimum_generation,
     )
     .map_err(|error| format!("cannot open attested store at {}: {error}", path.display()))
@@ -216,7 +242,13 @@ fn open_engine(tenant: &str, registry: Option<ActorRegistry>) -> Result<Loom, St
 struct ActorRegistry {
     keys: BTreeMap<ActorId, VerifyingKey>,
     attestation: ActorRegistryAttestation,
-    governance_key: VerifyingKey,
+    /// The governance trust roots, with their statuses. **P8**: this replaced a bare public key.
+    ///
+    /// A bare key answers "did this verify"; it cannot answer "is the party that signed this still
+    /// the governance authority". A retired key verifies exactly as well as the current one, and a
+    /// revoked key verifies exactly as well as it did the day before it was revoked — so refusing
+    /// one has to be a decision somebody recorded, and the register is where that decision lives.
+    governance: KeyDirectory,
     minimum_generation: u64,
 }
 
@@ -291,7 +323,13 @@ fn load_actor_registry() -> Result<Option<ActorRegistry>, String> {
         );
     }
 
-    let governance_key = read_verifying_key(Path::new(&governance_path), "governance trust root")?;
+    let governance = KeyDirectory::load(Path::new(&governance_path), KeyRole::ActorGovernance)
+        .map_err(|error| {
+            format!(
+                "cannot load the actor-governance trust roots from {}: {error}",
+                Path::new(&governance_path).display()
+            )
+        })?;
 
     let registry_path = PathBuf::from(registry_path);
     let bytes = read_protected_file(
@@ -344,30 +382,9 @@ fn load_actor_registry() -> Result<Option<ActorRegistry>, String> {
     Ok(Some(ActorRegistry {
         keys,
         attestation: document.attestation,
-        governance_key,
+        governance,
         minimum_generation,
     }))
-}
-
-/// Read a hex-encoded Ed25519 verifying key from a mounted file.
-fn read_verifying_key(path: &Path, what: &str) -> Result<VerifyingKey, String> {
-    // 64 hex characters plus whatever trailing whitespace a secret projection adds.
-    let bytes = read_protected_file(path, what, 4096)?;
-    let text = std::str::from_utf8(&bytes)
-        .map_err(|error| format!("the {what} at {} is not UTF-8: {error}", path.display()))?;
-    let bytes = decode_hex::<32>(text).ok_or_else(|| {
-        format!(
-            "the {what} at {} must contain 64 hexadecimal characters (a 32-byte Ed25519 verifying \
-             key)",
-            path.display()
-        )
-    })?;
-    VerifyingKey::from_bytes(&bytes).map_err(|error| {
-        format!(
-            "the {what} at {} is not on the curve: {error}",
-            path.display()
-        )
-    })
 }
 
 /// Read a file that must be a real, size-bounded, non-writable-by-others regular file.

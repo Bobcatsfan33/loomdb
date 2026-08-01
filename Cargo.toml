@@ -12,6 +12,7 @@ members = [
     "crates/loom-query",
     "crates/loom-soak",
     "crates/loom-bundle",
+    "crates/loom-keys",
     "crates/loomctl",
 ]
 
@@ -38,6 +39,7 @@ substrate-security = { git = "https://github.com/Bobcatsfan33/substrate", rev = 
 loom-core = { path = "crates/loom-core", version = "0.1.0" }
 loom-branch = { path = "crates/loom-branch", version = "0.1.0" }
 loom-provenance = { path = "crates/loom-provenance", version = "0.1.0" }
+loom-keys = { path = "crates/loom-keys", version = "0.1.0" }
 
 # --- deps ---
 thiserror = "2.0"

@@ -1,5 +1,6 @@
 //! `loomctl` — read-only-by-default operator diagnostics and verified backups.
 
+mod keys;
 mod metrics;
 mod receipt;
 mod retention;
@@ -26,10 +27,21 @@ USAGE:
   loomctl backup        --path <store> --tenant <tenant> --out <new-directory>
   loomctl backup-signed --path <store> --tenant <tenant> (--out <new-directory> | --root <shelf>) --signing-key-file <hex-key> --key-id <id>
   loomctl verify-backup --path <backup>
-  loomctl verify-backup-signed (--path <backup> | --root <shelf>) --public-key-file <hex-key> --key-id <id>
+  loomctl verify-backup-signed (--path <backup> | --root <shelf>) (--trust-roots <register> | --public-key-file <hex-key> --key-id <id>)
   loomctl restore       --path <backup> --expected-tenant <tenant> --out <new-store>
   loomctl restore-signed (--path <backup> | --root <shelf>) --expected-tenant <tenant> (--out <new-store> | --out-root <dir>) --public-key-file <hex-key> --key-id <id>
   loomctl backup-prune  --root <backup-root> --keep-days <n> --minimum-copies <n> [--legal-hold-file <file>] [--apply]
+  loomctl keys inspect  --trust-roots <register>
+  loomctl keys expand   --trust-roots <register> --role <role> --key-id <id> --public-key-file <hex> --generation <n> --ceremony <ref> --approver <who> [--approver <who>] [--backend software|aws-kms]
+  loomctl keys activate --trust-roots <register> --role <role> --key-id <id>
+  loomctl keys retire   --trust-roots <register> --role <role> --key-id <id>
+  loomctl keys revoke   --trust-roots <register> --role <role> --key-id <id> --reason <why> [--seal-role]
+  loomctl keys drill    --trust-roots <register> --role <role> --signing-key-file <hex>
+
+Trust-root custody. Roles are actor-governance, release, and backup-root, and they are separate
+authorities. A key is staged by `expand`, starts signing at `activate` (which retires the key it
+supersedes, leaving it able to VERIFY), and only `revoke` invalidates anything. Promoting or revoking
+a key needs two distinct --approver values recorded against a --ceremony reference.
 
 `--root` names a shelf instead of one backup: writes mint a fresh `<tenant>-<unix>` destination under
 it, and reads take the newest backup on it. That is what a scheduled job needs — verification and
@@ -47,7 +59,7 @@ and refuses to overwrite it. Open a restored store through a production construc
 deletes the newest --minimum-copies, and refuses to run inside a live store.
 "#;
 
-fn flag(args: &[String], name: &str) -> Result<String, String> {
+pub(crate) fn flag(args: &[String], name: &str) -> Result<String, String> {
     let index = args
         .iter()
         .position(|value| value == name)
@@ -58,7 +70,7 @@ fn flag(args: &[String], name: &str) -> Result<String, String> {
         .ok_or_else(|| format!("missing value for {name}\n\n{USAGE}"))
 }
 
-fn optional_flag(args: &[String], name: &str) -> Option<String> {
+pub(crate) fn optional_flag(args: &[String], name: &str) -> Option<String> {
     args.iter()
         .position(|value| value == name)
         .and_then(|index| args.get(index + 1))
@@ -66,7 +78,7 @@ fn optional_flag(args: &[String], name: &str) -> Option<String> {
         .cloned()
 }
 
-fn switch(args: &[String], name: &str) -> bool {
+pub(crate) fn switch(args: &[String], name: &str) -> bool {
     args.iter().any(|value| value == name)
 }
 
@@ -116,7 +128,7 @@ fn open_store(path: &Path, tenant: TenantId) -> Result<Loom, String> {
     Loom::open(path, tenant).map_err(|error| error.to_string())
 }
 
-fn print_json(value: &impl serde::Serialize) -> Result<(), String> {
+pub(crate) fn print_json(value: &impl serde::Serialize) -> Result<(), String> {
     let output = serde_json::to_string_pretty(value).map_err(|error| error.to_string())?;
     println!("{output}");
     Ok(())
@@ -389,6 +401,7 @@ fn run(args: &[String]) -> Result<(), String> {
                 .map_err(|error| error.to_string())?;
             print_json(&restored)
         }
+        "keys" => keys::run(args),
         "help" | "--help" | "-h" => {
             println!("{USAGE}");
             Ok(())
@@ -471,9 +484,28 @@ fn verify_backup_signed(
     args: &[String],
     path: &Path,
 ) -> Result<(BackupManifest, Option<u64>), String> {
-    let key_id = flag(args, "--key-id")?;
-    let key = verifying_key(args)?;
-    let manifest = verify_signed_backup(path, &key_id, &key).map_err(|error| error.to_string())?;
+    // Two doors onto the same signed bytes.
+    //
+    // `--trust-roots` asks custody: is the key that signed this backup *still* the backup authority?
+    // A bare `--public-key-file` cannot answer that — a revoked key verifies exactly as well as it
+    // did the day before it was revoked — so the register is the production door and the bare key
+    // remains for local diagnostics.
+    let manifest = match optional_flag(args, "--trust-roots") {
+        Some(register) => {
+            let directory =
+                loom_keys::KeyDirectory::load(Path::new(&register), loom_keys::KeyRole::BackupRoot)
+                    .map_err(|error| error.to_string())?;
+            let (manifest, signed_by) = loom_branch::verify_signed_backup_with(path, &directory)
+                .map_err(|error| error.to_string())?;
+            eprintln!("loomctl: backup verified against trust root {signed_by:?}");
+            manifest
+        }
+        None => {
+            let key_id = flag(args, "--key-id")?;
+            let key = verifying_key(args)?;
+            verify_signed_backup(path, &key_id, &key).map_err(|error| error.to_string())?
+        }
+    };
     // The receipt is unsigned and is read only *after* the trust-root signature has already passed.
     // It can move a number on a dashboard; it can never make a tampered backup verify.
     let recovery_point = BackupReceipt::read_beside(path)?.and_then(|receipt| {

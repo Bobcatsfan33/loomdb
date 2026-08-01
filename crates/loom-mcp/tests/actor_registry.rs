@@ -40,6 +40,33 @@ fn hex(bytes: &[u8]) -> String {
     bytes.iter().map(|byte| format!("{byte:02x}")).collect()
 }
 
+/// A trust-root register for the actor-governance role.
+///
+/// **P8** replaced the bare public key this file used to hold. A key with no identity, no status,
+/// and no ceremony behind it can be verified against but cannot be *revoked*, which is the one thing
+/// custody has to be able to do.
+fn governance_register(roots: &[(&str, &str, u64, String)]) -> String {
+    let entries: Vec<String> = roots
+        .iter()
+        .map(|(key_id, status, generation, public_key)| {
+            let revocation = if *status == "revoked" {
+                r#","revocationReason":"drilled""#
+            } else {
+                ""
+            };
+            format!(
+                r#"{{"keyId":"{key_id}","role":"actor-governance","algorithm":"ed25519",
+                   "publicKey":"{public_key}","backend":"software","status":"{status}",
+                   "generation":{generation},
+                   "ceremony":{{"reference":"CEREMONY-2026-08-01","approvals":[
+                     {{"approver":"pki-officer","atUnix":1800000000}},
+                     {{"approver":"security-lead","atUnix":1800000000}}]}}{revocation}}}"#
+            )
+        })
+        .collect();
+    format!(r#"{{"schemaVersion":1,"roots":[{}]}}"#, entries.join(","))
+}
+
 /// The material a deployment mounts: a store, a registry, and a trust root.
 struct Deployment {
     _root: tempfile::TempDir,
@@ -88,9 +115,17 @@ impl Deployment {
             serde_json::to_vec_pretty(&document).expect("registry serializes"),
         )
         .expect("registry writes");
-        let governance_file = root.path().join("governance.pub");
-        std::fs::write(&governance_file, hex(governance.verifying_key().as_bytes()))
-            .expect("trust root writes");
+        let governance_file = root.path().join("governance-trust-roots.json");
+        std::fs::write(
+            &governance_file,
+            governance_register(&[(
+                "gov-2026-q3",
+                "active",
+                1,
+                hex(governance.verifying_key().as_bytes()),
+            )]),
+        )
+        .expect("trust roots write");
 
         Deployment {
             _root: root,
@@ -447,10 +482,13 @@ fn a_forged_governance_signature_stops_startup() {
 
     let output = start_and_exit(&deployment.environment());
     assert_eq!(output.status.code(), Some(1), "{output:?}");
+    // P8 moved this refusal into custody, and it says more than it used to: not just "invalid" but
+    // how many trusted keys were tried, and that revoked and staged keys are never among them.
+    let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(
-        String::from_utf8_lossy(&output.stderr)
-            .contains("actor registry governance signature is invalid"),
-        "the refusal must name the invalid signature: {output:?}"
+        stderr.contains("was not signed by a trusted governance key")
+            && stderr.contains("no trusted actor-governance trust root verifies this signature"),
+        "the refusal must name the failed custody check: {output:?}"
     );
 }
 
@@ -652,5 +690,139 @@ fn a_second_attested_process_cannot_take_a_store_that_is_already_owned() {
     assert!(
         successor.status.success(),
         "an attested restart after a clean exit must acquire the store: {successor:?}"
+    );
+}
+
+// ── trust-root custody for the governance key (P8) ───────────────────────────────────────────────
+
+/// **The property revocation exists for.** The governance key's material is unchanged and still
+/// verifies the attestation mathematically. The register says it is revoked, and the daemon refuses
+/// to start — because refusing a mathematically-valid signature is a decision, and this is where it
+/// is recorded.
+#[test]
+fn a_revoked_governance_key_stops_startup() {
+    let deployment = Deployment::new();
+    let governance = key(2);
+    std::fs::write(
+        &deployment.governance_file,
+        governance_register(&[(
+            "gov-2026-q3",
+            "revoked",
+            1,
+            hex(governance.verifying_key().as_bytes()),
+        )]),
+    )
+    .expect("trust roots rewrite");
+
+    let output = start_and_exit(&deployment.environment());
+    assert_eq!(output.status.code(), Some(1), "{output:?}");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("not signed by a trusted governance key"),
+        "the refusal must name custody: {output:?}"
+    );
+}
+
+/// A staged key authorizes nothing until it is activated. Distributing a key and trusting it are
+/// separate acts, so a half-completed rotation fails closed rather than half-trusting.
+#[test]
+fn a_staged_governance_key_stops_startup() {
+    let deployment = Deployment::new();
+    let governance = key(2);
+    std::fs::write(
+        &deployment.governance_file,
+        governance_register(&[(
+            "gov-2026-q4",
+            "pending",
+            1,
+            hex(governance.verifying_key().as_bytes()),
+        )]),
+    )
+    .expect("trust roots rewrite");
+
+    let output = start_and_exit(&deployment.environment());
+    assert_eq!(output.status.code(), Some(1), "{output:?}");
+}
+
+/// **Rotation does not invalidate an attestation issued before it.** After the ceremony the new key
+/// is active and the old one is retired — and the attestation the old key signed still verifies, so
+/// the daemon still starts. That grace window is the whole reason `retire` exists as a state
+/// distinct from `revoke`.
+#[test]
+fn a_retired_governance_key_still_attests_what_it_signed_before_the_rotation() {
+    let deployment = Deployment::new();
+    let old = key(2);
+    let new = key(5);
+    std::fs::write(
+        &deployment.governance_file,
+        governance_register(&[
+            (
+                "gov-2026-q3",
+                "retired",
+                1,
+                hex(old.verifying_key().as_bytes()),
+            ),
+            (
+                "gov-2026-q4",
+                "active",
+                2,
+                hex(new.verifying_key().as_bytes()),
+            ),
+        ]),
+    )
+    .expect("trust roots rewrite");
+
+    let mut session = Session::open(&deployment.environment());
+    let agent = &deployment.agent;
+    assert!(
+        session.observe(AGENT, Some(agent), "obs/erp")["result"]["committed"].is_string(),
+        "a store attested by the retired key must still open and serve"
+    );
+    session.finish();
+}
+
+/// The governance trust roots are trust material. A file anything can rewrite can appoint its own
+/// governance authority, so it is refused the same way every other mounted trust root is.
+#[cfg(unix)]
+#[test]
+fn a_group_writable_governance_register_stops_startup() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let deployment = Deployment::new();
+    let mut permissions = std::fs::metadata(&deployment.governance_file)
+        .expect("metadata")
+        .permissions();
+    permissions.set_mode(0o660);
+    std::fs::set_permissions(&deployment.governance_file, permissions).expect("mode set");
+
+    let output = start_and_exit(&deployment.environment());
+    assert_eq!(output.status.code(), Some(2), "{output:?}");
+    assert!(
+        String::from_utf8_lossy(&output.stderr).contains("group- or world-writable"),
+        "{output:?}"
+    );
+}
+
+/// A register that names only another role's keys cannot govern actors. Roles are separate
+/// authorities: a release key must not be able to appoint writers into a tenant's store.
+#[test]
+fn a_register_holding_only_another_roles_key_stops_startup() {
+    let deployment = Deployment::new();
+    let governance = key(2);
+    let register = governance_register(&[(
+        "release-2026-q3",
+        "active",
+        1,
+        hex(governance.verifying_key().as_bytes()),
+    )])
+    .replace("actor-governance", "release");
+    std::fs::write(&deployment.governance_file, register).expect("trust roots rewrite");
+
+    let output = start_and_exit(&deployment.environment());
+    assert_eq!(output.status.code(), Some(1), "{output:?}");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("not signed by a trusted governance key"),
+        "{output:?}"
     );
 }

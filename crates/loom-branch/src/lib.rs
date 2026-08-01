@@ -40,9 +40,9 @@ pub mod token;
 pub mod tree;
 
 pub use backup::{
-    restore_backup, restore_signed_backup, verify_backup, verify_signed_backup, BackupError,
-    BackupFile, BackupManifest, BackupSignature, BACKUP_FORMAT_VERSION, BACKUP_MANIFEST_FILE,
-    BACKUP_SIGNATURE_FILE, BACKUP_SIGNATURE_VERSION,
+    restore_backup, restore_signed_backup, verify_backup, verify_signed_backup,
+    verify_signed_backup_with, BackupError, BackupFile, BackupManifest, BackupSignature,
+    BACKUP_FORMAT_VERSION, BACKUP_MANIFEST_FILE, BACKUP_SIGNATURE_FILE, BACKUP_SIGNATURE_VERSION,
 };
 pub use merge::{
     is_reserved, plan_merge, MergeConflict, MergeConflictReport, MergeOutcome, MergePolicy,

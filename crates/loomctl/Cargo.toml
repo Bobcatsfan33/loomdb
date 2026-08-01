@@ -12,6 +12,9 @@ repository.workspace = true
 # amputated from loomctl in every profile, including its ordinary default build.
 loom-branch = { path = "../loom-branch", default-features = false }
 loom-core.workspace = true
+# Trust-root custody: the operator surface for the rotation sequence, and the directory the
+# verification commands check against.
+loom-keys.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 ed25519-dalek.workspace = true
