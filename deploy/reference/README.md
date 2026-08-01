@@ -14,8 +14,8 @@ This is not an approval to deploy loomDB in production;
 |---|---|
 | `profile.json` | **The source of truth.** Edit this, never the rendered files. |
 | `Containerfile` | Non-root distroless image: air-gap `loomd` plus `loom-bundle-tool` and `loomctl`. Hand-written. |
-| `kubernetes/` | Rendered manifests: namespace + restricted PSA, default-deny NetworkPolicy, front-door config, one StatefulSet per tenant. |
-| `systemd/` | Rendered units: `loomd@.service` (templated, one instance per tenant) and one env file per tenant. |
+| `kubernetes/` | Rendered manifests: namespace + restricted PSA and service accounts, default-deny NetworkPolicy, front-door config, one StatefulSet per tenant, four backup CronJobs per tenant, and the backup alert rules. |
+| `systemd/` | Rendered units: `loomd@.service` (templated, one instance per tenant), one env file per tenant, and a templated service + timer for each backup role. |
 
 Everything under `kubernetes/` and `systemd/` is **generated**. Each file says so in its first two
 lines, and the gate fails on drift.
@@ -29,7 +29,7 @@ python3 scripts/render_host_profile.py --check  # drift only
 ```
 
 `verify_host_profile.py` does three things: validates `profile.json`, proves the committed artifacts
-match it byte for byte, and applies 48 unsafe postures that must each be rejected — two tenants
+match it byte for byte, and applies 69 unsafe postures that must each be rejected — two tenants
 sharing a store, an anonymous client, a writable root filesystem, a mutable image tag, an actor
 registry that is mounted but never enforced, and so on. The renderer validates before it renders and
 never repairs a declaration, so an unsafe posture has no rendered form.
@@ -50,4 +50,11 @@ workload: one tenant, one process, one store.
    document shape and the rollback floor are in
    [`docs/host-profile.md`](../../docs/host-profile.md) §4.3.
 4. Substitute your own SPIFFE trust domain and authorized client identities.
-5. Re-run the gate.
+5. Provide the **point-in-time source** for backups. The engine holds an exclusive lock on its store,
+   so a backup job cannot read a live tenant volume: snapshot it and bind the clone as
+   `backupOperations.pointInTimeSource.claimTemplate`. Provision the backup signing key (owner-only),
+   its independently distributed public trust root, and the legal-hold register, and replicate the
+   staging root into the immutable off-account target the profile declares — loomDB links no
+   object-storage client and cannot write there itself. See
+   [`docs/host-profile.md`](../../docs/host-profile.md) §8.
+6. Re-run the gate.

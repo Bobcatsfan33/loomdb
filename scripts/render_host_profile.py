@@ -30,6 +30,10 @@ import re
 import sys
 from typing import Any
 
+sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent))
+
+import backup_operations  # noqa: E402
+
 ROOT = pathlib.Path(__file__).resolve().parents[1]
 PROFILE = ROOT / "deploy" / "reference" / "profile.json"
 RENDER_ROOT = ROOT / "deploy" / "reference"
@@ -173,6 +177,12 @@ def validate(document: Any) -> dict[str, Any]:
         profile["image"]["bundle"],
     )
     validate_tenants(require_list(profile.get("tenants"), "tenants"), mounts)
+    backup_operations.validate(
+        require_object(profile.get("backupOperations"), "backupOperations"),
+        mounts,
+        profile["tenants"],
+        HELPERS,
+    )
     return profile
 
 
@@ -305,7 +315,17 @@ def validate_limits(limits: dict[str, Any]) -> None:
 
 
 def validate_external_mounts(mounts: dict[str, Any]) -> dict[str, Any]:
-    required = {"policy", "actorRegistry", "trustRoot", "frontDoorIdentity"}
+    required = {
+        "policy",
+        "actorRegistry",
+        "trustRoot",
+        "frontDoorIdentity",
+        # Backup operations: the writer's signing key, the verifier's public trust root, and the
+        # legal-hold register are three separate secrets on purpose. See scripts/backup_operations.py.
+        "backupSigningKey",
+        "backupTrustRoot",
+        "retentionHolds",
+    }
     missing = required - set(mounts)
     if missing:
         fail(f"externalMounts is missing {sorted(missing)}")
@@ -568,6 +588,23 @@ def volume_name(key: str) -> str:
     return re.sub(r"(?<!^)(?=[A-Z])", "-", key).lower()
 
 
+# The shared validation and rendering primitives, handed to the backup-operations module so it
+# validates and renders exactly the way the rest of the profile does — one set of rules, one place.
+HELPERS: dict[str, Any] = {
+    "fail": fail,
+    "require_object": require_object,
+    "require_list": require_list,
+    "require_text": require_text,
+    "require_true": require_true,
+    "require_bool": require_bool,
+    "require_int": require_int,
+    "posix_parts": posix_parts,
+    "nests": nests,
+    "volume_name": volume_name,
+    "HEADER": HEADER,
+}
+
+
 def cpu_quota_percent(cpu: str) -> int:
     """systemd `CPUQuota=` for a Kubernetes CPU quantity, millicores included."""
     if cpu.endswith("m"):
@@ -664,11 +701,20 @@ def render(profile: dict[str, Any]) -> dict[str, str]:
         "kubernetes/00-namespace.yaml": render_namespace(profile),
         "kubernetes/10-network-policy.yaml": render_network_policy(profile),
         "kubernetes/20-front-door-config.yaml": render_front_door_config(profile),
+        "kubernetes/50-backup-alerts.yaml": backup_operations.render_alerts(profile, HELPERS),
         "systemd/loomd@.service": render_systemd_unit(profile),
     }
     for tenant in profile["tenants"]:
         artifacts[f"kubernetes/30-tenant-{tenant['name']}.yaml"] = render_tenant(profile, tenant)
+        artifacts[f"kubernetes/40-backup-{tenant['name']}.yaml"] = (
+            backup_operations.render_cronjobs(profile, tenant, HELPERS)
+        )
         artifacts[f"systemd/loomd-{tenant['name']}.env"] = render_systemd_env(profile, tenant)
+    artifacts.update(
+        backup_operations.render_units(
+            profile, [tenant["name"] for tenant in profile["tenants"]], HELPERS
+        )
+    )
     return artifacts
 
 
@@ -695,6 +741,25 @@ metadata:
 # loomd calls no Kubernetes API. Without a mounted token there is no credential in the pod for a
 # compromised agent input to reach the control plane with.
 automountServiceAccountToken: {str(hardening['automountServiceAccountToken']).lower()}
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: loomd-backup
+  namespace: {namespace}
+# The backup writer. It is the only identity that mounts the backup signing key.
+automountServiceAccountToken: false
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: loomd-backup-verifier
+  namespace: {namespace}
+# THE SEPARATE TRUST DOMAIN. Independent verification and the restore rehearsal run as this identity,
+# which mounts the public trust root and never the signing key. A signature checked by whoever
+# produced it is not an independent check — so the thing that writes backups and the thing that
+# blesses them are two identities, and which secret each may mount is what keeps them apart.
+automountServiceAccountToken: false
 """
 
 
@@ -993,12 +1058,18 @@ def render_tenant(profile: dict[str, Any], tenant: dict[str, Any]) -> str:
     init_mounts = render_volume_mounts(profile, "verify-release-bundle", " " * 12)
     engine_mounts = render_volume_mounts(profile, "loomd", " " * 12)
     proxy_mounts = render_volume_mounts(profile, "front-door", " " * 12)
+    # ── LEAST PRIVILEGE IS THE POD BOUNDARY, NOT JUST THE CONTAINER ─────────────────────────────
+    # A volume declared on the pod projects its secret into the pod whether or not a container
+    # mounts it. So the engine pod declares exactly the volumes its containers use — the policy, the
+    # actor registry, the trust roots, the front door's identity — and nothing else. The backup
+    # signing key belongs to the backup job's pod and must never be materialized here.
+    projected = sorted({key for keys in MOUNTS_BY_CONTAINER.values() for key in keys})
     volume_yaml = "\n".join(
         f"""        - name: {volume_name(key)}
           secret:
-            secretName: {mount['secretName']}
-            defaultMode: 0{int(mount['mode'], 8):o}"""
-        for key, mount in sorted(mounts.items())
+            secretName: {mounts[key]['secretName']}
+            defaultMode: 0{int(mounts[key]['mode'], 8):o}"""
+        for key in projected
     )
 
     return f"""{HEADER}# Tenant {name!r} — one tenant, one process, one store.

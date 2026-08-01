@@ -97,7 +97,80 @@
       "mountPath": "/etc/loomd/identity",
       "readOnly": true,
       "mode": "0440"
+    },
+    "backupSigningKey": {
+      "description": "The backup trust-root private key. Mounted into the backup writer alone; the engine, the independent verifier, and the rehearsal never see it.",
+      "source": "secret",
+      "secretName": "loomd-backup-signing",
+      "mountPath": "/etc/loomd/backup-signing",
+      "readOnly": true,
+      "mode": "0400"
+    },
+    "backupTrustRoot": {
+      "description": "The backup trust-root public key, provisioned independently of the writer. Mounted into the verifier and the rehearsal alone.",
+      "source": "secret",
+      "secretName": "loomd-backup-trust-root",
+      "mountPath": "/etc/loomd/backup-trust",
+      "readOnly": true,
+      "mode": "0440"
+    },
+    "retentionHolds": {
+      "description": "The legal-hold register. Mounted into retention alone; nothing that can write a backup can lift a hold.",
+      "source": "secret",
+      "secretName": "loomd-legal-hold",
+      "mountPath": "/etc/loomd/retention",
+      "readOnly": true,
+      "mode": "0440"
     }
+  },
+  "backupOperations": {
+    "description": "Scheduling, retention, verification, and rehearsal around the signed-backup mechanism. loomDB signs and verifies; the platform supplies the point-in-time source and the immutable off-account target.",
+    "keyId": "backup-root-2026-q3",
+    "signingKeyPath": "/etc/loomd/backup-signing/backup-root.hex",
+    "trustRootPath": "/etc/loomd/backup-trust/backup-root.pub.hex",
+    "stagingPath": "/var/backups/loomd",
+    "metricsPath": "/var/lib/loomd-metrics",
+    "schedules": {
+      "backup": "17 2 * * *",
+      "verify": "47 3 * * *",
+      "prune": "11 5 * * *",
+      "rehearsal": "23 4 * * 0"
+    },
+    "backupIntervalSeconds": 86400,
+    "maxAgeSeconds": 129600,
+    "pointInTimeSource": {
+      "kind": "csi-volume-snapshot-clone",
+      "claimTemplate": "loomd-snapshot-{tenant}",
+      "description": "loomd holds an exclusive advisory lock on its store for the process lifetime, so a backup job cannot read a volume a live engine is serving. The platform takes a CSI VolumeSnapshot of the tenant volume and binds it as this claim; the backup job mounts that clone and never the live volume."
+    },
+    "retention": {
+      "keepDays": 35,
+      "minimumCopies": 7,
+      "legalHoldFile": "/etc/loomd/retention/legal-hold.json",
+      "immutableTarget": {
+        "kind": "object-lock-compliance",
+        "retainDays": 90,
+        "offAccount": true,
+        "description": "Host responsibility. loomDB links no object-storage client in any build, so it can neither write to nor delete from this target; the platform replicates the staging root into a compliance-locked bucket in an account the loomDB deployment has no credentials for."
+      }
+    },
+    "rehearsal": {
+      "restorePath": "/var/lib/loomd-rehearsal",
+      "description": "Restores the newest verified backup to a fresh path and runs an integrity scrub. It never writes to a tenant data directory and never promotes what it restored; activating a restored store is a deliberate operator act."
+    },
+    "signals": [
+      "loomdb_backup_last_success_timestamp_seconds",
+      "loomdb_backup_last_verified_timestamp_seconds",
+      "loomdb_backup_last_verified_recovery_point_seconds",
+      "loomdb_backup_duration_seconds",
+      "loomdb_backup_bytes",
+      "loomdb_backup_files",
+      "loomdb_backup_failures_total",
+      "loomdb_backup_scrub_damaged_objects",
+      "loomdb_backup_retained_copies",
+      "loomdb_backup_pruned_total",
+      "loomdb_backup_legal_hold_retained"
+    ]
   },
   "observability": {
     "enabled": false,

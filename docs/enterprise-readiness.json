@@ -136,18 +136,42 @@
       "title": "Backup, recovery, and resilience",
       "status": "partial",
       "frameworks": ["csa-ccm-caiq-4.1"],
-      "evidence": ["docs/backup-restore.md", "docs/operations.md", ".github/workflows/ci.yml"],
+      "evidence": [
+        "docs/backup-restore.md",
+        "docs/operations.md",
+        "docs/host-profile.md",
+        ".github/workflows/ci.yml",
+        "scripts/backup_operations.py",
+        "scripts/verify_host_profile.py",
+        "deploy/reference/profile.json",
+        "deploy/reference/kubernetes/40-backup-alpha.yaml",
+        "deploy/reference/systemd/loomd-backup@.timer",
+        "crates/loomctl/src/retention.rs",
+        "crates/loomctl/src/receipt.rs",
+        "crates/loomctl/tests/backup_operations.rs"
+      ],
       "gaps": [
-        "Customer-scale RPO/RTO targets and a signed restore drill receipt for each target topology remain required."
+        "The reference profile now renders scheduled signed backups against a platform-provided point-in-time clone, an independent verification job that runs under a different identity and holds only the public trust root, retention with legal hold, a declared immutable off-account target with a named WORM mechanism, and a restore rehearsal that restores to a fresh path and cannot overwrite or activate a live store. The engine holds an exclusive lock on its store, so no job can read a live tenant volume; the profile refuses to render one that tries.",
+        "Customer-scale RPO/RTO targets and a signed restore drill receipt for each target topology remain required. maxAgeSeconds is a threshold the profile enforces, not a recovery objective anyone has measured, and no drill has been executed against a production storage stack, CSI driver, or backup product."
       ]
     },
     {
       "id": "OBS-01",
       "title": "Operational observability and bounded admission",
-      "status": "implemented",
+      "status": "partial",
       "frameworks": ["csa-ccm-caiq-4.1", "csa-ai-caiq-1.0.2"],
-      "evidence": ["docs/operations.md", ".github/workflows/ci.yml"],
-      "gaps": []
+      "evidence": [
+        "docs/operations.md",
+        "docs/backup-restore.md",
+        ".github/workflows/ci.yml",
+        "crates/loomctl/src/metrics.rs",
+        "crates/loomctl/tests/backup_operations.rs",
+        "deploy/reference/kubernetes/50-backup-alerts.yaml",
+        "scripts/backup_operations.py"
+      ],
+      "gaps": [
+        "Backup, verification, retention, and scrub signals are emitted as fixed-cardinality unlabelled series and are wired to rendered alerts for a stale backup, an unverified backup, a failing job, and detected damage; the stale rule fires on absence so a job that never ran is not read as health. No signal carries a tenant identifier. What remains deployment-owned is the collection pipeline itself: no metric here has been scraped by a production collector, no alert has been routed to a named on-call rota, and no threshold has been tuned against observed behaviour."
+      ]
     },
     {
       "id": "IR-01",

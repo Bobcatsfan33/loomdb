@@ -107,6 +107,132 @@ loomctl restore-signed \
 Then open `/var/lib/loom/acme-restored` with the production actor-key attestation and run application
 read/query smoke tests before traffic is switched.
 
+## Scheduling, retention, and signals
+
+The commands above are the mechanism. The reference host profile renders the **operations** around
+them — when they run, who runs them, how long copies live, and what the host can see — from
+[`deploy/reference/profile.json`](../deploy/reference/profile.json), the same declarative way as
+everything else. See [`host-profile.md`](host-profile.md) §8.
+
+### The constraint everything else follows from
+
+`FileRefStore::open` holds an **exclusive** advisory lock on `<store>/loom/store.lock` for the
+store's lifetime, so a scheduled job **cannot back up a volume a live `loomd` is serving** — it would
+fail every night. This is not a limitation to work around quietly; it is proven at the command
+boundary (`a_backup_cannot_be_taken_from_a_store_a_daemon_is_holding`).
+
+So the profile declares a **point-in-time source** the platform provides — a CSI volume-snapshot
+clone, a storage-array clone, or a filesystem snapshot — and the backup job mounts *that*,
+read-only. The renderer refuses to emit a job that mounts a live tenant claim, and the gate refuses
+a profile whose `claimTemplate` would render one.
+
+### The four scheduled roles, and why they are four
+
+| Role | Runs | Identity | Holds |
+|---|---|---|---|
+| `backup` | `loomctl backup-signed` against the clone | `loomd-backup` | the signing key **only** |
+| `verify` | `loomctl verify-backup-signed` against the trust root | `loomd-backup-verifier` | the public trust root **only** |
+| `prune` | `loomctl backup-prune --apply` | `loomd-backup` | the legal-hold register |
+| `rehearsal` | `loomctl restore-signed` to a fresh path, then `loomctl verify` | `loomd-backup-verifier` | the public trust root |
+
+**The verifier is not the writer.** A signature is worth the independence of the party checking it,
+so the job that produces backups and the job that blesses them are different identities holding
+different secrets, and neither can do the other's job. That is enforced by which secret each
+container may mount — not by convention — and the gate checks it on the rendered bytes.
+
+### Receipts, and what they are not
+
+`backup-signed --metrics-file` writes an operational receipt *beside* the backup —
+`<backup>.receipt.json`, never inside it, because verification refuses a file the signed manifest
+does not allow-list. The receipt records the recovery point, duration, bytes, and key id, and it is
+what lets verification later report *which point in time* it proved restorable.
+
+The receipt is **unsigned and is not an authenticity claim**. The loomDB trust-root signature over
+the exact manifest bytes is, and remains, the only authenticity check. A rewritten receipt moves a
+number on a dashboard; it cannot make a tampered backup verify, and a receipt whose manifest digest
+no longer matches is ignored. A storage vendor's checksum sits in exactly the same position: it may
+coexist, it never substitutes.
+
+### Retention and legal hold
+
+```sh
+loomctl backup-prune \
+  --root /var/backups/loomd/acme \
+  --keep-days 35 --minimum-copies 7 \
+  --legal-hold-file /etc/loomd/retention/legal-hold.json \
+  --metrics-file /var/lib/loomd-metrics/acme-prune.prom \
+  --apply
+```
+
+Four rules, and every one of them is a reason to **keep**:
+
+1. **A legal hold names it** — nothing overrides this, not age, not policy, not `--apply`.
+2. It is one of the newest `--minimum-copies`.
+3. It is younger than `--keep-days`.
+4. Otherwise it is pruned.
+
+Without `--apply` the command prints the plan and removes nothing. It refuses to run inside a live
+store, never follows a symlink, and never deletes an entry it does not positively recognize as a
+backup — a retention tool that deletes what it does not understand eventually deletes something else.
+An unreadable hold register is an **error**, never an empty one.
+
+The hold register is a JSON document on the read-only retention mount:
+
+```json
+{"schemaVersion": 1, "holds": [{"backup": "acme-2026-07-29", "reason": "litigation hold 2026-114"}]}
+```
+
+A hold with no recorded reason is refused: an unexplained hold cannot be reviewed or lifted.
+
+### The immutable, off-account copy
+
+The staging root is local. The copy that survives a compromise of the deployment is the host's:
+the profile declares its **named mechanism** (`object-lock-compliance`, a WORM appliance, or a tape
+vault), its retention window, and that it is **off-account** — and validation requires all three.
+`object-lock` *governance* mode is rejected, because a principal holding the bypass permission can
+delete under it, and that principal is exactly the adversary an immutable copy exists to survive.
+The immutable window must be at least as long as local retention.
+
+loomDB **cannot write to that target**: no build links an object-storage client, in any profile,
+which the air-gap dependency inspection re-proves on every CI run. Replication into it is the
+platform's job, and the profile says so rather than pretending otherwise.
+
+### Signals
+
+`loomctl` links no exporter and opens no socket. Each command writes a fixed set of unlabelled
+Prometheus series atomically to `--metrics-file`, and the host's collector reads them:
+
+| Signal | Meaning |
+|---|---|
+| `loomdb_backup_last_success_timestamp_seconds` | when a backup last completed |
+| `loomdb_backup_last_verified_timestamp_seconds` | when one was last independently verified |
+| `loomdb_backup_last_verified_recovery_point_seconds` | *which* point in time that verification proved |
+| `loomdb_backup_duration_seconds`, `_bytes`, `_files` | the shape of the last run |
+| `loomdb_backup_failures_total` | 1 if the last run failed — **written on the failure path too** |
+| `loomdb_backup_scrub_damaged_objects` | objects an integrity scrub found damaged |
+| `loomdb_backup_retained_copies`, `_pruned_total`, `_legal_hold_retained` | what retention did |
+
+**No signal carries a tenant identifier**, for the same reason `loomd` forbids a tenant dimension on
+its RPC instruments: a tenant name in a metric is tenant data leaving through the monitoring
+pipeline. One job serves one tenant and writes one file, so the *path* carries the tenant and the
+collector attaches workload labels itself.
+
+The rendered alerts (`deploy/reference/kubernetes/50-backup-alerts.yaml`) fire on a stale backup, a
+backup nobody verified, a failing job, and detected damage. The stale-backup rule uses `absent()`
+deliberately: a job that never ran emits nothing, and silence must not read as health.
+
+A metric is an operational record, not an authenticity claim. `last_success` saying "yesterday" does
+not prove a restorable backup exists — only verification against the trust root does. The signals
+exist so a *missing* backup is loud.
+
+### The restore rehearsal
+
+The rehearsal restores the shelf's newest verified backup to a **fresh path** and scrubs it. It
+never overwrites and never activates: `restore-signed` refuses any destination that already exists,
+so a rehearsal pointed at a live store fails rather than destroying it, and the profile cannot even
+render one — the rehearsal path may not overlap a tenant data directory, and the rehearsal job mounts
+the backup shelf read-only. Promoting a rehearsed store is a separate, deliberate operator act.
+
 ## Required deployment drill
 
 Run this drill for every target filesystem, CSI driver, backup agent, and object-store topology:
@@ -129,13 +255,21 @@ system, not of this crate alone.
 
 ## Remaining Phase 3 work
 
-This closes the storage mechanism, not all enterprise operations. Open work remains:
+The storage mechanism and the operations around it are now both in the repository. What remains is
+work no amount of configuration can do for you:
 
-- scheduled retention and immutable/off-account backup policy;
-- metrics and traces for backup duration, bytes, failures, last successful recovery point, scrub damage,
-  and recovery drills;
-- `loomctl` provenance-chain and `taint` dry-run views;
-- documented RPO/RTO targets validated on customer-scale data;
-- encryption/key-management policy for backup media at the platform layer.
-- automated KMS/HSM signing-key delivery and trust-root rotation drills (the
-  native signed-manifest door is implemented; custody remains platform policy).
+- **documented RPO/RTO targets validated on customer-scale data.** The profile renders a schedule and
+  an alert threshold; neither is a measurement. Nobody has run this against a customer-scale store on
+  the target storage stack, so `RES-01` and the `EXT-DR` gate stay open.
+- **the environment-specific drill below, executed and signed.** The rendered rehearsal proves the
+  restore path works on the shelf it can reach; it does not prove your CSI driver, backup product, or
+  mount options behave.
+- **encryption and key-management policy for backup media** at the platform layer.
+- **automated KMS/HSM signing-key delivery and trust-root rotation drills.** The signed-manifest door
+  is implemented and the profile keeps the signing key on its own owner-only mount, but custody,
+  ceremony, and rotation remain platform policy — `CRYPTO-01` and `EXT-HSM` stay open.
+- **`loomctl` provenance-chain and `taint` dry-run views** (a diagnostics gap, not a safety one).
+
+Closed by this increment: scheduled signed backups, an independent verifier in a separate trust
+domain, retention with legal hold, a declared immutable/off-account target, operational signals with
+a stale-backup alert, and a restore rehearsal that cannot overwrite or activate production.
