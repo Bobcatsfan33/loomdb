@@ -240,7 +240,7 @@ and all verification gates; HSM integration is not claimed by this repository.
 | Isolation holds under churn | `cargo test -p loom-soak --test multitenant_endurance` | green |
 | Update authorization | `loom-bundle-tool verify --public <key> --require-kind <kind> --require-id <id> --require-version <version> --in <bundle>` | exit 0 only if genuine and exactly approved |
 | Release provenance | `gh attestation verify <artifact> --repo Bobcatsfan33/loomdb` | tagged workflow identity and matching subject digest |
-| Host profile upholds its controls | `python3 scripts/verify_host_profile.py` | valid, no drift, 48 unsafe postures rejected |
+| Host profile upholds its controls | `python3 scripts/verify_host_profile.py` | valid, no drift, 69 unsafe postures rejected |
 | Restart reopens the store; a second process cannot take it | `cargo test -p loom-mcp --test host_profile` | green |
 
 ## The reference host profile
@@ -251,7 +251,7 @@ the supported reference posture for it is [host-profile.md](host-profile.md), re
 [`deploy/reference/profile.json`](../deploy/reference/profile.json):
 
 ```sh
-python3 scripts/verify_host_profile.py          # validate, check drift, reject 48 unsafe postures
+python3 scripts/verify_host_profile.py          # validate, check drift, reject 69 unsafe postures
 python3 scripts/render_host_profile.py --write  # regenerate after editing profile.json
 ```
 
@@ -321,6 +321,33 @@ Clients sign `WriteEnvelope::signing_bytes()` off-process and pass the result as
 argument to `observe`, `claim.assert`, and `branch.merge`.
 `crates/loom-mcp/tests/actor_registry.rs` proves all of this at the process boundary, including that
 a declared registry which cannot be verified never falls back to an unauthenticated open.
+
+## Backup operations
+
+The signed-backup mechanism is in [backup-restore.md](backup-restore.md); this is what the reference
+profile schedules around it, and the two operational facts an operator needs first.
+
+**A backup cannot read a live store.** The engine holds an exclusive advisory lock on
+`<store>/loom/store.lock` for its process lifetime, so a job pointed at the volume `loomd` is serving
+fails with "already open by another process". Every scheduled backup therefore runs against a
+platform-provided point-in-time clone, and the profile refuses to render one that mounts a live
+tenant volume.
+
+**The verifier is not the writer.** Four scheduled roles — backup, verify, prune, rehearsal — run as
+two identities holding two different secrets. The writer mounts the owner-only signing key; the
+verifier and the rehearsal mount the public trust root and never the signing key. A signature
+checked by whoever produced it is not an independent check, so this is enforced by which secret each
+container may mount and is checked on the rendered bytes.
+
+Signals reach the host as unlabelled Prometheus series written atomically to `--metrics-file` —
+`loomctl` links no exporter and opens no socket. `loomdb_backup_failures_total` is written on the
+failure path too, and the rendered stale-backup alert uses `absent()`, because a job that never ran
+emits nothing and silence must not read as health. No signal carries a tenant identifier; the file
+path does, and the collector attaches workload labels itself.
+
+Retention keeps a copy for any of three reasons — a legal hold names it, it is one of the newest
+`--minimum-copies`, or it is younger than `--keep-days` — and is a dry run until `--apply`. It
+refuses to run inside a live store, and an unreadable hold register is an error, never an empty one.
 
 ## Request admission and secure defaults
 

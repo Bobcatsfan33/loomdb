@@ -20,11 +20,13 @@ from __future__ import annotations
 import copy
 import json
 import pathlib
+import re
 import sys
 from typing import Any, Callable
 
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent))
 
+import backup_operations  # noqa: E402
 from render_host_profile import (  # noqa: E402
     PROFILE,
     RENDER_ROOT,
@@ -212,6 +214,237 @@ def check_rendered(profile: dict[str, Any], artifacts: dict[str, str]) -> list[s
         problems.append("the systemd unit does not empty the capability bounding set")
 
     problems.extend(check_container_image(profile))
+    problems.extend(check_backup_operations(profile, artifacts))
+    problems.extend(check_signal_catalogue())
+    return problems
+
+
+def check_signal_catalogue() -> list[str]:
+    """The profile's closed signal list must equal what `loomctl` actually emits.
+
+    `KNOWN_BACKUP_SIGNALS` is the reason a profile cannot wire an alert to a metric nothing writes.
+    That is only true while the two stay in step, so this reads the constants out of
+    `crates/loomctl/src/metrics.rs` and compares — a signal renamed on one side and not the other
+    fails here rather than becoming an alert that silently never fires.
+    """
+    source = RENDER_ROOT.parents[1] / "crates" / "loomctl" / "src" / "metrics.rs"
+    if not source.is_file():
+        return [f"{source} is missing; the signal catalogue cannot be checked"]
+    emitted = set(re.findall(r'^pub const [A-Z_]+: &str = "([a-z0-9_]+)";', source.read_text(
+        encoding="utf-8"
+    ), flags=re.MULTILINE))
+    declared = backup_operations.KNOWN_BACKUP_SIGNALS
+    problems = []
+    for signal in sorted(declared - emitted):
+        problems.append(
+            f"backup_operations.KNOWN_BACKUP_SIGNALS names {signal!r}, which loomctl does not emit"
+        )
+    for signal in sorted(emitted - declared):
+        problems.append(
+            f"loomctl emits {signal!r}, which the profile's signal catalogue does not know about"
+        )
+    return problems
+
+
+def without_comments(content: str) -> str:
+    """The configuration a parser would see. A comment explains a control; it cannot violate one."""
+    return "\n".join(
+        line for line in content.splitlines() if not line.lstrip().startswith("#")
+    )
+
+
+def check_backup_operations(profile: dict[str, Any], artifacts: dict[str, str]) -> list[str]:
+    """Assert the rendered backup jobs uphold the controls that live in the emitted configuration."""
+    problems: list[str] = []
+    backup = profile["backupOperations"]
+    mounts = profile["externalMounts"]
+    signing_volume = volume_name("backupSigningKey")
+    trust_volume = volume_name("backupTrustRoot")
+
+    # ── THE ENGINE POD MUST NEVER MATERIALIZE A BACKUP SECRET ───────────────────────────────────
+    # A volume declared on a pod projects its secret whether or not a container mounts it. The
+    # engine signs nothing and verifies no backup, so neither the signing key nor its trust root has
+    # any business being in that pod.
+    for tenant in profile["tenants"]:
+        engine = artifacts[f"kubernetes/30-tenant-{tenant['name']}.yaml"]
+        for secret in (
+            mounts["backupSigningKey"]["secretName"],
+            mounts["backupTrustRoot"]["secretName"],
+            mounts["retentionHolds"]["secretName"],
+        ):
+            if secret in engine:
+                problems.append(
+                    f"kubernetes/30-tenant-{tenant['name']}.yaml projects {secret!r} into the "
+                    "engine pod; the engine neither signs nor verifies backups"
+                )
+
+    for tenant in profile["tenants"]:
+        relative = f"kubernetes/40-backup-{tenant['name']}.yaml"
+        content = artifacts.get(relative)
+        if content is None:
+            problems.append(f"{relative} was not rendered")
+            continue
+
+        # ── THE LIVE-VOLUME REFUSAL, ON THE RENDERED BYTES ──────────────────────────────────────
+        # loomd holds an exclusive lock on its store, so a job that mounted the live claim would
+        # fail every night. Nothing rendered here may mount one. Comments are stripped first: the
+        # header explains the refusal by naming the claim, and prose mounts nothing.
+        effective = without_comments(content)
+        for other in profile["tenants"]:
+            if f"claimName: {other['volumeClaim']}" in effective:
+                problems.append(
+                    f"{relative} mounts the live tenant volume {other['volumeClaim']!r}; the "
+                    "engine holds an exclusive lock on it and the job could not read it"
+                )
+            if other["name"] != tenant["name"] and other["tenantId"] in effective:
+                problems.append(
+                    f"{relative} names another tenant's id {other['tenantId']!r}; one backup job "
+                    "covers exactly one tenant"
+                )
+        expected_source = backup["pointInTimeSource"]["claimTemplate"].replace(
+            "{tenant}", tenant["name"]
+        )
+        if f"claimName: {expected_source}" not in content:
+            problems.append(f"{relative} does not mount the point-in-time source {expected_source}")
+
+        # ── THE SEPARATE TRUST DOMAIN, ON THE RENDERED BYTES ────────────────────────────────────
+        # Split the file into its four CronJobs and check, per job, that the writer holds only the
+        # signing key and the verifier and rehearsal hold only the public trust root. An independent
+        # check performed by whoever produced the artifact is not independent.
+        jobs = {}
+        for block in content.split("\n---\n"):
+            for role in backup_operations.SCHEDULE_ROLES:
+                if f"name: loomd-{role}-{tenant['name']}\n" in block:
+                    jobs[role] = block
+        missing = set(backup_operations.SCHEDULE_ROLES) - set(jobs)
+        if missing:
+            problems.append(f"{relative} is missing the {sorted(missing)} job(s)")
+        for role, block in jobs.items():
+            identity = backup_operations.JOB_IDENTITY[role]
+            if f"serviceAccountName: {identity}" not in block:
+                problems.append(f"{relative} job {role!r} does not run as {identity}")
+            holds_signing = signing_volume in block
+            holds_trust = trust_volume in block
+            if holds_signing and holds_trust:
+                problems.append(
+                    f"{relative} job {role!r} mounts both the backup signing key and its trust "
+                    "root; one secret that both writes and blesses a backup defeats the "
+                    "independent check"
+                )
+            if role == "backup" and not holds_signing:
+                problems.append(f"{relative} job {role!r} cannot sign: no signing key is mounted")
+            if role in {"verify", "rehearsal"}:
+                if holds_signing:
+                    problems.append(
+                        f"{relative} job {role!r} mounts the backup signing key; the independent "
+                        "verifier must not be able to produce what it checks"
+                    )
+                if not holds_trust:
+                    problems.append(
+                        f"{relative} job {role!r} cannot verify: no trust root is mounted"
+                    )
+            if "schedule:" not in block:
+                problems.append(f"{relative} job {role!r} has no schedule")
+            if "concurrencyPolicy: Forbid" not in block:
+                problems.append(
+                    f"{relative} job {role!r} allows concurrent runs; two backups publishing into "
+                    "one staging root race each other"
+                )
+            if "automountServiceAccountToken: false" not in block:
+                problems.append(f"{relative} job {role!r} mounts a service-account token")
+            # Nothing may depend on a per-run identifier the two flavours express differently: the
+            # tool mints destinations and resolves the newest backup itself. A rendered `$(…)` would
+            # be a job looking for a backup named after itself.
+            if "$(" in without_comments(block):
+                problems.append(
+                    f"{relative} job {role!r} interpolates a runtime variable into its arguments; "
+                    "destinations are minted by loomctl so both flavours mean the same thing"
+                )
+        # The writer mints onto the shelf; the verifier and the rehearsal resolve the newest backup
+        # on it. Neither is handed a path by the other.
+        for role, expected in (
+            ("backup", ["--root"]),
+            ("verify", ["--root"]),
+            ("rehearsal", ["--root", "--out-root"]),
+        ):
+            block = jobs.get(role, "")
+            for flag in expected:
+                if f"- {flag}\n" not in block:
+                    problems.append(f"{relative} job {role!r} does not use {flag}")
+
+        # ── THE REHEARSAL MUST NOT BE ABLE TO ACTIVATE OR OVERWRITE ─────────────────────────────
+        rehearsal = jobs.get("rehearsal", "")
+        if tenant["dataDir"] in rehearsal:
+            problems.append(
+                f"{relative} rehearsal names tenant {tenant['name']!r}'s live data directory; a "
+                "rehearsal restores beside production, never onto it"
+            )
+        if backup["rehearsal"]["restorePath"] not in rehearsal:
+            problems.append(f"{relative} rehearsal does not restore into the rehearsal path")
+        if "--out" not in rehearsal or "restore-signed" not in rehearsal:
+            problems.append(f"{relative} rehearsal is not a signed restore to a new path")
+        # Retention prunes the staging root, so the rehearsal must only ever read it.
+        staging_mount = f"- name: staging\n                  mountPath: {backup['stagingPath']}"
+        if f"{staging_mount}\n                  readOnly: true" not in rehearsal:
+            problems.append(f"{relative} rehearsal mounts the backup shelf writable")
+
+        prune = jobs.get("prune", "")
+        if "--legal-hold-file" not in prune:
+            problems.append(f"{relative} retention runs with no legal-hold register")
+        for tenant_any in profile["tenants"]:
+            if tenant_any["dataDir"] in prune:
+                problems.append(f"{relative} retention is pointed at a live store")
+
+    # ── THE ALERTS MUST READ SIGNALS SOMETHING ACTUALLY WRITES ──────────────────────────────────
+    alerts = artifacts["kubernetes/50-backup-alerts.yaml"]
+    for signal in backup_operations.REQUIRED_BACKUP_SIGNALS:
+        if signal not in alerts:
+            problems.append(f"the rendered alerts do not read {signal}")
+    if f"> {backup['maxAgeSeconds']}" not in alerts:
+        problems.append("the stale-backup alert does not use the declared maxAgeSeconds")
+    if "absent(loomdb_backup_last_success_timestamp_seconds)" not in alerts:
+        problems.append(
+            "the stale-backup alert does not fire when the signal is absent; a job that never ran "
+            "emits nothing, and silence must not read as health"
+        )
+    for tenant in profile["tenants"]:
+        if tenant["tenantId"] in alerts:
+            problems.append(
+                f"the rendered alerts name tenant {tenant['tenantId']!r}; these series are "
+                "unlabelled and the collector attaches workload labels itself"
+            )
+
+    # ── THE SYSTEMD FLAVOUR MUST MEAN THE SAME THING ────────────────────────────────────────────
+    for role in backup_operations.SCHEDULE_ROLES:
+        timer = artifacts.get(f"systemd/loomd-{role}@.timer")
+        unit = artifacts.get(f"systemd/loomd-{role}@.service")
+        if timer is None or unit is None:
+            problems.append(f"the systemd flavour is missing the {role!r} service or timer")
+            continue
+        if "INVALID(" in timer:
+            problems.append(
+                f"systemd/loomd-{role}@.timer could not express the cron schedule exactly"
+            )
+        if "Persistent=true" not in timer:
+            problems.append(
+                f"systemd/loomd-{role}@.timer skips a run the host was down for instead of "
+                "catching it up"
+            )
+        if "IPAddressDeny=any" not in unit:
+            problems.append(f"systemd/loomd-{role}@.service does not deny outbound addresses")
+        if role == "backup" and backup["signingKeyPath"] not in unit:
+            problems.append("the systemd backup unit does not sign with the declared key")
+        if role in {"verify", "rehearsal"} and backup["signingKeyPath"] in unit:
+            problems.append(
+                f"systemd/loomd-{role}@.service reads the backup signing key; the independent "
+                "verifier must not be able to produce what it checks"
+            )
+        for tenant in profile["tenants"]:
+            if tenant["dataDir"] in unit:
+                problems.append(
+                    f"systemd/loomd-{role}@.service names a live tenant store; the engine holds an "
+                    "exclusive lock on it"
+                )
     return problems
 
 
@@ -481,6 +714,7 @@ def unsafe_postures() -> list[tuple[str, Callable[[dict[str, Any]], None]]]:
         ),
         ("one trust root signs both releases and actor registries", one_key_for_releases_and_actors),
         ("write authentication is absent from the profile", no_write_authentication_at_all),
+        *backup_operations.unsafe_postures(),
     ]
 
 

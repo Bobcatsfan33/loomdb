@@ -84,7 +84,7 @@ Rendering is validation-first and **never repairs a declaration**. There is no r
 that expresses two tenants in one process, an anonymous client, a writable root filesystem, a
 permissive policy, or a mounted actor registry the daemon never verifies against — the renderer
 refuses to emit one. That is what makes the guarantee structural rather than advisory, and the gate
-proves it by applying **48 unsafe postures and requiring every one to be rejected**. A validator
+proves it by applying **69 unsafe postures and requiring every one to be rejected**. A validator
 nobody has watched fail is not evidence.
 
 Everything is checked in as real YAML and real unit files, and the gate compares bytes, so what a
@@ -106,6 +106,7 @@ reviewer reads is exactly what the declaration produces.
 | Immutable artifact digest + offline bundle verification | images referenced only by `@sha256:`; `verify-release-bundle` initContainer / `ExecStartPre` runs `loom-bundle-tool verify` with exact kind, id, and version against the mounted trust root | gate: digest shape, no tags, bundle fields present |
 | Externally managed policy, actor registry, trust roots | read-only secret mounts at `/etc/loomd/{policy,actors,trust}`, mode `0440`, non-overlapping | gate: `source: secret`, `readOnly`, mode not group-writable |
 | **Write authenticity: every MCP write is signature-verified** | `LOOM_ACTOR_REGISTRY_FILE` + `LOOM_ACTOR_GOVERNANCE_KEY_FILE` + `LOOM_ACTOR_MIN_GENERATION` make `loomd` open with `Loom::open_production_attested`; a missing or unverifiable registry stops startup | gate: all three rendered exactly once per tenant, in both flavours, pointing at that tenant's own registry; `crates/loom-mcp/tests/actor_registry.rs` proves it at the process boundary |
+| **Scheduled, verified, retained, rehearsed backups** | four CronJobs / templated timers per tenant against a point-in-time clone; writer and verifier are separate identities holding separate secrets; retention with legal hold; rehearsal to a fresh path (§8) | gate: no job mounts a live tenant claim, the verifier never mounts the signing key, the rehearsal never names a data directory and mounts the shelf read-only, alerts read only signals `loomctl` writes; `crates/loomctl/tests/backup_operations.rs` |
 | No service-account token unless documented | `automountServiceAccountToken: false` on both the ServiceAccount and the pod | gate: `true` requires a written justification; a stale justification with no token is also rejected |
 | Health + fixed-cardinality metrics | front-door `/healthz` liveness/readiness probes; the four `loomd.rpc.*` instruments over HTTPS OTLP **in the connected flavour only** (§4.6) | gate: instruments ⊆ what the daemon emits, tenant-bearing dimensions stay forbidden, and telemetry cannot be enabled on a build with no exporter |
 
@@ -236,10 +237,13 @@ Stated plainly, in the spirit of [the threat model](threat-model.md) §3.
 5. **Nothing here has run in a Fortune 500 production topology.** The manifests are gated for
    internal consistency and posture. They have not been applied to a production cluster by us, no
    third party has assessed them, and no recovery exercise has been run against them.
-6. **Backup scheduling, retention, and recovery objectives are still open.** The profile mounts a
-   durable store and `loomctl backup-signed` exists ([backup-restore.md](backup-restore.md)), but
-   *when* backups run, how long they are kept, and what RPO/RTO they meet are not part of this
-   increment. `RES-01` and the `EXT-DR` gate remain open.
+6. **Recovery objectives are declared, not measured.** Backups now run on a schedule, are verified
+   from a separate trust domain, are retained under policy with legal hold, and are rehearsed (§8).
+   What is *not* here is a number anyone measured: no RPO or RTO has been established on
+   customer-scale data using the target storage stack, and the rendered `maxAgeSeconds` is a
+   threshold the profile enforces, not a recovery objective the deployment has met. The rehearsal
+   proves the restore path works on the shelf it can reach; it does not prove your CSI driver, your
+   backup product, or your mount options behave. `RES-01` and the `EXT-DR` gate remain open.
 7. **HSM/KMS key custody is unchanged.** The signing boundary is still an exported Ed25519 seed in a
    protected CI environment (see [operations.md](operations.md)). `CRYPTO-01` and `EXT-HSM` remain
    open. This applies to the actor-governance key too: `loomd` only ever *verifies* with it, and it
@@ -259,7 +263,7 @@ Stated plainly, in the spirit of [the threat model](threat-model.md) §3.
 
 | Claim | Command | Expected |
 |---|---|---|
-| Profile valid, artifacts current, unsafe postures rejected | `python3 scripts/verify_host_profile.py` | `48 unsafe postures rejected` |
+| Profile valid, artifacts current, unsafe postures rejected | `python3 scripts/verify_host_profile.py` | `69 unsafe postures rejected` |
 | Rendering is deterministic | `python3 scripts/render_host_profile.py --check` | no drift |
 | Restart reopens the same store, integrity intact | `cargo test -p loom-mcp --test host_profile` | green |
 | A repointable or shared-writable store stops startup | same test file | green |
@@ -269,4 +273,111 @@ Stated plainly, in the spirit of [the threat model](threat-model.md) §3.
 | The same restart and ownership criteria hold attested | same test file | green |
 | Write authenticity / registry attestation (library) | `cargo test -p loom-branch --release --test acceptance at_026` | green |
 | The image links no object-storage client | `cargo tree -p loom-mcp --no-default-features --features airgap -e no-dev \| grep object_store` | no output |
+| Backups are scheduled, verified, retained, and rehearsed | `cargo test -p loomctl --test backup_operations` | green |
+| A backup cannot be taken from a store a daemon holds | same test file (`a_backup_cannot_be_taken_from_a_store_a_daemon_is_holding`) | green — this is why the profile schedules against a clone |
+| A legal hold outranks retention | same test file | green |
 | Enterprise evidence still consistent | `python3 scripts/verify_enterprise_readiness.py` | valid, `decision=not-approved` |
+
+---
+
+## §8 — Backup operations
+
+The signed-backup *mechanism* — an atomic publish, a manifest allow-list, a detached Ed25519
+signature over the exact manifest bytes, a restore that refuses to overwrite — is described in
+[backup-restore.md](backup-restore.md) and is unchanged. This section is the *operations* the profile
+renders around it, and everything in it follows from one fact.
+
+### §8.1 — A backup cannot read a live store
+
+`FileRefStore::open` takes an **exclusive** advisory lock on `<store>/loom/store.lock` and holds it
+for the process lifetime. A scheduled job pointed at the volume `loomd` is serving therefore fails
+with *"already open by another process"* — every night, forever. That is not a theory; it is
+`a_backup_cannot_be_taken_from_a_store_a_daemon_is_holding` in
+`crates/loomctl/tests/backup_operations.rs`.
+
+So the profile declares a **point-in-time source** the platform provides:
+
+```jsonc
+"pointInTimeSource": {
+  "kind": "csi-volume-snapshot-clone",       // or storage-array-clone, filesystem-snapshot
+  "claimTemplate": "loomd-snapshot-{tenant}" // never a tenant's live volumeClaim
+}
+```
+
+The platform snapshots the tenant volume and binds the result as that claim; the backup job mounts
+it read-only. The renderer refuses a `claimTemplate` that would render a live claim or that serves
+two tenants from one source, and the gate re-checks it on the emitted `claimName:` lines. **Taking
+the snapshot is the host's job** — loomDB does not call a Kubernetes API and mounts no service-account
+token to do so.
+
+### §8.2 — Four roles, two identities, and why they are not one
+
+| Role | Command | Runs as | Mounts |
+|---|---|---|---|
+| `backup` | `loomctl backup-signed --root` against the clone | `loomd-backup` | the signing key, owner-only `0400` |
+| `verify` | `loomctl verify-backup-signed --root` (newest on the shelf) | `loomd-backup-verifier` | the public trust root |
+| `prune` | `loomctl backup-prune --apply` | `loomd-backup` | the legal-hold register |
+| `rehearsal` | `loomctl restore-signed --root --out-root` (fresh path) | `loomd-backup-verifier` | the public trust root |
+
+The writer mints its destination and the readers resolve the newest backup themselves: neither is
+handed a path by the other, because they run at different times as different identities and share
+nothing but the shelf. An **empty shelf is an error**, so a pipeline that quietly stopped producing
+backups cannot report success forever.
+
+**A signature is worth the independence of the party checking it.** So the writer and the verifier
+are different identities holding different secrets, delivered on different mounts, and neither can do
+the other's job: the verifier cannot produce a backup, and the writer cannot mint the verification
+that blesses one. The gate checks this per rendered job, in both flavours — a verifier that mounted
+the signing key, or a job that mounted both, is rejected.
+
+The engine pod carries none of this. A volume declared on a pod projects its secret whether or not a
+container mounts it, so the tenant workload declares exactly the volumes its containers use, and the
+gate refuses a tenant manifest that names any backup secret.
+
+### §8.3 — Retention, legal hold, and the immutable copy
+
+Retention keeps a copy for any of three reasons — a legal hold names it, it is one of the newest
+`minimumCopies`, or it is younger than `keepDays` — and is a dry run until `--apply`. It refuses to
+run inside a live store, never follows a symlink, and never deletes what it does not positively
+recognize as a backup.
+
+The copy that survives a compromise of the deployment is the host's, and the profile makes the
+declaration checkable rather than aspirational: a **named** WORM mechanism, a retention window at
+least as long as local retention, and **off-account**, all required. `object-lock` *governance* mode
+is rejected — a principal holding the bypass permission can delete under it, and that principal is
+precisely the adversary an immutable copy exists to survive.
+
+loomDB **cannot write to that target**: no build links an object-storage client, in any profile,
+re-proven by the air-gap dependency inspection on every CI run. Replication into it is the platform's
+job and the profile says so.
+
+### §8.4 — Signals, and the limits of a number
+
+`loomctl` links no exporter and opens no socket. Each command writes a fixed set of **unlabelled**
+Prometheus series atomically to `--metrics-file`; the *path* carries the tenant and the collector
+attaches workload labels. No signal carries a tenant identifier, for the same reason `loomd` forbids
+a tenant dimension on its RPC instruments.
+
+The profile may only declare signals `loomctl` actually writes, and must declare the ones the alerts
+read. The rendered rules fire on a stale backup, a backup nobody verified, a failing job, and
+detected damage; the stale rule uses `absent()`, because a job that never ran emits nothing and
+silence must not read as health. `maxAgeSeconds` must exceed the backup period — an alert below it
+fires forever and gets muted — and may not exceed four periods.
+
+**A metric is an operational record, not an authenticity claim.** `last_success` saying "yesterday"
+does not prove a restorable backup exists; only verification against the trust root does. The signals
+exist so a *missing* backup is loud.
+
+### §8.5 — What §8 does not give you
+
+- **No measured RPO or RTO.** `maxAgeSeconds` is a threshold the profile enforces, not an objective
+  the deployment has met on customer-scale data. See §6.6.
+- **The rehearsal proves the restore path, not your storage stack.** It restores from the shelf it
+  can reach. Your CSI driver, backup product, mount options, and recovery time are still yours to
+  drill — the procedure is in [backup-restore.md](backup-restore.md).
+- **Backup key custody is unchanged.** The signing key is on its own owner-only mount and the engine
+  never sees it, but the ceremony, custody, and rotation behind it are `CRYPTO-01`/`EXT-HSM`, still
+  open.
+- **Nothing here has run in a production topology**, per §6.5. The jobs are gated for internal
+  consistency and posture; no third party has assessed them and no recovery exercise has been run
+  against them.

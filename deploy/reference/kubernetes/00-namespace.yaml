@@ -20,3 +20,22 @@ metadata:
 # loomd calls no Kubernetes API. Without a mounted token there is no credential in the pod for a
 # compromised agent input to reach the control plane with.
 automountServiceAccountToken: false
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: loomd-backup
+  namespace: loomdb-reference
+# The backup writer. It is the only identity that mounts the backup signing key.
+automountServiceAccountToken: false
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: loomd-backup-verifier
+  namespace: loomdb-reference
+# THE SEPARATE TRUST DOMAIN. Independent verification and the restore rehearsal run as this identity,
+# which mounts the public trust root and never the signing key. A signature checked by whoever
+# produced it is not an independent check — so the thing that writes backups and the thing that
+# blesses them are two identities, and which secret each may mount is what keeps them apart.
+automountServiceAccountToken: false
