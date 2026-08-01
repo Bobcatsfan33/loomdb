@@ -103,6 +103,17 @@ spec:
             # to start alongside it.
             - name: LOOM_POLICY_FILE
               value: /etc/loomd/policy/alpha.json
+            # Write authenticity. With these three set, loomd opens the store with
+            # Loom::open_production_attested: the governance signature, the tenant binding, the
+            # rollback floor, and the registry fingerprint are all verified before a store file is
+            # opened, and a write from an actor this registry does not name is refused rather than
+            # recorded. Removing any one of them does not weaken the daemon — it stops it starting.
+            - name: LOOM_ACTOR_REGISTRY_FILE
+              value: /etc/loomd/actors/alpha.json
+            - name: LOOM_ACTOR_GOVERNANCE_KEY_FILE
+              value: /etc/loomd/trust/actor-governance.pub
+            - name: LOOM_ACTOR_MIN_GENERATION
+              value: "1"
             - name: LOOM_MAX_REQUEST_BYTES
               value: "1048576"
             - name: LOOM_REQUESTS_PER_SECOND

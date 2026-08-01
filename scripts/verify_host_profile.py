@@ -32,6 +32,7 @@ from render_host_profile import (  # noqa: E402
     drift,
     render,
     validate,
+    volume_name,
 )
 
 
@@ -46,6 +47,7 @@ def check_rendered(profile: dict[str, Any], artifacts: dict[str, str]) -> list[s
     """Assert the emitted configuration cannot express the postures the profile forbids."""
     problems: list[str] = []
     tenants = profile["tenants"]
+    mounts = profile["externalMounts"]
 
     for relative, content in sorted(artifacts.items()):
         # The permissive development policy must never be *configured*. A comment may explain why it
@@ -84,6 +86,40 @@ def check_rendered(profile: dict[str, Any], artifacts: dict[str, str]) -> list[s
             problems.append(f"{relative} sets LOOM_TENANT more than once")
         if content.count("name: LOOM_DATA_DIR") != 1:
             problems.append(f"{relative} sets LOOM_DATA_DIR more than once")
+
+        # ── THE WRITE-AUTHENTICITY CHECK, on the rendered bytes ─────────────────────────────────
+        # Mounting an actor registry and not enforcing it was the honest gap this increment closes.
+        # It is checked here, on the manifest that gets applied, because the daemon opens attested
+        # only if all three variables reach it: a rendering that mounted `/etc/loomd/actors` and set
+        # none of them would produce exactly the registry-declared-but-unattested daemon we removed.
+        for variable, expected in (
+            ("LOOM_ACTOR_REGISTRY_FILE", tenant["actorRegistryFile"]),
+            (
+                "LOOM_ACTOR_GOVERNANCE_KEY_FILE",
+                profile["writeAuthentication"]["governanceKeyPath"],
+            ),
+            ("LOOM_ACTOR_MIN_GENERATION", str(tenant["actorRegistryMinGeneration"])),
+        ):
+            if content.count(f"name: {variable}") != 1:
+                problems.append(f"{relative} must set {variable} exactly once")
+            if not any(
+                f"name: {variable}\n              value: {form}" in content
+                for form in (expected, f'"{expected}"')
+            ):
+                problems.append(f"{relative} does not set {variable} to {expected}")
+        # Telling the daemon to verify against a registry it cannot read is a daemon that will not
+        # start. The mount must actually be projected into the engine container, read-only.
+        registry_mount = (
+            f"- name: {volume_name('actorRegistry')}\n"
+            f"              mountPath: {mounts['actorRegistry']['mountPath']}\n"
+            "              readOnly: true"
+        )
+        if registry_mount not in content:
+            problems.append(
+                f"{relative} does not mount the actor registry read-only into the engine container, "
+                "so the registry the daemon is told to verify against would not be there"
+            )
+
         for other in tenants:
             if other["name"] == tenant["name"]:
                 continue
@@ -96,6 +132,31 @@ def check_rendered(profile: dict[str, Any], artifacts: dict[str, str]) -> list[s
                 problems.append(
                     f"{relative} names another tenant's data directory {other['dataDir']!r}"
                 )
+            if other["actorRegistryFile"] in content:
+                problems.append(
+                    f"{relative} names another tenant's actor registry "
+                    f"{other['actorRegistryFile']!r}; an attestation binds one registry to one "
+                    "tenant"
+                )
+
+        # The systemd flavour is the same posture without Kubernetes, so it carries the same three
+        # variables. A unit that started an unauthenticated daemon would be the gap re-opened on the
+        # other deployment path.
+        unit_env = f"systemd/loomd-{tenant['name']}.env"
+        environment = artifacts.get(unit_env)
+        if environment is None:
+            problems.append(f"{unit_env} was not rendered")
+            continue
+        for variable, expected in (
+            ("LOOM_ACTOR_REGISTRY_FILE", tenant["actorRegistryFile"]),
+            (
+                "LOOM_ACTOR_GOVERNANCE_KEY_FILE",
+                profile["writeAuthentication"]["governanceKeyPath"],
+            ),
+            ("LOOM_ACTOR_MIN_GENERATION", str(tenant["actorRegistryMinGeneration"])),
+        ):
+            if f"\n{variable}={expected}\n" not in environment:
+                problems.append(f"{unit_env} does not set {variable} to {expected}")
 
     namespace = artifacts["kubernetes/00-namespace.yaml"]
     if "pod-security.kubernetes.io/enforce: restricted" not in namespace:
@@ -334,6 +395,40 @@ def unsafe_postures() -> list[tuple[str, Callable[[dict[str, Any]], None]]]:
     def no_tenants(document: dict[str, Any]) -> None:
         document["tenants"] = []
 
+    # ── the postures that would re-open the write-authenticity gap ──────────────────────────────
+    #
+    # Each of these renders a daemon that mounts a governance-signed actor registry and then does not
+    # verify against it — writes attributable but not authenticated, which is precisely what
+    # docs/host-profile.md §6 used to have to admit. None of them can be expressed.
+
+    def mount_the_registry_but_never_enforce_it(document: dict[str, Any]) -> None:
+        del document["tenants"][0]["actorRegistryFile"]
+
+    def registry_outside_the_governed_mount(document: dict[str, Any]) -> None:
+        document["tenants"][0]["actorRegistryFile"] = "/tmp/actors.json"
+
+    def share_one_registry_between_tenants(document: dict[str, Any]) -> None:
+        document["tenants"][1]["actorRegistryFile"] = document["tenants"][0]["actorRegistryFile"]
+
+    def no_rollback_floor(document: dict[str, Any]) -> None:
+        del document["tenants"][0]["actorRegistryMinGeneration"]
+
+    def a_rollback_floor_that_accepts_everything(document: dict[str, Any]) -> None:
+        document["tenants"][0]["actorRegistryMinGeneration"] = 0
+
+    def governance_key_beside_the_registry_it_signs(document: dict[str, Any]) -> None:
+        document["writeAuthentication"]["governanceKeyPath"] = (
+            document["externalMounts"]["actorRegistry"]["mountPath"] + "/governance.pub"
+        )
+
+    def one_key_for_releases_and_actors(document: dict[str, Any]) -> None:
+        document["writeAuthentication"]["governanceKeyPath"] = document["image"]["bundle"][
+            "publicKeyPath"
+        ]
+
+    def no_write_authentication_at_all(document: dict[str, Any]) -> None:
+        del document["writeAuthentication"]
+
     return [
         ("two tenants share one tenant id", share_tenant_id),
         ("two tenants share one data directory", share_data_dir),
@@ -375,6 +470,17 @@ def unsafe_postures() -> list[tuple[str, Callable[[dict[str, Any]], None]]]:
         ("egress is opened while telemetry is disabled", egress_without_telemetry),
         ("egress is widened to the front-door port", widen_egress_to_the_front_door),
         ("no tenant is declared", no_tenants),
+        ("the actor registry is mounted but never enforced", mount_the_registry_but_never_enforce_it),
+        ("the actor registry comes from outside the governed mount", registry_outside_the_governed_mount),
+        ("two tenants share one governance-signed actor registry", share_one_registry_between_tenants),
+        ("the actor registry has no rollback floor", no_rollback_floor),
+        ("the rollback floor accepts every signed generation", a_rollback_floor_that_accepts_everything),
+        (
+            "the governance key is delivered beside the registry it signs",
+            governance_key_beside_the_registry_it_signs,
+        ),
+        ("one trust root signs both releases and actor registries", one_key_for_releases_and_actors),
+        ("write authentication is absent from the profile", no_write_authentication_at_all),
     ]
 
 

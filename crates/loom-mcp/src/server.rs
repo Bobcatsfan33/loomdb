@@ -25,6 +25,7 @@ use loom_policy::{may_pack, Engine};
 use loom_provenance::Provenance;
 use serde_json::{json, Value as Json};
 
+use crate::hex::decode_hex;
 use crate::protocol::{codes, Request, Response};
 #[cfg(feature = "observability")]
 use crate::telemetry::{RequestObservation, RequestObserver};
@@ -419,6 +420,23 @@ impl LoomServer {
         AgentStore::new(ActorId::new("agent"), branch, simulation)
     }
 
+    /// Build the envelope a write rides in, carrying the client's signature when it supplied one.
+    ///
+    /// # Why the signature is the client's and not the server's
+    ///
+    /// A signature the *server* applied would prove only that the server wrote something, which is
+    /// what the commit already proves. AT-026 is a claim about the **actor**: the write verifies
+    /// against the key of the actor the envelope claims to be. So the bytes must be signed by
+    /// whoever holds that actor's key, off-process, and arrive here already signed.
+    ///
+    /// The client signs [`WriteEnvelope::signing_bytes`] over exactly the fields it controls — actor,
+    /// session, branch, context hash, intent, delegation, and the sources it *declares*. The engine
+    /// authenticates that envelope before it adds the read-set it captured, so engine-captured
+    /// provenance is never something the client had to predict in order to sign.
+    ///
+    /// An absent `signature` is not an error here. It is refused where it must be — inside the
+    /// engine, when the store was opened with an actor registry — so that a daemon without a
+    /// registry keeps behaving exactly as it did.
     fn envelope(
         &self,
         args: &Json,
@@ -427,7 +445,21 @@ impl LoomServer {
     ) -> Result<WriteEnvelope, ToolError> {
         let session = SessionId::new(arg_str(args, "session").unwrap_or("s"));
         let actor = ActorId::new(arg_str(args, "actor").unwrap_or("agent"));
-        Ok(WriteEnvelope::new(actor, session, branch.clone(), intent))
+        let mut envelope = WriteEnvelope::new(actor, session, branch.clone(), intent);
+        if let Some(signature) = args.get("signature") {
+            let text = signature.as_str().ok_or_else(|| {
+                ToolError::BadArgs("'signature' must be a hex string, if it is present".into())
+            })?;
+            let bytes = decode_hex::<64>(text).ok_or_else(|| {
+                ToolError::BadArgs(
+                    "'signature' must be exactly 128 hexadecimal characters (a 64-byte Ed25519 \
+                     signature over the envelope's signing bytes)"
+                        .into(),
+                )
+            })?;
+            envelope.signature = bytes.to_vec();
+        }
+        Ok(envelope)
     }
 }
 

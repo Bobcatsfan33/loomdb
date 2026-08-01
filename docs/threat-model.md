@@ -24,7 +24,7 @@ action it should never take. Most of what follows is about surviving your own co
 | **A double-charged / double-executed action** | One idempotency key → at most one side effect, under concurrent retries. | The gateway's idempotency store. **AT-028.** |
 | **A conclusion built on withdrawn evidence acting** | A `Stale`/unsupported claim cannot authorize an action; the refusal names the missing dependency. | The gateway's evidence check. **AT-007/030.** |
 | **A capability escaping its scope** | A token reaches no branch outside its scope, **through every surface including MCP**. | The token issuer, re-proven at the MCP boundary. **AT-019.** |
-| **Forging a write's author** | With an actor registry, every write is signed and verified against the *claimed* actor's key; an unknown actor is refused, not trusted. | Ed25519 envelope signatures, fail-closed. **AT-026**, invariant I-9. |
+| **Forging a write's author** | With an actor registry, every write is signed and verified against the *claimed* actor's key; an unknown actor is refused, not trusted. **Through `loomd` too**: under the reference host profile the daemon opens with `Loom::open_production_attested`, and a registry it cannot verify stops startup rather than downgrading to unauthenticated writes. | Ed25519 envelope signatures, fail-closed. **AT-026**, invariant I-9. `crates/loom-mcp/tests/actor_registry.rs`. |
 | **One tenant reaching another's data** | Structurally impossible: the tenant *is* the substrate pool. A known-good key of tenant B is, from tenant A, indistinguishable from one that never existed. | One tenant per pool. **AT-039.** |
 | **A signal turning the database into a weapon** | `taint()` is a dry run; execution is a separate, token-gated call. The kill switch disables *actions* while leaving reads, writes, and audit fully available. | **AT-024/033.** |
 | **Crash mid-commit** | The commit point is an fsync'd WAL record before the manifest install; data survives a crash at any byte. | substrate's `DurableStore` (50,000 crash cycles). **AT-045 partial — see §3.** |
@@ -51,8 +51,12 @@ Each of these is a real gap. None is hidden.
 1. **Key distribution, rotation, and revocation.** Signature verification (AT-026) checks a write
    against a key you handed the engine. Where that key came from, and what happens when it is
    compromised, LoomDB does not address in v0.1. **Consequence:** the authenticity guarantee is only as
-   good as your out-of-band key management. Signature checking is also *opt-in* — with no registry,
-   writes are attributable but not authenticated.
+   good as your out-of-band key management. Signature checking is also *opt-in at the library* — a
+   `Loom::open` with no registry leaves writes attributable but not authenticated. It is **not**
+   optional under the reference host profile: there, the daemon is given a governance-signed registry
+   and a rollback floor, and it refuses to start without them (see §1 and
+   [host-profile.md](host-profile.md) §3). Rotation and revocation of the actor keys *inside* that
+   registry, and custody of the governance signing key, remain yours.
 
 2. **A malicious operator.** The action gateway takes a human approval before executing. LoomDB does not
    defend against the human approver being the adversary, or against an operator with database access
@@ -82,14 +86,15 @@ Each of these is a real gap. None is hidden.
    authenticated front door that owns connection lifecycle — but rendering a ceiling is not the same as
    proving throughput under attack, and no load or flood test backs these numbers.
 
-6. **Write authenticity through `loomd`.** Signature-checked writes (AT-026) are a library capability:
-   `Loom::open_production_attested` refuses an unknown actor and verifies a governance-signed registry.
-   The `loomd` daemon does not use it — it opens with `Loom::open` — so writes arriving over MCP are
-   attributable but **not** signature-authenticated, per §3.1. The reference host profile mounts an
-   externally managed actor registry read-only, which stages the material; it does not make the daemon
-   enforce it. Wiring that constructor into `loomd` is outstanding work.
+6. **A client that holds a real key and signs a false thing.** Write authenticity through `loomd` is
+   now enforced (§1), but a signature answers exactly one question: did the holder of this actor's
+   key sign these bytes. It does not establish that the holder is who you believe, that the key has
+   not been stolen from the agent runtime, or that the agent was not steered into signing a
+   truthful-looking write. Those are, respectively, your key custody, your workload isolation, and —
+   for the injection case — the policy engine's job at the action gateway (AT-034), not the
+   signature's.
 
-6. **AT-045 at LoomDB granularity.** Data commits ride substrate's 50,000-cycle crash suite. The durable
+7. **AT-045 at LoomDB granularity.** Data commits ride substrate's 50,000-cycle crash suite. The durable
    **ref write** — a second object with its own ordering (invariant I-8) — is enforced and unit-tested
    but has **not** yet been driven through 50,000 crash-and-recover cycles under LoomDB-shaped workloads.
    Deferred to v0.2, tracked in [at-map.md](at-map.md). Until then, the crash-safety claim for the ref

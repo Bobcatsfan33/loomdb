@@ -78,10 +78,14 @@ AT-026 makes it **authentic** — it checks the claim is true.
 must be signed** and verifies against the registered key of the actor the envelope claims to be.
 
 Two honest notes on its limits:
-- **It is opt-in.** A database with *no* actor registry does not check signatures at all — envelopes are
-  attributable but not authenticated. That is the right default for a single-process embedded database
-  where the only writer is the process itself, and the **wrong** default the moment two agents can reach
-  the same database. It is documented at the field, not hidden.
+- **It is opt-in *at the library*.** A database with *no* actor registry does not check signatures at
+  all — envelopes are attributable but not authenticated. That is the right default for a
+  single-process embedded database where the only writer is the process itself, and the **wrong**
+  default the moment two agents can reach the same database. It is documented at the field, not
+  hidden. It is **not** opt-in for `loomd` under the reference host profile: that deployment hands
+  the daemon a governance-signed registry, a trust root, and a rollback floor, and the daemon opens
+  with `Loom::open_production_attested` or does not start
+  (`crates/loom-mcp/tests/actor_registry.rs`, `docs/host-profile.md` §3).
 - **Key distribution is not solved here.** LoomDB verifies against keys you hand it. Where those keys
   come from, how they rotate, and how a compromised one is revoked is **not built** (see L3.5).
 

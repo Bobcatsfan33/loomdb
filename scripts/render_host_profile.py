@@ -167,6 +167,11 @@ def validate(document: Any) -> dict[str, Any]:
         front_door,
         profile["observability"]["enabled"],
     )
+    validate_write_authentication(
+        require_object(profile.get("writeAuthentication"), "writeAuthentication"),
+        mounts,
+        profile["image"]["bundle"],
+    )
     validate_tenants(require_list(profile.get("tenants"), "tenants"), mounts)
     return profile
 
@@ -407,16 +412,57 @@ def validate_egress(
             )
 
 
+def validate_write_authentication(
+    write_authentication: dict[str, Any], mounts: dict[str, Any], bundle: dict[str, Any]
+) -> None:
+    """THE WRITE-AUTHENTICITY CONTROL: `loomd` must verify writes, not merely record who claimed them.
+
+    There is deliberately **no enable/disable field**. A profile that mounted an actor registry and
+    left the daemon opening with `Loom::open`, which is the posture this increment removes, is not a
+    posture this schema can express — every tenant declares a registry file and a rollback floor
+    below, and the renderer emits the environment that makes `loomd` open attested.
+    """
+    require_text(write_authentication.get("description"), "writeAuthentication.description")
+    governance = require_text(
+        write_authentication.get("governanceKeyPath"), "writeAuthentication.governanceKeyPath"
+    )
+    parts = posix_parts(governance, "writeAuthentication.governanceKeyPath")
+    trust_root = posix_parts(
+        mounts["trustRoot"]["mountPath"], "externalMounts.trustRoot.mountPath"
+    )
+    # The governance verifying key is a *trust root*, so it arrives on the trust-root mount through
+    # the same independent channel as the release key. A registry that carried its own governance key
+    # would be a document that authenticates itself.
+    if not nests(parts, trust_root) or len(parts) <= len(trust_root):
+        fail(
+            f"writeAuthentication.governanceKeyPath {governance!r} must live under the read-only "
+            f"trust-root mount {mounts['trustRoot']['mountPath']!r}; a governance key delivered "
+            "alongside the registry it signs authenticates nothing"
+        )
+    # Two different trust roots with two different lifecycles: one says "this build is ours", the
+    # other says "these actors may write". Collapsing them into one key makes a release-signing
+    # compromise into an authority to appoint writers.
+    if governance == bundle["publicKeyPath"]:
+        fail(
+            "writeAuthentication.governanceKeyPath must differ from image.bundle.publicKeyPath; the "
+            "release trust root and the actor-governance trust root are separate authorities"
+        )
+
+
 def validate_tenants(tenants: list[Any], mounts: dict[str, Any]) -> None:
     if not tenants:
         fail("tenants must not be empty")
     policy_root = posix_parts(mounts["policy"]["mountPath"], "externalMounts.policy.mountPath")
+    registry_root = posix_parts(
+        mounts["actorRegistry"]["mountPath"], "externalMounts.actorRegistry.mountPath"
+    )
 
     names: set[str] = set()
     tenant_ids: set[str] = set()
     claims: set[str] = set()
     data_dirs: list[tuple[str, tuple[str, ...]]] = []
     policy_files: set[str] = set()
+    registry_files: set[str] = set()
 
     for index, item in enumerate(tenants):
         tenant = require_object(item, f"tenants[{index}]")
@@ -428,6 +474,18 @@ def validate_tenants(tenants: list[Any], mounts: dict[str, Any]) -> None:
         parts = posix_parts(data_dir, f"tenants[{index}].dataDir")
         policy_file = require_text(tenant.get("policyFile"), f"tenants[{index}].policyFile")
         policy_parts = posix_parts(policy_file, f"tenants[{index}].policyFile")
+        registry_file = require_text(
+            tenant.get("actorRegistryFile"), f"tenants[{index}].actorRegistryFile"
+        )
+        registry_parts = posix_parts(registry_file, f"tenants[{index}].actorRegistryFile")
+        # The rollback floor. `loomd` refuses a floor of 0, because a floor of 0 accepts every
+        # generation governance ever signed — including the one that still listed a revoked actor.
+        require_int(
+            tenant.get("actorRegistryMinGeneration"),
+            f"tenants[{index}].actorRegistryMinGeneration",
+            1,
+            2**63 - 1,
+        )
 
         # ── THE ONE-TENANT-PER-PROCESS-AND-DIRECTORY CONTROL ────────────────────────────────────
         # Every one of these is a way two tenants could end up sharing a process or a store. A
@@ -463,11 +521,29 @@ def validate_tenants(tenants: list[Any], mounts: dict[str, Any]) -> None:
         if "permissive" in policy_file:
             fail(f"tenants[{index}].policyFile must not name a permissive policy: {policy_file!r}")
 
+        # ── THE ONE-REGISTRY-PER-TENANT CONTROL ─────────────────────────────────────────────────
+        # A registry attestation binds a fingerprint to one tenant and one generation. Two tenants
+        # sharing a registry file would mean one governance signature authorizing writers in two
+        # stores, which is the cross-tenant seam this deployment shape exists to remove — and the
+        # daemon would refuse the mismatched tenant at startup anyway.
+        if not nests(registry_parts, registry_root) or len(registry_parts) <= len(registry_root):
+            fail(
+                f"tenants[{index}].actorRegistryFile {registry_file!r} must live under the "
+                f"read-only actor-registry mount {mounts['actorRegistry']['mountPath']!r}; a "
+                "registry loaded from anywhere else is one the deployment does not govern"
+            )
+        if registry_file in registry_files:
+            fail(
+                f"tenants[{index}].actorRegistryFile {registry_file!r} is declared twice; an "
+                "attestation binds one registry to one tenant"
+            )
+
         names.add(name)
         tenant_ids.add(tenant_id)
         claims.add(claim)
         data_dirs.append((name, parts))
         policy_files.add(policy_file)
+        registry_files.add(registry_file)
 
 
 # ── rendering ───────────────────────────────────────────────────────────────────────────────────
@@ -1026,6 +1102,17 @@ spec:
             # to start alongside it.
             - name: LOOM_POLICY_FILE
               value: {tenant['policyFile']}
+            # Write authenticity. With these three set, loomd opens the store with
+            # Loom::open_production_attested: the governance signature, the tenant binding, the
+            # rollback floor, and the registry fingerprint are all verified before a store file is
+            # opened, and a write from an actor this registry does not name is refused rather than
+            # recorded. Removing any one of them does not weaken the daemon — it stops it starting.
+            - name: LOOM_ACTOR_REGISTRY_FILE
+              value: {tenant['actorRegistryFile']}
+            - name: LOOM_ACTOR_GOVERNANCE_KEY_FILE
+              value: {profile['writeAuthentication']['governanceKeyPath']}
+            - name: LOOM_ACTOR_MIN_GENERATION
+              value: "{tenant['actorRegistryMinGeneration']}"
             - name: LOOM_MAX_REQUEST_BYTES
               value: "{limits['maxRequestBytes']}"
             - name: LOOM_REQUESTS_PER_SECOND
@@ -1212,6 +1299,12 @@ LOOM_TENANT={tenant['tenantId']}
 LOOM_DATA_DIR={tenant['dataDir']}
 # Deny-by-default from the externally managed, read-only policy mount.
 LOOM_POLICY_FILE={tenant['policyFile']}
+# Write authenticity: loomd opens the store attested, so every write is verified against the
+# governance-signed actor registry. Dropping any of these three stops the unit rather than
+# downgrading it to unauthenticated writes.
+LOOM_ACTOR_REGISTRY_FILE={tenant['actorRegistryFile']}
+LOOM_ACTOR_GOVERNANCE_KEY_FILE={profile['writeAuthentication']['governanceKeyPath']}
+LOOM_ACTOR_MIN_GENERATION={tenant['actorRegistryMinGeneration']}
 LOOM_MAX_REQUEST_BYTES={limits['maxRequestBytes']}
 LOOM_REQUESTS_PER_SECOND={limits['requestsPerSecond']}
 LOOM_REQUEST_BURST={limits['requestBurst']}
