@@ -169,10 +169,20 @@ host responsibilities into loomDB.
 
    For the **connected** flavour, build
    `--no-default-features --features airgap,observability` — telemetry *and* still no
-   object-storage client anywhere in the graph, verified the same `cargo tree` way — then set
-   `image.build` to match, flip `observability.enabled`, and add the collector to `egressAllowed`.
-   The gate then validates the instruments and the forbidden dimensions. Telemetry is never a reason
-   to reintroduce an S3 client.
+   object-storage client anywhere in the graph — then set `image.build` to match, flip
+   `observability.enabled`, and add the collector to `egressAllowed`. The gate then validates the
+   instruments and the forbidden dimensions. Telemetry is never a reason to reintroduce an S3
+   client.
+
+   **Storage posture and telemetry are orthogonal, and all four corners are built.** Until P7.1 a
+   blanket `compile_error!` in `crates/loom-mcp/src/lib.rs` rejected `airgap,observability`
+   outright, so the connected flavour this section documents — and that the profile validator
+   accepted — could not actually be compiled. Nothing caught it, because nothing built it. The guard
+   is now narrowed to what is genuinely contradictory (both storage postures at once, or neither
+   declared), and `scripts/verify_build_flavours.sh` compiles all four flavours, requires each
+   forbidden combination to be rejected by name, and checks that each graph links what its flavour
+   claims — including that the connected air-gap flavour *does* carry an exporter, so it cannot
+   advertise a pipeline it could not serve.
 
    Either way the pod's health signal is the front door's `/healthz`, because a stdio process cannot
    answer a probe.

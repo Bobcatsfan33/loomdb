@@ -10,8 +10,8 @@ guarantees *themselves*, without trusting us:
 
 Every claim below comes with the exact command that verifies it. Two of them run on every CI build
 (the [`no-egress`](#guarantee-1-the-suite-runs-with-no-network) and
-[`airgap`](#guarantee-2-loomd-contains-no-object-storage-client) jobs in
-`.github/workflows/ci.yml`), so the certification is reproduced continuously, not asserted once.
+[`build flavours and airgap amputation`](#guarantee-2-loomd-contains-no-object-storage-client) jobs
+in `.github/workflows/ci.yml`), so the certification is reproduced continuously, not asserted once.
 
 ---
 
@@ -96,9 +96,23 @@ cargo tree -p loom-mcp -e no-dev | grep -i object_store
 ```
 
 The air-gap build has neither `object_store` nor `substrate-store` anywhere in its graph, so no code
-path can possibly reach an object-storage client — there is none to reach. This is the `airgap` job in
-CI: it builds `loomd` air-gapped and fails the build if `cargo tree` finds either crate, so the
-amputation cannot silently regress if someone re-adds a `default-features` edge.
+path can possibly reach an object-storage client — there is none to reach.
+
+**Both air-gap flavours are checked, not just the pure one.** Telemetry and storage posture are
+orthogonal: `--no-default-features --features airgap,observability` links the OTLP exporter and
+still links no object-storage client. Run the whole matrix yourself:
+
+```sh
+bash scripts/verify_build_flavours.sh
+```
+
+It compiles all four supported flavours, requires each forbidden combination — both postures at
+once, or no posture declared — to be rejected *by name*, and checks that every graph links what its
+flavour claims: no object-storage client in either air-gap flavour, no exporter in the pure one, and
+an exporter genuinely present in the connected one. This is the `build flavours and airgap
+amputation` job in CI, so the amputation cannot silently regress if someone re-adds a
+`default-features` edge, and a documented flavour cannot become uncompilable without the build going
+red (which is exactly how the P6 `airgap,observability` contradiction survived unnoticed).
 
 ### Binary confirmation (and its honest limit)
 

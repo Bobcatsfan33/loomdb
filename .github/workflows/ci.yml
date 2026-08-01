@@ -193,39 +193,20 @@ jobs:
   # graph, not by trusting a `--network none` runtime flag — so it CANNOT silently regress if someone
   # re-adds a default-features edge. It also builds loomd and loomctl to prove both gates compile.
   airgap:
-    name: airgap amputation (no S3 client in operator binaries)
+    name: build flavours and airgap amputation
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v5
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
-      - name: airgap operator binaries compile
-        run: |
-          cargo build -p loom-mcp --no-default-features --features airgap
-          cargo build -p loomctl
-      - name: no object-storage client in the airgap binary graph
-        run: |
-          echo "loomd airgap dependency graph (no-dev):"
-          cargo tree -p loom-mcp --no-default-features --features airgap -e no-dev
-          if cargo tree -p loom-mcp --no-default-features --features airgap -e no-dev \
-               | grep -iE 'object_store|substrate-store'; then
-            echo "::error::airgap amputation FAILED — loomd links an object-storage client. A default-features edge to loom-branch's remote path leaked back in."
-            exit 1
-          fi
-          echo "OK: loomd airgap binary has no object-storage client compiled in."
-          if cargo tree -p loom-mcp --no-default-features --features airgap -e no-dev \
-               | grep -iE 'opentelemetry|reqwest|prost'; then
-            echo "::error::airgap amputation FAILED — optional telemetry/export dependencies leaked into loomd."
-            exit 1
-          fi
-          echo "OK: loomd airgap binary has zero telemetry/export dependencies."
-          echo "loomctl dependency graph (no-dev):"
-          cargo tree -p loomctl -e no-dev
-          if cargo tree -p loomctl -e no-dev | grep -iE 'object_store|substrate-store'; then
-            echo "::error::airgap amputation FAILED — loomctl links an object-storage client it never uses."
-            exit 1
-          fi
-          echo "OK: loomctl has no object-storage client compiled in."
+      # P7.1: this job used to inspect only the *pure* air-gap graph. P6 documented a fourth
+      # flavour — air-gap plus telemetry — that a `compile_error!` in loom-mcp made uncompilable,
+      # and nothing here noticed, because nothing here built it. The script now compiles all four
+      # supported flavours, requires every forbidden combination to be rejected *by name*, and
+      # inspects the graph of each: no object-storage client in either air-gap flavour, no exporter
+      # in the pure one, and an exporter that is actually present in the connected one.
+      - name: every build flavour compiles, is rejected, or links what it claims
+        run: bash scripts/verify_build_flavours.sh
 
   observability:
     name: optional OTLP telemetry

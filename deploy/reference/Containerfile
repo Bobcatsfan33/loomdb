@@ -27,7 +27,9 @@ COPY . .
 # --locked: build exactly the reviewed dependency graph.
 # --no-default-features --features airgap: the amputation. loom-branch's remote sleep/wake path is
 # the only code in the workspace that links an object-storage client, and it is compiled out here.
-# The `airgap` CI job proves the resulting graph contains neither object_store nor substrate-store.
+# The `build flavours and airgap amputation` CI job (scripts/verify_build_flavours.sh) proves the
+# resulting graph contains neither object_store nor substrate-store — in this flavour and in the
+# connected `airgap,observability` one.
 RUN cargo build --locked --release \
         -p loom-mcp --no-default-features --features airgap \
     && cargo build --locked --release -p loom-bundle -p loomctl \
