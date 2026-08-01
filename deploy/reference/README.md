@@ -29,10 +29,10 @@ python3 scripts/render_host_profile.py --check  # drift only
 ```
 
 `verify_host_profile.py` does three things: validates `profile.json`, proves the committed artifacts
-match it byte for byte, and applies 40 unsafe postures that must each be rejected — two tenants
-sharing a store, an anonymous client, a writable root filesystem, a mutable image tag, and so on. The
-renderer validates before it renders and never repairs a declaration, so an unsafe posture has no
-rendered form.
+match it byte for byte, and applies 48 unsafe postures that must each be rejected — two tenants
+sharing a store, an anonymous client, a writable root filesystem, a mutable image tag, an actor
+registry that is mounted but never enforced, and so on. The renderer validates before it renders and
+never repairs a declaration, so an unsafe posture has no rendered form.
 
 Adding a tenant is one entry in `profile.json` plus `--write`. It is never an edit to an existing
 workload: one tenant, one process, one store.
@@ -44,6 +44,10 @@ workload: one tenant, one process, one store.
    repository publishes no image. Do the same for `frontDoor.image.digest`.
 2. Pin the `Containerfile`'s base images by digest against your own mirror.
 3. Create the four externally managed secrets named in `profile.json`. Policy, actor registry, and
-   trust roots are yours to own and rotate; none is baked into the image.
+   trust roots are yours to own and rotate; none is baked into the image. The actor-registry secret
+   needs one governance-signed registry document per tenant, and the trust-root secret needs the
+   actor-governance public key alongside the release key — `loomd` will not start without them. The
+   document shape and the rollback floor are in
+   [`docs/host-profile.md`](../../docs/host-profile.md) §4.3.
 4. Substitute your own SPIFFE trust domain and authorized client identities.
 5. Re-run the gate.

@@ -61,6 +61,10 @@
     "requestsPerSecond": 100,
     "requestBurst": 200
   },
+  "writeAuthentication": {
+    "description": "loomd opens its store with Loom::open_production_attested, so every write arriving over MCP is verified against the governance-signed actor registry rather than merely attributed to the actor it names. There is no field in this profile that turns that off: a tenant declares its registry and its rollback floor, or it cannot be rendered.",
+    "governanceKeyPath": "/etc/loomd/trust/actor-governance.pub"
+  },
   "externalMounts": {
     "policy": {
       "description": "Reviewed PolicySet, owned and rotated outside this repository.",
@@ -124,7 +128,9 @@
       "dataDir": "/var/lib/loomd/alpha",
       "volumeClaim": "loomd-data-alpha",
       "storage": "50Gi",
-      "policyFile": "/etc/loomd/policy/alpha.json"
+      "policyFile": "/etc/loomd/policy/alpha.json",
+      "actorRegistryFile": "/etc/loomd/actors/alpha.json",
+      "actorRegistryMinGeneration": 1
     },
     {
       "name": "beta",
@@ -132,7 +138,9 @@
       "dataDir": "/var/lib/loomd/beta",
       "volumeClaim": "loomd-data-beta",
       "storage": "50Gi",
-      "policyFile": "/etc/loomd/policy/beta.json"
+      "policyFile": "/etc/loomd/policy/beta.json",
+      "actorRegistryFile": "/etc/loomd/actors/beta.json",
+      "actorRegistryMinGeneration": 1
     }
   ]
 }

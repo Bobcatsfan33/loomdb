@@ -56,6 +56,13 @@ A second tenant is a second workload with its own volume, rendered from its own 
   (`TokenIssuer::generate`), so every token minted by a previous process is invalid after a restart.
   Clients must re-open a session on reconnect. This is proven at the process boundary in
   `crates/loom-mcp/tests/host_profile.rs`.
+- **Writes must arrive already signed.** Under this profile the engine authenticates every write
+  against the actor's registered key, and a signature the *server* applied would prove only that the
+  server wrote something. So the client signs `WriteEnvelope::signing_bytes()` with the key of the
+  actor it claims to be, off-process, and passes the result as the `signature` argument to `observe`,
+  `claim.assert`, and `branch.merge`. It signs only the fields it controls; the engine authenticates
+  before it attaches the read-set it captured, so engine-captured provenance is never something a
+  client would have had to predict in order to sign.
 - **`loomd` has no health endpoint.** A stdio process cannot answer an HTTP probe. The front door
   serves `/healthz` for the pod; the engine's own liveness signal is the process itself — the
   supervisor restarts it when it exits — plus its OTLP instruments in the connected flavour (§4.6).
@@ -74,10 +81,11 @@ python3 scripts/render_host_profile.py --write  # after editing profile.json
 ```
 
 Rendering is validation-first and **never repairs a declaration**. There is no rendered configuration
-that expresses two tenants in one process, an anonymous client, a writable root filesystem, or a
-permissive policy — the renderer refuses to emit one. That is what makes the guarantee structural
-rather than advisory, and the gate proves it by applying **40 unsafe postures and requiring every one
-to be rejected**. A validator nobody has watched fail is not evidence.
+that expresses two tenants in one process, an anonymous client, a writable root filesystem, a
+permissive policy, or a mounted actor registry the daemon never verifies against — the renderer
+refuses to emit one. That is what makes the guarantee structural rather than advisory, and the gate
+proves it by applying **48 unsafe postures and requiring every one to be rejected**. A validator
+nobody has watched fail is not evidence.
 
 Everything is checked in as real YAML and real unit files, and the gate compares bytes, so what a
 reviewer reads is exactly what the declaration produces.
@@ -97,6 +105,7 @@ reviewer reads is exactly what the declaration produces.
 | Default-deny network policy | `loomd-default-deny` (empty podSelector, both policy types, no rules) + one narrow allow per direction; systemd `IPAddressDeny=any` | gate: the deny object must carry no rules |
 | Immutable artifact digest + offline bundle verification | images referenced only by `@sha256:`; `verify-release-bundle` initContainer / `ExecStartPre` runs `loom-bundle-tool verify` with exact kind, id, and version against the mounted trust root | gate: digest shape, no tags, bundle fields present |
 | Externally managed policy, actor registry, trust roots | read-only secret mounts at `/etc/loomd/{policy,actors,trust}`, mode `0440`, non-overlapping | gate: `source: secret`, `readOnly`, mode not group-writable |
+| **Write authenticity: every MCP write is signature-verified** | `LOOM_ACTOR_REGISTRY_FILE` + `LOOM_ACTOR_GOVERNANCE_KEY_FILE` + `LOOM_ACTOR_MIN_GENERATION` make `loomd` open with `Loom::open_production_attested`; a missing or unverifiable registry stops startup | gate: all three rendered exactly once per tenant, in both flavours, pointing at that tenant's own registry; `crates/loom-mcp/tests/actor_registry.rs` proves it at the process boundary |
 | No service-account token unless documented | `automountServiceAccountToken: false` on both the ServiceAccount and the pod | gate: `true` requires a written justification; a stale justification with no token is also rejected |
 | Health + fixed-cardinality metrics | front-door `/healthz` liveness/readiness probes; the four `loomd.rpc.*` instruments over HTTPS OTLP **in the connected flavour only** (§4.6) | gate: instruments ⊆ what the daemon emits, tenant-bearing dimensions stay forbidden, and telemetry cannot be enabled on a build with no exporter |
 
@@ -118,14 +127,35 @@ host responsibilities into loomDB.
 2. **The stdio bridge.** Whatever adapts the loopback socket to `loomd`'s stdin/stdout — socket
    activation, a supervisor, or the proxy spawning it as a child. It must be loopback-only and must
    not multiplex two clients onto one engine process.
-3. **Secrets.** The reviewed `PolicySet`, the governance-signed actor registry and its rollback
-   floor, the release trust root and bundle, and the front door's certificate, key, and client CA.
-   All rotate outside this repository.
-4. **The trust-root ceremony.** The loomDB release public key must arrive through a separate,
-   authenticated channel. A digest published beside an artifact by a storage vendor is **not** a
-   substitute for the signature: `loom-bundle-tool verify` checks the loomDB trust-root signature
-   over the manifest, the payload's BLAKE3 hash inside that signed manifest, and the exact approved
-   kind/id/version.
+3. **Secrets.** The reviewed `PolicySet`, the governance-signed actor registry, the release trust
+   root and bundle, the actor-governance trust root, and the front door's certificate, key, and
+   client CA. All rotate outside this repository.
+
+   The **actor registry** is one JSON document per tenant, on the `/etc/loomd/actors` mount:
+
+   ```json
+   {
+     "schemaVersion": 1,
+     "actors": { "alpha-agent": "<64 hex characters — an Ed25519 verifying key>" },
+     "attestation": { "tenant": "alpha-corp", "generation": 7, "fingerprint": "…", "signature": [ … ] }
+   }
+   ```
+
+   `attestation` is the serialized `ActorRegistryAttestation` your governance process issues offline
+   with `ActorRegistryAttestation::issue(tenant, generation, keys, &governance_signing_key)`. The
+   **rollback floor** (`actorRegistryMinGeneration` in `profile.json`) is deployment configuration,
+   not part of the registry: raising it after a revocation must be a change a reviewer sees in the
+   manifest, never a number the compromised material could carry. `loomd` refuses a floor of `0`.
+
+4. **The trust-root ceremony — twice, for two different authorities.** The loomDB release public key
+   must arrive through a separate, authenticated channel. A digest published beside an artifact by a
+   storage vendor is **not** a substitute for the signature: `loom-bundle-tool verify` checks the
+   loomDB trust-root signature over the manifest, the payload's BLAKE3 hash inside that signed
+   manifest, and the exact approved kind/id/version.
+
+   The **actor-governance** public key is a second, independent trust root — it answers "who may
+   write into this tenant", not "is this build ours" — and the profile refuses to let one key serve
+   both roles, or to let the governance key be delivered on the same mount as the registry it signs.
 5. **Monitoring and operations.** OTLP collection with mTLS, alerting on the denial/error rate and
    latency SLO burn, and the human on-call and incident procedures the readiness manifest still
    records as open external gates.
@@ -161,8 +191,14 @@ python3 scripts/verify_host_profile.py
 
 # 3. Create the externally managed secrets (names come from profile.json).
 kubectl -n loomdb-reference create secret generic loomd-policy       --from-file=alpha.json=…
-kubectl -n loomdb-reference create secret generic loomd-actor-registry --from-file=…
-kubectl -n loomdb-reference create secret generic loomd-trust-root   --from-file=loom-release.pub=… --from-file=loomd.bundle=…
+#    One governance-signed registry document per tenant; the file names come from
+#    tenants[].actorRegistryFile.
+kubectl -n loomdb-reference create secret generic loomd-actor-registry \
+    --from-file=alpha.json=… --from-file=beta.json=…
+#    Two independent trust roots: the release key, and the actor-governance key.
+kubectl -n loomdb-reference create secret generic loomd-trust-root \
+    --from-file=loom-release.pub=… --from-file=loomd.bundle=… \
+    --from-file=actor-governance.pub=…
 kubectl -n loomdb-reference create secret tls     loomd-frontdoor-identity --cert=… --key=…
 
 # 4. Apply in order. The namespace's restricted Pod Security Standard and the default-deny
@@ -206,16 +242,16 @@ Stated plainly, in the spirit of [the threat model](threat-model.md) §3.
    increment. `RES-01` and the `EXT-DR` gate remain open.
 7. **HSM/KMS key custody is unchanged.** The signing boundary is still an exported Ed25519 seed in a
    protected CI environment (see [operations.md](operations.md)). `CRYPTO-01` and `EXT-HSM` remain
-   open.
-8. **The mounted actor registry is provisioned, not yet enforced by `loomd`.** The profile mounts it
-   read-only from an externally managed secret, which is where a registry belongs. But the daemon
-   opens its store with `Loom::open`, not `Loom::open_production_attested` — so writes through the
-   MCP surface are **attributable but not signature-authenticated**, exactly as
-   [threat model](threat-model.md) §3.1 says. The library capability is real and tested
-   (`at_026_production_registry_attestation_is_signed_and_rollback_resistant`); wiring it into the
-   daemon is a separate increment, and until then the mount stages the material rather than gating
-   on it. Do not read the presence of `/etc/loomd/actors` as a claim that `loomd` verifies write
-   signatures.
+   open. This applies to the actor-governance key too: `loomd` only ever *verifies* with it, and it
+   is never present on the engine's host — but where it is custodied, and how a compromise is
+   revoked, is still yours.
+8. **Write authenticity now holds, and stops exactly at the signature.** `loomd` opens attested, so a
+   write over MCP verifies against the key of the actor it claims to be (§3, and
+   `crates/loom-mcp/tests/actor_registry.rs`). What that proves is that *the holder of that actor's
+   key signed these bytes*. It does not prove the holder is the person or system you think it is,
+   that the key has not been stolen, or that the agent was not manipulated into signing something
+   truthful-looking — key custody at the client is the deploying organization's, and prompt
+   injection is contained by the policy engine, not by a signature.
 
 ---
 
@@ -223,11 +259,14 @@ Stated plainly, in the spirit of [the threat model](threat-model.md) §3.
 
 | Claim | Command | Expected |
 |---|---|---|
-| Profile valid, artifacts current, unsafe postures rejected | `python3 scripts/verify_host_profile.py` | `40 unsafe postures rejected` |
+| Profile valid, artifacts current, unsafe postures rejected | `python3 scripts/verify_host_profile.py` | `48 unsafe postures rejected` |
 | Rendering is deterministic | `python3 scripts/render_host_profile.py --check` | no drift |
 | Restart reopens the same store, integrity intact | `cargo test -p loom-mcp --test host_profile` | green |
 | A repointable or shared-writable store stops startup | same test file | green |
 | A second process cannot take an owned store | same test file (`a_second_process_cannot_take_a_store_that_is_already_owned`) | green |
-| Write authenticity / registry attestation (library) | `cargo test -p loom-branch --release --test acceptance at_026` | green — but see §6.8: not wired into `loomd` |
+| **`loomd` verifies writes against the mounted registry** | `cargo test -p loom-mcp --test actor_registry` | green — an unsigned, impersonated, or unregistered write is refused |
+| **A stale, tampered, or unloadable registry stops startup** | same test file | green — and never falls back to an unauthenticated open |
+| The same restart and ownership criteria hold attested | same test file | green |
+| Write authenticity / registry attestation (library) | `cargo test -p loom-branch --release --test acceptance at_026` | green |
 | The image links no object-storage client | `cargo tree -p loom-mcp --no-default-features --features airgap -e no-dev \| grep object_store` | no output |
 | Enterprise evidence still consistent | `python3 scripts/verify_enterprise_readiness.py` | valid, `decision=not-approved` |

@@ -13,12 +13,14 @@ compile_error!(
 );
 
 mod admission;
+mod hex;
 mod protocol;
 mod server;
 #[cfg(feature = "observability")]
 mod telemetry;
 
 pub use admission::{read_bounded_line, AdmissionConfig, AdmissionController, BoundedLine};
+pub use hex::decode_hex;
 pub use protocol::{codes, Request, Response, RpcError};
 pub use server::LoomServer;
 #[cfg(feature = "observability")]

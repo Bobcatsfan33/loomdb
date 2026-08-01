@@ -240,7 +240,7 @@ and all verification gates; HSM integration is not claimed by this repository.
 | Isolation holds under churn | `cargo test -p loom-soak --test multitenant_endurance` | green |
 | Update authorization | `loom-bundle-tool verify --public <key> --require-kind <kind> --require-id <id> --require-version <version> --in <bundle>` | exit 0 only if genuine and exactly approved |
 | Release provenance | `gh attestation verify <artifact> --repo Bobcatsfan33/loomdb` | tagged workflow identity and matching subject digest |
-| Host profile upholds its controls | `python3 scripts/verify_host_profile.py` | valid, no drift, 40 unsafe postures rejected |
+| Host profile upholds its controls | `python3 scripts/verify_host_profile.py` | valid, no drift, 48 unsafe postures rejected |
 | Restart reopens the store; a second process cannot take it | `cargo test -p loom-mcp --test host_profile` | green |
 
 ## The reference host profile
@@ -251,7 +251,7 @@ the supported reference posture for it is [host-profile.md](host-profile.md), re
 [`deploy/reference/profile.json`](../deploy/reference/profile.json):
 
 ```sh
-python3 scripts/verify_host_profile.py          # validate, check drift, reject 40 unsafe postures
+python3 scripts/verify_host_profile.py          # validate, check drift, reject 48 unsafe postures
 python3 scripts/render_host_profile.py --write  # regenerate after editing profile.json
 ```
 
@@ -288,6 +288,39 @@ Two further operational facts follow from the engine being one stdio stream per 
   the owner releases the lock, so a clean restart reacquires it.
 - **Capability tokens do not survive a restart.** The token issuer key is generated per process, so
   clients must re-open a session after the daemon restarts.
+
+## Write authenticity: the attested open
+
+Under the reference host profile `loomd` does not open its store with `Loom::open`. It opens with
+`Loom::open_production_attested`, so a write arriving over MCP is verified against the key of the
+actor the envelope *claims to be* — an unsigned write, a forged signature, and an actor nobody
+registered are each refused rather than recorded.
+
+Three variables carry the material, and they are **all-or-nothing**: set none and the daemon behaves
+as it always did (attributable, unauthenticated — the embedded and development posture); set some but
+not all and it refuses to start rather than run with authentication half-configured.
+
+| Variable | Meaning | Where it comes from |
+|---|---|---|
+| `LOOM_ACTOR_REGISTRY_FILE` | The tenant's actor→key map and the governance attestation over it | the read-only actor-registry mount |
+| `LOOM_ACTOR_GOVERNANCE_KEY_FILE` | The governance verifying key | the read-only trust-root mount — an independent channel from the registry it signs |
+| `LOOM_ACTOR_MIN_GENERATION` | The rollback floor. Must be ≥ 1 | deployment configuration, rendered into the manifest a reviewer reads |
+
+Everything is checked **before any store file is opened**: the governance signature, the tenant the
+attestation was issued for, the rollback floor, and the registry fingerprint. Each failure stops
+startup and names itself — `actor registry rollback refused`, `actor key registry fingerprint
+mismatch`, `actor registry governance signature is invalid`, `actor registry attestation tenant
+mismatch`. The registry file itself is validated the same fail-closed way as the policy file: a
+regular file, at most 1 MiB, never group- or world-writable, never a symlink.
+
+**Revoking an actor** is therefore two steps and both are auditable: issue a new registry at a higher
+generation without that actor, and raise `actorRegistryMinGeneration` in `profile.json`. Raising the
+floor is what stops the revoked-but-still-validly-signed registry from being replayed.
+
+Clients sign `WriteEnvelope::signing_bytes()` off-process and pass the result as the `signature`
+argument to `observe`, `claim.assert`, and `branch.merge`.
+`crates/loom-mcp/tests/actor_registry.rs` proves all of this at the process boundary, including that
+a declared registry which cannot be verified never falls back to an unauthenticated open.
 
 ## Request admission and secure defaults
 
