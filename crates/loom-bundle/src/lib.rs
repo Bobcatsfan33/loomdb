@@ -42,6 +42,16 @@ pub const FORMAT_VERSION: u32 = 1;
 #[derive(Debug, thiserror::Error)]
 #[non_exhaustive]
 pub enum BundleError {
+    /// Trust-root custody refused the key that signed this bundle.
+    ///
+    /// Distinct from [`BundleError::Signature`] on purpose: "the release key was revoked last
+    /// Tuesday" and "these bytes were tampered with" are different incidents and want different
+    /// responses.
+    #[error("bundle custody check failed: {detail}")]
+    Custody {
+        /// What custody said — an unknown key, a revoked one, a role mismatch, or no trusted key.
+        detail: String,
+    },
     /// The bundle was written by a format version this build does not understand.
     #[error(
         "this bundle is format version {found}, but this build understands version {expected}. \
@@ -259,6 +269,53 @@ impl Bundle {
         require_claim("id", required_id, &self.manifest.id)?;
         require_claim("kind", required_kind, &self.manifest.kind)?;
         require_claim("version", required_version, &self.manifest.version)
+    }
+
+    /// **Verify a bundle against a trust-root register rather than a bare key.**
+    ///
+    /// `verify_for` answers "did *a* key sign this, and is it the artifact we approved". It cannot
+    /// answer "is that key still the release authority", because a bare `VerifyingKey` carries no
+    /// identity, no role, and no status — a retired or revoked release key verifies exactly as well
+    /// as the current one.
+    ///
+    /// The bundle format carries no key id, and P8 did not add one: changing a signed format would
+    /// invalidate every bundle already in the field. So each trusted release root is tried, newest
+    /// generation first, and the key that verified is returned for the audit record. Revoked and
+    /// staged keys are never tried, which is precisely how a revoked release key stops being able
+    /// to bless an update.
+    pub fn verify_with_directory(
+        &self,
+        directory: &loom_keys::KeyDirectory,
+        required_id: &str,
+        required_kind: &str,
+        required_version: &str,
+    ) -> Result<String> {
+        if self.manifest.format_version != FORMAT_VERSION {
+            return Err(BundleError::UnsupportedFormat {
+                found: self.manifest.format_version,
+                expected: FORMAT_VERSION,
+            });
+        }
+        let trusted = directory
+            .verify_any(&self.manifest.signing_bytes()?, &self.ed25519)
+            .map_err(|error| BundleError::Custody {
+                detail: error.to_string(),
+            })?;
+
+        // The payload must still match the hash the now-trusted manifest commits to, and the
+        // artifact must still be the one the change record approved. Custody says *who*; these say
+        // *what*, and a bundle needs both.
+        let actual = blake3::hash(&self.payload).to_hex().to_string();
+        if actual != self.manifest.payload_blake3 {
+            return Err(BundleError::PayloadHashMismatch {
+                expected: self.manifest.payload_blake3.clone(),
+                actual,
+            });
+        }
+        require_claim("id", required_id, &self.manifest.id)?;
+        require_claim("kind", required_kind, &self.manifest.kind)?;
+        require_claim("version", required_version, &self.manifest.version)?;
+        Ok(trusted.key_id.clone())
     }
 
     /// Serialize the whole bundle to bytes for transport on physical media.

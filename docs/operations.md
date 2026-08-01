@@ -317,8 +317,14 @@ not all and it refuses to start rather than run with authentication half-configu
 | Variable | Meaning | Where it comes from |
 |---|---|---|
 | `LOOM_ACTOR_REGISTRY_FILE` | The tenant's actor→key map and the governance attestation over it | the read-only actor-registry mount |
-| `LOOM_ACTOR_GOVERNANCE_KEY_FILE` | The governance verifying key | the read-only trust-root mount — an independent channel from the registry it signs |
+| `LOOM_ACTOR_GOVERNANCE_KEY_FILE` | The governance **trust-root register** — see [key-custody.md](key-custody.md) | the read-only trust-root mount — an independent channel from the registry it signs |
 | `LOOM_ACTOR_MIN_GENERATION` | The rollback floor. Must be ≥ 1 | deployment configuration, rendered into the manifest a reviewer reads |
+
+Since P8 that file is a *register*, not a bare key: `loomd` tries every governance root the register
+still trusts, newest generation first, and names the one that accepted the attestation in its startup
+log. A revoked root is never tried, so a revoked governance key stops the daemon starting even though
+its signature is still mathematically valid — which is exactly the point of recording revocation
+somewhere.
 
 Everything is checked **before any store file is opened**: the governance signature, the tenant the
 attestation was issued for, the rollback floor, and the registry fingerprint. Each failure stops

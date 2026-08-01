@@ -111,7 +111,7 @@ spec:
             - name: LOOM_ACTOR_REGISTRY_FILE
               value: /etc/loomd/actors/alpha.json
             - name: LOOM_ACTOR_GOVERNANCE_KEY_FILE
-              value: /etc/loomd/trust/actor-governance.pub
+              value: /etc/loomd/trust/actor-governance-trust-roots.json
             - name: LOOM_ACTOR_MIN_GENERATION
               value: "1"
             - name: LOOM_MAX_REQUEST_BYTES

@@ -146,6 +146,26 @@ impl ActorRegistryAttestation {
         &self.fingerprint
     }
 
+    /// The tenant this attestation was issued for.
+    pub fn tenant(&self) -> &TenantId {
+        &self.tenant
+    }
+
+    /// **The exact bytes governance signed.**
+    ///
+    /// Exposed so trust-root custody (`loom-keys`) can decide *which* registered key verifies this
+    /// attestation, without this crate depending on custody and — more importantly — without
+    /// changing the payload by one byte. The format is `loomdb-actor-registry-attestation-v1` and
+    /// P8 did not touch it: an attestation issued before custody existed still verifies after it.
+    pub fn signed_bytes(&self) -> Vec<u8> {
+        actor_registry_attestation_payload(&self.tenant, self.generation, &self.fingerprint)
+    }
+
+    /// The detached signature over [`ActorRegistryAttestation::signed_bytes`].
+    pub fn signature(&self) -> &[u8] {
+        &self.signature
+    }
+
     /// Serialize the signed manifest for a deployment artifact or secrets manager.
     pub fn to_json(&self) -> Result<String> {
         serde_json::to_string(self).map_err(|error| LoomError::InvalidSecurityConfiguration {

@@ -52,15 +52,25 @@
       "id": "GOV-01",
       "title": "Security governance and product boundary",
       "status": "implemented",
-      "frameworks": ["nist-ssdf-1.1", "nist-ai-rmf-1.0"],
-      "evidence": ["SECURITY.md", "docs/threat-model.md", "docs/invariants.md"],
+      "frameworks": [
+        "nist-ssdf-1.1",
+        "nist-ai-rmf-1.0"
+      ],
+      "evidence": [
+        "SECURITY.md",
+        "docs/threat-model.md",
+        "docs/invariants.md"
+      ],
       "gaps": []
     },
     {
       "id": "SDLC-01",
       "title": "Secure development and change verification",
       "status": "implemented",
-      "frameworks": ["nist-ssdf-1.1", "owasp-asvs-5.0.0"],
+      "frameworks": [
+        "nist-ssdf-1.1",
+        "owasp-asvs-5.0.0"
+      ],
       "evidence": [
         ".github/CODEOWNERS",
         ".github/workflows/ci.yml",
@@ -73,15 +83,28 @@
       "id": "APPSEC-01",
       "title": "Technical security verification",
       "status": "partial",
-      "frameworks": ["owasp-asvs-5.0.0", "csa-ccm-caiq-4.1"],
-      "evidence": ["docs/threat-model.md", "docs/at-map.md", ".github/workflows/ci.yml"],
-      "gaps": ["Commissioned independent penetration test and remediation report are not complete."]
+      "frameworks": [
+        "owasp-asvs-5.0.0",
+        "csa-ccm-caiq-4.1"
+      ],
+      "evidence": [
+        "docs/threat-model.md",
+        "docs/at-map.md",
+        ".github/workflows/ci.yml"
+      ],
+      "gaps": [
+        "Commissioned independent penetration test and remediation report are not complete."
+      ]
     },
     {
       "id": "SUPPLY-01",
       "title": "Release integrity, SBOM, signing, and provenance",
       "status": "implemented",
-      "frameworks": ["nist-ssdf-1.1", "slsa-1.2", "csa-ccm-caiq-4.1"],
+      "frameworks": [
+        "nist-ssdf-1.1",
+        "slsa-1.2",
+        "csa-ccm-caiq-4.1"
+      ],
       "evidence": [
         ".github/workflows/release-bundle.yml",
         ".github/workflows/security.yml",
@@ -93,7 +116,11 @@
       "id": "IAM-01",
       "title": "Identity, authorization, and tenant isolation",
       "status": "partial",
-      "frameworks": ["owasp-asvs-5.0.0", "csa-ccm-caiq-4.1", "csa-ai-caiq-1.0.2"],
+      "frameworks": [
+        "owasp-asvs-5.0.0",
+        "csa-ccm-caiq-4.1",
+        "csa-ai-caiq-1.0.2"
+      ],
       "evidence": [
         "SECURITY.md",
         "docs/threat-model.md",
@@ -115,18 +142,42 @@
       "id": "CRYPTO-01",
       "title": "Key management and cryptographic trust",
       "status": "partial",
-      "frameworks": ["nist-ssdf-1.1", "csa-ccm-caiq-4.1"],
-      "evidence": ["docs/backup-restore.md", "docs/operations.md", "SECURITY.md"],
+      "frameworks": [
+        "nist-ssdf-1.1",
+        "csa-ccm-caiq-4.1"
+      ],
+      "evidence": [
+        "docs/key-custody.md",
+        "docs/backup-restore.md",
+        "docs/operations.md",
+        "SECURITY.md",
+        "crates/loom-keys/src/register.rs",
+        "crates/loom-keys/src/directory.rs",
+        "crates/loom-keys/src/signer.rs",
+        "crates/loom-keys/src/rotation.rs",
+        "crates/loomctl/tests/key_custody.rs",
+        "crates/loom-mcp/tests/actor_registry.rs"
+      ],
       "gaps": [
-        "Production HSM/KMS key custody, delivery, revocation, and rotation drill are deployment-owned and not yet evidenced."
+        "All three signing roles - actor-governance, release, and backup-root - now verify through a named trust-root register rather than a bare public key: key id, algorithm, and role are bound into the verification path, and a revoked key is refused by name even though its material still verifies. The expand/activate/drill/revoke rotation sequence is implemented and exercised, dual control gates the two transitions that change what verifies, and every refusal is separately named. loomd verifies its actor-registry attestation through custody at startup.",
+        "EVERY KEY EXERCISED WAS SOFTWARE-BACKED. No hardware ceremony has been run, no key is non-exportable, and no receipt in this repository was produced by an HSM or KMS. Signer receipts record the backend that produced them precisely so a software drill cannot be mistaken for hardware custody; the drill output says so in its own text. EXT-HSM is unchanged and open.",
+        "The approved production backend is AWS KMS, whose asymmetric key specs are RSA and ECDSA only. Every loomDB signed format is Ed25519, so the ceremony requires either an Ed25519-capable backend such as CloudHSM (formats unchanged) or an algorithm migration that changes signed formats. This is unresolved and is a prerequisite for the ceremony, not a consequence of it - see docs/key-custody.md section 5."
       ]
     },
     {
       "id": "DATA-01",
       "title": "Data protection, privacy, and retention",
       "status": "partial",
-      "frameworks": ["csa-ccm-caiq-4.1", "csa-ai-caiq-1.0.2", "nist-ai-rmf-1.0"],
-      "evidence": ["docs/threat-model.md", "docs/backup-restore.md", "docs/at-map.md"],
+      "frameworks": [
+        "csa-ccm-caiq-4.1",
+        "csa-ai-caiq-1.0.2",
+        "nist-ai-rmf-1.0"
+      ],
+      "evidence": [
+        "docs/threat-model.md",
+        "docs/backup-restore.md",
+        "docs/at-map.md"
+      ],
       "gaps": [
         "Encryption at rest/in transit, retention, deletion, residency, and privacy notices are host or managed-service responsibilities."
       ]
@@ -135,7 +186,9 @@
       "id": "RES-01",
       "title": "Backup, recovery, and resilience",
       "status": "partial",
-      "frameworks": ["csa-ccm-caiq-4.1"],
+      "frameworks": [
+        "csa-ccm-caiq-4.1"
+      ],
       "evidence": [
         "docs/backup-restore.md",
         "docs/operations.md",
@@ -159,7 +212,10 @@
       "id": "OBS-01",
       "title": "Operational observability and bounded admission",
       "status": "partial",
-      "frameworks": ["csa-ccm-caiq-4.1", "csa-ai-caiq-1.0.2"],
+      "frameworks": [
+        "csa-ccm-caiq-4.1",
+        "csa-ai-caiq-1.0.2"
+      ],
       "evidence": [
         "docs/operations.md",
         "docs/backup-restore.md",
@@ -177,8 +233,14 @@
       "id": "IR-01",
       "title": "Incident and vulnerability response",
       "status": "partial",
-      "frameworks": ["nist-ssdf-1.1", "csa-ccm-caiq-4.1"],
-      "evidence": ["SECURITY.md", "docs/incident-response.md"],
+      "frameworks": [
+        "nist-ssdf-1.1",
+        "csa-ccm-caiq-4.1"
+      ],
+      "evidence": [
+        "SECURITY.md",
+        "docs/incident-response.md"
+      ],
       "gaps": [
         "Named on-call staff, communication channels, and an exercised customer notification drill are organizational gates."
       ]
@@ -187,7 +249,10 @@
       "id": "VM-01",
       "title": "Dependency and vulnerability management",
       "status": "implemented",
-      "frameworks": ["nist-ssdf-1.1", "csa-ccm-caiq-4.1"],
+      "frameworks": [
+        "nist-ssdf-1.1",
+        "csa-ccm-caiq-4.1"
+      ],
       "evidence": [
         "SECURITY.md",
         ".github/dependabot.yml",
@@ -200,8 +265,15 @@
       "id": "AIRISK-01",
       "title": "AI provenance, taint containment, and action governance",
       "status": "implemented",
-      "frameworks": ["nist-ai-rmf-1.0", "csa-ai-caiq-1.0.2"],
-      "evidence": ["docs/threat-model.md", "docs/invariants.md", "docs/at-map.md"],
+      "frameworks": [
+        "nist-ai-rmf-1.0",
+        "csa-ai-caiq-1.0.2"
+      ],
+      "evidence": [
+        "docs/threat-model.md",
+        "docs/invariants.md",
+        "docs/at-map.md"
+      ],
       "gaps": []
     }
   ],

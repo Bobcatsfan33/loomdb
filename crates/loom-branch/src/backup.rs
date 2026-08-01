@@ -593,6 +593,25 @@ fn load_signature(root: &Path) -> Result<BackupSignature, BackupError> {
         .map_err(|error| BackupError::Authenticity(format!("signature record is invalid: {error}")))
 }
 
+/// The checks both verification paths share: a format this build understands, and a signature
+/// record that actually commits to *these* manifest bytes.
+fn check_signature_record(record: &BackupSignature, manifest: &[u8]) -> Result<(), BackupError> {
+    if record.format_version != BACKUP_SIGNATURE_VERSION {
+        return Err(BackupError::Authenticity(format!(
+            "signature format {} is unsupported; this build accepts {}",
+            record.format_version, BACKUP_SIGNATURE_VERSION
+        )));
+    }
+    let digest = blake3::hash(manifest).to_hex().to_string();
+    if record.manifest_blake3 != digest {
+        return Err(BackupError::Authenticity(format!(
+            "signed manifest digest mismatch: expected {}, found {}",
+            record.manifest_blake3, digest
+        )));
+    }
+    Ok(())
+}
+
 fn verify_signature(
     root: &Path,
     manifest: &[u8],
@@ -600,12 +619,7 @@ fn verify_signature(
     public_key: &VerifyingKey,
 ) -> Result<BackupSignature, BackupError> {
     let record = load_signature(root)?;
-    if record.format_version != BACKUP_SIGNATURE_VERSION {
-        return Err(BackupError::Authenticity(format!(
-            "signature format {} is unsupported; this build accepts {}",
-            record.format_version, BACKUP_SIGNATURE_VERSION
-        )));
-    }
+    check_signature_record(&record, manifest)?;
     if record.algorithm != "ed25519" {
         return Err(BackupError::Authenticity(format!(
             "signature algorithm {:?} is unsupported",
@@ -616,13 +630,6 @@ fn verify_signature(
         return Err(BackupError::Authenticity(format!(
             "backup was signed by key {:?}, not expected key {:?}",
             record.key_id, expected_key_id
-        )));
-    }
-    let digest = blake3::hash(manifest).to_hex().to_string();
-    if record.manifest_blake3 != digest {
-        return Err(BackupError::Authenticity(format!(
-            "signed manifest digest mismatch: expected {}, found {}",
-            record.manifest_blake3, digest
         )));
     }
     let bytes = decode_hex::<64>(&record.ed25519, "Ed25519 signature")?;
@@ -653,6 +660,44 @@ pub fn verify_signed_backup(
     let manifest = decode_manifest(&bytes)?;
     verify_manifest_files(root, &manifest)?;
     Ok(manifest)
+}
+
+/// **Verify a signed backup against a trust-root register rather than a bare key.**
+///
+/// The signature record already names the key id and the algorithm, so this reads them and asks
+/// custody the question a bare `VerifyingKey` cannot answer: *is that key still trusted for the
+/// backup role?* A revoked key's material verifies exactly as well as it did the day before it was
+/// revoked, so refusing it has to be a decision somebody records — and this is where that decision
+/// reaches the backup path.
+///
+/// Not one signed byte changes. The record, the domain separator, and the manifest bytes are the
+/// P7 format; all that is added is which keys may still speak for the role.
+pub fn verify_signed_backup_with(
+    root: impl AsRef<Path>,
+    directory: &loom_keys::KeyDirectory,
+) -> Result<(BackupManifest, String), BackupError> {
+    let root = root.as_ref();
+    let bytes = load_manifest_bytes(root)?;
+    let record = load_signature(root)?;
+    check_signature_record(&record, &bytes)?;
+
+    // Custody decides *whether this key may still authorize a backup*, and the algorithm the record
+    // claims is checked against the algorithm the key is registered under — not against a hardcoded
+    // string. A revoked key is refused as revoked, rather than quietly passing a check it would
+    // mathematically pass.
+    let signature = decode_hex::<64>(&record.ed25519, "Ed25519 signature")?;
+    let trusted = directory
+        .verify(
+            &record.key_id,
+            &record.algorithm,
+            &signature_payload(&record.key_id, &bytes),
+            &signature,
+        )
+        .map_err(|error| BackupError::Authenticity(error.to_string()))?;
+
+    let manifest = decode_manifest(&bytes)?;
+    verify_manifest_files(root, &manifest)?;
+    Ok((manifest, trusted.key_id.clone()))
 }
 
 /// Restore a verified backup into a new, empty destination.

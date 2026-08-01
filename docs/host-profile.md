@@ -157,6 +157,13 @@ host responsibilities into loomDB.
    The **actor-governance** public key is a second, independent trust root — it answers "who may
    write into this tenant", not "is this build ours" — and the profile refuses to let one key serve
    both roles, or to let the governance key be delivered on the same mount as the registry it signs.
+
+   **P8**: `governanceKeyPath` names a trust-root *register*, not a bare public key. A bare key can
+   be verified against but cannot be **revoked** — it verifies exactly as well the day after a
+   compromise as the day before — and revocation is the one thing custody has to be able to do. The
+   register names the key, its role, its algorithm, its status, and the ceremony that approved it;
+   `loomd` tries every trusted governance root against the attestation and logs which one accepted
+   it. See [key-custody.md](key-custody.md).
 5. **Monitoring and operations.** OTLP collection with mTLS, alerting on the denial/error rate and
    latency SLO burn, and the human on-call and incident procedures the readiness manifest still
    records as open external gates.

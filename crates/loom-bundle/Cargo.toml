@@ -13,6 +13,8 @@ path = "src/main.rs"
 
 [dependencies]
 ed25519-dalek = { workspace = true }
+# Trust-root custody: which release key may still bless an update. No transport of any kind.
+loom-keys.workspace = true
 blake3.workspace = true
 serde.workspace = true
 bincode.workspace = true
