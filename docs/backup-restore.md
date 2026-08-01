@@ -227,7 +227,10 @@ exist so a *missing* backup is loud.
 
 ### The restore rehearsal
 
-The rehearsal restores the shelf's newest verified backup to a **fresh path** and scrubs it. It
+The rehearsal takes the **newest** backup on the shelf, verifies its signature against the trust root
+as part of `restore-signed`, restores it to a **fresh path**, and scrubs the result. (It picks the
+newest, not "the newest one the verify job blessed" — the two jobs share the shelf and nothing else,
+by design. A backup that fails here fails loudly and reports damage.) It
 never overwrites and never activates: `restore-signed` refuses any destination that already exists,
 so a rehearsal pointed at a live store fails rather than destroying it, and the profile cannot even
 render one — the rehearsal path may not overlap a tenant data directory, and the rehearsal job mounts

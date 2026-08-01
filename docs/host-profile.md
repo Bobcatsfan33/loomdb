@@ -314,10 +314,15 @@ token to do so.
 
 | Role | Command | Runs as | Mounts |
 |---|---|---|---|
-| `backup` | `loomctl backup-signed` against the clone | `loomd-backup` | the signing key, owner-only `0400` |
-| `verify` | `loomctl verify-backup-signed` | `loomd-backup-verifier` | the public trust root |
+| `backup` | `loomctl backup-signed --root` against the clone | `loomd-backup` | the signing key, owner-only `0400` |
+| `verify` | `loomctl verify-backup-signed --root` (newest on the shelf) | `loomd-backup-verifier` | the public trust root |
 | `prune` | `loomctl backup-prune --apply` | `loomd-backup` | the legal-hold register |
-| `rehearsal` | `loomctl restore-signed` to a fresh path | `loomd-backup-verifier` | the public trust root |
+| `rehearsal` | `loomctl restore-signed --root --out-root` (fresh path) | `loomd-backup-verifier` | the public trust root |
+
+The writer mints its destination and the readers resolve the newest backup themselves: neither is
+handed a path by the other, because they run at different times as different identities and share
+nothing but the shelf. An **empty shelf is an error**, so a pipeline that quietly stopped producing
+backups cannot report success forever.
 
 **A signature is worth the independence of the party checking it.** So the writer and the verifier
 are different identities holding different secrets, delivered on different mounts, and neither can do
