@@ -181,6 +181,8 @@ pub struct BackupConsumed {
     pub signed_payload_bytes: u64,
     /// Whether that payload fits the KMS `Sign` RAW limit.
     pub fits_kms_raw_sign_limit: bool,
+    /// Which backup signature format the drill exercised: 1 signs the manifest, 2 signs its digest.
+    pub signature_format_version: u32,
 }
 
 /// The complete record of one drill.

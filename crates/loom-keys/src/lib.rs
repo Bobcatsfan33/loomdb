@@ -57,6 +57,8 @@
 #![warn(rust_2018_idioms)]
 #![cfg_attr(test, allow(clippy::unwrap_used, clippy::expect_used, clippy::panic))]
 
+#[cfg(feature = "aws-kms")]
+pub mod aws_kms;
 mod directory;
 mod error;
 mod register;

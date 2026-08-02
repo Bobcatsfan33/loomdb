@@ -136,6 +136,13 @@ absent "air-gap + telemetry" 'object_store|substrate-store' "$AIRGAP_OTLP_GRAPH"
 # The pure air-gap flavour carries no exporter at all — not "configured off", not compiled.
 absent "air-gap" 'opentelemetry|reqwest|prost' "$AIRGAP_GRAPH"
 
+# ...and no AWS SDK. `loom-keys` gained an optional `aws-kms` signer backend in P9.1; it is OFF by
+# default precisely because loom-keys sits in loomd's graph, and an SDK there would break the claim
+# that the air-gap binary links no network client. This is the check that keeps the feature gate
+# honest — enabling it by accident would be silent otherwise.
+absent "air-gap" 'aws-sdk|aws-config|aws-smithy|^tokio' "$AIRGAP_GRAPH"
+absent "air-gap + telemetry" 'aws-sdk|aws-config|aws-smithy' "$AIRGAP_OTLP_GRAPH"
+
 # ...and the connected air-gap flavour does carry one, or it is advertising a pipeline it cannot
 # serve. This is the assertion that would have caught the contradiction from the other direction.
 present "air-gap + telemetry" 'opentelemetry' "$AIRGAP_OTLP_GRAPH"

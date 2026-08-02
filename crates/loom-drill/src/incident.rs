@@ -207,6 +207,7 @@ mod tests {
                 bytes: 4096,
                 signed_payload_bytes: 1200,
                 fits_kms_raw_sign_limit: true,
+                signature_format_version: 2,
             },
             restored_heads: heads,
             integrity_healthy: true,

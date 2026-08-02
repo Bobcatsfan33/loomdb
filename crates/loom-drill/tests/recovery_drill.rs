@@ -215,7 +215,14 @@ fn recovery_drill_local_filesystem() -> Result<(), Box<dyn std::error::Error>> {
         let live_db = Loom::open(&live, TenantId::new(TENANT))?;
 
         let clone_db = Loom::open(&clone, TenantId::new(TENANT))?;
-        let manifest = clone_db.backup_to_signed(&backup, BACKUP_KEY_ID, &backup_key)?;
+        // P9.1: the drill runs on the v2 path — a format that has not been through a recovery is a
+        // format nobody has recovered from (docs/design/backup-signature-v2.md §6).
+        let manifest = clone_db.backup_to_signed_as(
+            &backup,
+            BACKUP_KEY_ID,
+            &backup_key,
+            loom_branch::BACKUP_SIGNATURE_VERSION_V2,
+        )?;
         assert_eq!(manifest.tenant, TENANT);
         drop(clone_db);
 
@@ -370,6 +377,7 @@ fn recovery_drill_local_filesystem() -> Result<(), Box<dyn std::error::Error>> {
             bytes: manifest.files.iter().map(|file| file.bytes).sum(),
             signed_payload_bytes: payload_bytes,
             fits_kms_raw_sign_limit: payload_bytes <= KMS_RAW_SIGN_LIMIT_BYTES,
+            signature_format_version: loom_branch::BACKUP_SIGNATURE_VERSION_V2,
         },
         restored_heads,
         integrity_healthy: integrity.is_healthy(),
@@ -505,6 +513,11 @@ fn recovery_drill_local_filesystem() -> Result<(), Box<dyn std::error::Error>> {
         "measured RTO must be inside the target"
     );
     assert!(receipt.all_checks_held);
+    assert!(
+        receipt.backup.fits_kms_raw_sign_limit,
+        "the v2 payload must fit the KMS Sign RAW limit — that is why v2 exists: {} bytes",
+        receipt.backup.signed_payload_bytes
+    );
 
     eprintln!("\n{}\n", receipt.summary());
     eprintln!(
