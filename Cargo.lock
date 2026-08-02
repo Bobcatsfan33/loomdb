@@ -1260,6 +1260,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "loom-drill"
+version = "0.1.0"
+dependencies = [
+ "ed25519-dalek",
+ "loom-branch",
+ "loom-core",
+ "loom-keys",
+ "loom-provenance",
+ "serde",
+ "serde_json",
+ "tempfile",
+]
+
+[[package]]
 name = "loom-keys"
 version = "0.1.0"
 dependencies = [
