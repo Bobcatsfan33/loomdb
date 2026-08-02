@@ -75,7 +75,7 @@ asserts the **survivors**: the live store and the shelf are both intact afterwar
 | an unregistered key id | custody — `no trust root named …` |
 | **a revoked key whose signature is still valid** | custody — `REVOKED`, carrying the recorded reason |
 | a stale actor-registry generation | the rollback floor — `rollback refused` |
-| a destination that cannot be written | the restore, publishing nothing |
+| a destination that cannot be created | the restore, publishing nothing (a file blocking the path — **not** a true ENOSPC; see below) |
 | a backup killed mid-flight | build-in-a-sibling-then-rename: a partial publish is not a backup |
 | a restore killed mid-flight | nothing published; shelf and live store both intact |
 | a restore aimed at a live store | the drill's own guard rail, before anything is read |
@@ -109,6 +109,7 @@ The receipt lists this itself, in `notExercised`, so it travels with the artifac
 - immutable off-account object-lock targets
 - customer-scale data volumes
 - multi-node or cross-availability-zone recovery
+- a true ENOSPC / full-filesystem injection (a file blocking the destination path stands in for it; filling a filesystem is not portably arrangeable here)
 
 **`EXT-DR` remains open.** These drills ran on developer hardware, at developer scale, against a
 directory-copy clone and a software-backed key. Customer-scale data, the target storage stacks, and

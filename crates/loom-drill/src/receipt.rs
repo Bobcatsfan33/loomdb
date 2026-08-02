@@ -57,6 +57,8 @@ impl Topology {
                 "immutable off-account object-lock targets",
                 "customer-scale data volumes",
                 "multi-node or cross-availability-zone recovery",
+                "a true ENOSPC / full-filesystem injection (a file blocking the destination path \
+                 stands in for it; filling a filesystem is not portably arrangeable here)",
             ],
         }
     }

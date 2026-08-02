@@ -350,21 +350,32 @@ fn a_stale_actor_generation_stops_the_restored_store_opening(
 
 // ── the machine gets in the way ──────────────────────────────────────────────────────────────────
 
-/// A destination that cannot be written. The restore refuses and publishes nothing — a partially
+/// **A destination the restore cannot create.** It refuses and publishes nothing — a partially
 /// restored store must never become visible.
-#[cfg(unix)]
+///
+/// The blocker is a regular *file* where the restore needs a directory, so it fails with `ENOTDIR`
+/// for **any** uid. An earlier version of this test used a `0o500` directory, which passed locally
+/// and failed in CI: the offline suite runs as root inside its container, and root ignores
+/// permission bits. A fault test whose outcome depends on who is running it is testing the
+/// environment, not the system.
+///
+/// This is *not* a true ENOSPC injection. Filling a filesystem is not portably arrangeable from a
+/// test on this machine, and the topology's `notExercised` list says so rather than letting this
+/// stand in for it silently. What this does prove is the property that matters at the boundary: a
+/// restore that cannot write publishes nothing and leaves both survivors intact.
 #[test]
-fn a_restore_that_cannot_write_publishes_nothing() -> Result<(), Box<dyn std::error::Error>> {
-    use std::os::unix::fs::PermissionsExt;
-
+fn a_restore_that_cannot_create_its_destination_publishes_nothing(
+) -> Result<(), Box<dyn std::error::Error>> {
     let fixture = Fixture::new(TENANT)?;
-    let readonly_parent = fixture.root.join("readonly");
-    std::fs::create_dir(&readonly_parent)?;
-    std::fs::set_permissions(&readonly_parent, std::fs::Permissions::from_mode(0o500))?;
-    let destination = readonly_parent.join("restored");
+    let blocker = fixture.root.join("a-file-not-a-directory");
+    std::fs::write(
+        &blocker,
+        b"a regular file sits where a directory would have to be",
+    )?;
+    let destination = blocker.join("restored");
 
     let outcome = record(
-        "restore into a destination the process cannot write (stands in for ENOSPC)",
+        "restore into a path that cannot be created (a file blocks the parent)",
         loom_drill::restore_beside_production(
             &fixture.backup,
             &destination,
@@ -376,15 +387,16 @@ fn a_restore_that_cannot_write_publishes_nothing() -> Result<(), Box<dyn std::er
         .map_err(|error| error.to_string()),
         fixture.survivors_intact(),
     );
-    // Restore permissions before any assertion can abort the test and leak an undeletable directory.
-    std::fs::set_permissions(&readonly_parent, std::fs::Permissions::from_mode(0o700))?;
 
     assert!(outcome.refused, "{outcome:?}");
     assert!(
         !destination.exists(),
         "a failed restore must publish nothing"
     );
-    assert!(outcome.survivors_intact);
+    assert!(
+        outcome.survivors_intact,
+        "the live store and the shelf must both survive: {outcome:?}"
+    );
     Ok(())
 }
 
