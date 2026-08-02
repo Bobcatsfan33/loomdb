@@ -211,12 +211,13 @@ and gives an auditor no way to tell a rotation mistake from an attack.
    - **`actor-governance` and `release` can move to KMS unchanged.** Both payloads are small and
      fixed-shape. The ceremony order Ryan chose puts actor-governance first, which is the role with
      the most headroom — nothing blocks starting.
-   - **`backup-root` cannot, without a decision.** The options are to sign a digest of the manifest
-     instead of the manifest (a signed-format change, and the record already carries
-     `manifest_blake3`, so the change is small but real), to use `ED25519_PH_SHA_512` (a *different*
-     signature scheme — `ed25519-dalek` will not verify it, so also a format change), or to keep the
-     backup trust root on a backend without the 4 KiB ceiling. **This is undecided and is a
-     prerequisite for moving that one key, not for the ceremony as a whole.**
+   - **`backup-root` joins as phase 2, behind a versioned format change.** Decided 2026-08-02: it
+     will sign a domain-separated tag plus the manifest *digest* rather than the manifest, taking the
+     payload from 5,680 bytes to a fixed ~95. Keeping one root of three on different custody was the
+     alternative and was rejected — it fragments the ceremony story, and the odd one out would be the
+     DR-critical root. The design is in
+     [`docs/design/backup-signature-v2.md`](design/backup-signature-v2.md) and lands as its own
+     increment (P9.1) before the key moves; v1 backups verify forever and are never rewritten.
 
 3. **The register is not signed** (§1), and its integrity rests on the read-only mount and the
    channel that delivered it.
