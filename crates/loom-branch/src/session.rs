@@ -2120,6 +2120,30 @@ impl Loom {
         key_id: &str,
         signing_key: &ed25519_dalek::SigningKey,
     ) -> std::result::Result<crate::backup::BackupManifest, crate::backup::BackupError> {
+        self.backup_to_signed_as(
+            destination,
+            key_id,
+            signing_key,
+            crate::backup::BACKUP_SIGNATURE_VERSION,
+        )
+    }
+
+    /// Create a signed backup in a chosen signature format.
+    ///
+    /// `format_version` selects what the signature covers: `1` signs the whole manifest, `2` signs a
+    /// domain-tagged digest of it. v2 exists because the v1 payload grows with the store and AWS KMS
+    /// `Sign` accepts at most 4096 bytes — see `docs/design/backup-signature-v2.md`.
+    ///
+    /// [`Loom::backup_to_signed`] still writes v1. Verification accepts both, everywhere, and the
+    /// default flips only once every verifier in a fleet is known to accept v2 — the same
+    /// distribute-then-trust ordering P8's rotation uses.
+    pub fn backup_to_signed_as(
+        &self,
+        destination: impl AsRef<std::path::Path>,
+        key_id: &str,
+        signing_key: &ed25519_dalek::SigningKey,
+        format_version: u32,
+    ) -> std::result::Result<crate::backup::BackupManifest, crate::backup::BackupError> {
         let root = self.store_root.as_ref().ok_or_else(|| {
             crate::backup::BackupError::Unsupported(
                 "online backup requires a database opened with Loom::open or a production variant"
@@ -2139,6 +2163,7 @@ impl Loom {
             self.tenant.as_str(),
             key_id,
             signing_key,
+            format_version,
         )
     }
 

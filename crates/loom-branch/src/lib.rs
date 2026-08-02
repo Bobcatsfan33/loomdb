@@ -43,6 +43,7 @@ pub use backup::{
     restore_backup, restore_signed_backup, verify_backup, verify_signed_backup,
     verify_signed_backup_with, BackupError, BackupFile, BackupManifest, BackupSignature,
     BACKUP_FORMAT_VERSION, BACKUP_MANIFEST_FILE, BACKUP_SIGNATURE_FILE, BACKUP_SIGNATURE_VERSION,
+    BACKUP_SIGNATURE_VERSION_V2,
 };
 pub use merge::{
     is_reserved, plan_merge, MergeConflict, MergeConflictReport, MergeOutcome, MergePolicy,

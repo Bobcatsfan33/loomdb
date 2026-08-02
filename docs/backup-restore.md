@@ -236,6 +236,20 @@ so a rehearsal pointed at a live store fails rather than destroying it, and the 
 render one — the rehearsal path may not overlap a tenant data directory, and the rehearsal job mounts
 the backup shelf read-only. Promoting a rehearsed store is a separate, deliberate operator act.
 
+## Signature formats
+
+Two, and both verify. **v1** signs the whole manifest; **v2** signs a domain-tagged digest of it,
+which takes the payload from thousands of bytes to a fixed 95 and lets the backup trust root share
+AWS KMS custody with the other two roles (`Sign` accepts at most 4,096 bytes).
+
+`loomctl backup-signed` still writes **v1**. Verification accepts both, everywhere, so a shelf may
+hold either during a rotation; the writer default flips only once every verifier is known to accept
+v2 — the same distribute-then-trust ordering key rotation uses. Old backups are never rewritten.
+
+The v2 verifier **recomputes** the manifest digest and never trusts the one the signature record
+carries: a signature over a carried value would bind a claim the record makes about itself rather
+than the manifest. See [`docs/design/backup-signature-v2.md`](design/backup-signature-v2.md).
+
 ## Recovery objectives
 
 **Approved 2026-08-01: RPO 24 hours, RTO 4 hours.**

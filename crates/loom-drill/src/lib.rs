@@ -192,9 +192,16 @@ pub fn signed_payload_bytes(backup: &Path) -> Result<u64> {
     let key_id = record["key_id"]
         .as_str()
         .ok_or_else(|| fail("the signature record has no key_id"))?;
-    // domain separator + key id + one separator byte + the manifest bytes (backup.rs).
     const SIGNATURE_DOMAIN_BYTES: u64 = 36;
-    Ok(SIGNATURE_DOMAIN_BYTES + key_id.len() as u64 + 1 + manifest.len() as u64)
+    match record["format_version"].as_u64() {
+        // v1: domain + key id + separator byte + the whole manifest (backup.rs).
+        Some(1) => Ok(SIGNATURE_DOMAIN_BYTES + key_id.len() as u64 + 1 + manifest.len() as u64),
+        // v2: domain + a u64 length prefix + key id + a 32-byte digest. Fixed.
+        Some(2) => Ok(SIGNATURE_DOMAIN_BYTES + 8 + key_id.len() as u64 + 32),
+        other => Err(fail(format!(
+            "signature record declares format {other:?}, which this drill cannot measure"
+        ))),
+    }
 }
 
 /// The manifest digest a signature record commits to.

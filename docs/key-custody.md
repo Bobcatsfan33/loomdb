@@ -211,6 +211,14 @@ and gives an auditor no way to tell a rotation mistake from an attack.
    - **`actor-governance` and `release` can move to KMS unchanged.** Both payloads are small and
      fixed-shape. The ceremony order Ryan chose puts actor-governance first, which is the role with
      the most headroom — nothing blocks starting.
+   **Status 2026-08-02: implemented and exercised.** Both keys are provisioned, registered by ARN
+   with their exported public keys pinned to the provisioning SPKI hashes, and a real `kms:Sign`
+   round-trip verified offline against each — [`docs/drills/kms-roundtrip.json`](drills/kms-roundtrip.json).
+   Both are `status: pending`: provisioned is not trusted, and the dual-control ceremony has not
+   been held. The `aws-kms` driver lives in `loom-keys` behind an off-by-default feature, because
+   that crate is in `loomd`'s air-gap graph and an SDK there would break the no-network-client
+   claim; `verify_build_flavours.sh` asserts the air-gap graph carries no AWS crate.
+
    - **`backup-root` joins as phase 2, behind a versioned format change.** Decided 2026-08-02: it
      will sign a domain-separated tag plus the manifest *digest* rather than the manifest, taking the
      payload from 5,680 bytes to a fixed ~95. Keeping one root of three on different custody was the
