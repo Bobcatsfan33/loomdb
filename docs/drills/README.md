@@ -111,6 +111,11 @@ The receipt lists this itself, in `notExercised`, so it travels with the artifac
 - multi-node or cross-availability-zone recovery
 - a true ENOSPC / full-filesystem injection (a file blocking the destination path stands in for it; filling a filesystem is not portably arrangeable here)
 
+The drill also measured the backup signing payload at **5,680 bytes** against AWS KMS's 4,096-byte
+`Sign` limit — the measurement that motivated
+[`docs/design/backup-signature-v2.md`](../design/backup-signature-v2.md). A drill that only confirmed
+the happy path would not have produced that number.
+
 **`EXT-DR` remains open.** These drills ran on developer hardware, at developer scale, against a
 directory-copy clone and a software-backed key. Customer-scale data, the target storage stacks, and
 SRE sign-off are external, and no drill in this repository was run against production-shaped storage.
