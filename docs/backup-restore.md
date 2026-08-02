@@ -236,6 +236,26 @@ so a rehearsal pointed at a live store fails rather than destroying it, and the 
 render one — the rehearsal path may not overlap a tenant data directory, and the rehearsal job mounts
 the backup shelf read-only. Promoting a rehearsed store is a separate, deliberate operator act.
 
+## Recovery objectives
+
+**Approved 2026-08-01: RPO 24 hours, RTO 4 hours.**
+
+| | Target | Why this number |
+|---|---|---|
+| **RPO** — worst-case data loss | 24 h | The deployed schedule takes one signed backup a day (`backupIntervalSeconds: 86400`), so a day is the honest worst case. The stale-backup alert fires at 36 h (`maxAgeSeconds: 129600`), which is one missed run. |
+| **RTO** — time to a serving store | 4 h | Restore, attested reopen, and the known-answer checks below, with room for a human in the loop. |
+
+These describe the mechanism **actually deployed**. Approving targets tighter than the schedule would
+make a drill fail by construction instead of measuring anything; approving these makes the drill
+measure reality. They are pre-production targets and revisitable per deployment — tightening them is
+a schedule change (a shorter `backupIntervalSeconds` and a matching `maxAgeSeconds`), not a
+re-labelling.
+
+**Every drill records the measured recovery point and recovery time as first-class results**, not
+merely pass/fail against the targets. If the real numbers come in far better — and on developer
+hardware they do — that evidence is what justifies tightening the targets when a customer contract
+demands it. Receipts are retained under [`docs/drills/`](drills/).
+
 ## Required deployment drill
 
 Run this drill for every target filesystem, CSI driver, backup agent, and object-store topology:

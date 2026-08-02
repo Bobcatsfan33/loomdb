@@ -1,0 +1,175 @@
+{
+  "notifications": [
+    {
+      "audience": "operations",
+      "body": "This is a DRILL. No production system was affected.\n\nTenant:            acme-corp\nTopology:          local-filesystem-copy-clone\nSigner backend:    software\n\nRecovery point:    0.17s of work was not in the clone in this drill\nProduction RPO:    bounded by the backup interval, 24h00m00.00s (target 24h00m00.00s) - the drill measures the boundary, not the interval\nRecovery time:     0.09s to a verified, attested, servable store on 23.60 KiB (target 4h00m00.00s)\n\nBackup consumed:   acme-corp-1785633602\nManifest BLAKE3:   ef1edfc1f0799e9a4f282a1500b8063a92b1f8cdc39631d6a970a0d965c5e946\nVerified by:       trust root backup-root-2026-q3 (backup-root role)\nRestored heads:    main=a2d19542aa62 pre-clone-work=b03244ee29b6\nIntegrity:         clean\nKnown-answer:      11/11 matched\nFaults injected:   4 — all refused: true\n\nNot exercised by this topology:\n  - CSI volume snapshots and clone provisioning\n  - storage-array or filesystem snapshot primitives\n  - third-party backup products and their agents\n  - immutable off-account object-lock targets\n  - customer-scale data volumes\n  - multi-node or cross-availability-zone recovery\n  - a true ENOSPC / full-filesystem injection (a file blocking the destination path stands in for it; filling a filesystem is not portably arrangeable here)\n",
+      "delivered": false,
+      "deliveryRequires": [
+        "a named on-call rota with contracted response targets",
+        "a paging system wired to that rota",
+        "a customer-communications channel with an accountable owner",
+        "a documented decision on whether an incident is notifiable",
+        "all of the above are EXT-OPERATIONS and remain open"
+      ],
+      "subject": "[DRILL] loomDB recovery exercise — tenant acme-corp — local-filesystem-copy-clone topology"
+    },
+    {
+      "audience": "customer",
+      "body": "This is a DRILL. Your data was not affected and no action is required.\n\nHad this been real, the recovery would have restored your data to the most recent backup. Backups are taken every 24h00m00.00s, so up to that much recent work would not have been recovered and would need to be re-entered.\n\nService was restored to a verified state in 0.09s.\n\nThe restored data was checked against its cryptographic signature before being brought back, and its integrity was verified as intact.\n",
+      "delivered": false,
+      "deliveryRequires": [
+        "a named on-call rota with contracted response targets",
+        "a paging system wired to that rota",
+        "a customer-communications channel with an accountable owner",
+        "a documented decision on whether an incident is notifiable",
+        "all of the above are EXT-OPERATIONS and remain open"
+      ],
+      "subject": "[DRILL] Recovery exercise for acme-corp"
+    }
+  ],
+  "receipt": {
+    "allChecksHeld": true,
+    "attestedOpen": true,
+    "backend": "software",
+    "backup": {
+      "bytes": 24163,
+      "files": 27,
+      "fitsKmsRawSignLimit": false,
+      "manifestBlake3": "ef1edfc1f0799e9a4f282a1500b8063a92b1f8cdc39631d6a970a0d965c5e946",
+      "name": "acme-corp-1785633602",
+      "signedPayloadBytes": 5680,
+      "verifiedByKeyId": "backup-root-2026-q3",
+      "verifiedByRole": "backup-root"
+    },
+    "cloneTakenUnix": 1785633602,
+    "failureUnix": 1785633602,
+    "faults": [
+      {
+        "error": "independent verification refused the backup: backup integrity check failed: loom/refs.log changed: expected 1334 bytes / 2963f0d2335e14d82f1ecf6d80b3f2fcca5f550fbdcd5ffbc69a93c3807fd3bc, found 1334 bytes / 9d0ceabb37190b70486e258074f96abe6e271aea5166a4de72fbdb02d2e03d62",
+        "fault": "bit flip in backup part loom/refs.log",
+        "refused": true,
+        "survivorsIntact": true
+      },
+      {
+        "error": "backup belongs to tenant \"acme-corp\", not the expected \"beta-industries\"; refusing restore",
+        "fault": "restore a backup belonging to another tenant",
+        "refused": true,
+        "survivorsIntact": true
+      },
+      {
+        "error": "independent verification refused the backup: backup authenticity check failed: trust root \"backup-root-2026-q3\" was REVOKED at generation 1: revoked during the drill's fault injection. The signature may still be cryptographically valid — revocation is a decision, and this is it.",
+        "fault": "verify against a register that has since revoked the signing trust root",
+        "refused": true,
+        "survivorsIntact": true
+      },
+      {
+        "error": "refusing to restore into /var/folders/_b/r7fwk2p529xdn3jbj2h64k7m0000gn/T/.tmplMS43H/live: it is, or is inside, the live store /var/folders/_b/r7fwk2p529xdn3jbj2h64k7m0000gn/T/.tmplMS43H/live. A drill restores beside production, never onto it",
+        "fault": "restore aimed at the live store",
+        "refused": true,
+        "survivorsIntact": true
+      }
+    ],
+    "integrityHealthy": true,
+    "knownAnswers": [
+      {
+        "actual": "{\"main\": \"a2d19542aa62\", \"pre-clone-work\": \"b03244ee29b6\"}",
+        "check": "branch heads match the pre-clone state",
+        "expected": "{\"main\": \"a2d19542aa62\", \"pre-clone-work\": \"b03244ee29b6\"}",
+        "matched": true
+      },
+      {
+        "actual": "recorded before the clone",
+        "check": "known-answer read of obs/before-0",
+        "expected": "recorded before the clone",
+        "matched": true
+      },
+      {
+        "actual": "recorded before the clone",
+        "check": "known-answer read of obs/before-1",
+        "expected": "recorded before the clone",
+        "matched": true
+      },
+      {
+        "actual": "recorded before the clone",
+        "check": "known-answer read of obs/before-2",
+        "expected": "recorded before the clone",
+        "matched": true
+      },
+      {
+        "actual": "absent",
+        "check": "obs/after-0 is absent, as the recovery point requires",
+        "expected": "absent",
+        "matched": true
+      },
+      {
+        "actual": "absent",
+        "check": "obs/after-1 is absent, as the recovery point requires",
+        "expected": "absent",
+        "matched": true
+      },
+      {
+        "actual": "absent",
+        "check": "obs/after-2 is absent, as the recovery point requires",
+        "expected": "absent",
+        "matched": true
+      },
+      {
+        "actual": "absent",
+        "check": "obs/after-3 is absent, as the recovery point requires",
+        "expected": "absent",
+        "matched": true
+      },
+      {
+        "actual": "absent",
+        "check": "obs/after-4 is absent, as the recovery point requires",
+        "expected": "absent",
+        "matched": true
+      },
+      {
+        "actual": "absent",
+        "check": "the branch created after the clone is absent",
+        "expected": "absent",
+        "matched": true
+      },
+      {
+        "actual": "reachable",
+        "check": "taint over a source restored from backup still names its downstream set",
+        "expected": "reachable",
+        "matched": true
+      }
+    ],
+    "notExercised": [
+      "CSI volume snapshots and clone provisioning",
+      "storage-array or filesystem snapshot primitives",
+      "third-party backup products and their agents",
+      "immutable off-account object-lock targets",
+      "customer-scale data volumes",
+      "multi-node or cross-availability-zone recovery",
+      "a true ENOSPC / full-filesystem injection (a file blocking the destination path stands in for it; filling a filesystem is not portably arrangeable here)"
+    ],
+    "recoveryPoint": {
+      "headroomFactor": 514850.3641642694,
+      "human": "0.17s",
+      "seconds": 0.16781575,
+      "targetSeconds": 86400,
+      "withinTarget": true
+    },
+    "recoveryPointBoundedBySeconds": 86400,
+    "recoveryTime": {
+      "headroomFactor": 163674.25980731333,
+      "human": "0.09s",
+      "seconds": 0.087979625,
+      "targetSeconds": 14400,
+      "withinTarget": true
+    },
+    "restoredBytes": 24163,
+    "restoredHeads": {
+      "main": "a2d19542aa62",
+      "pre-clone-work": "b03244ee29b6"
+    },
+    "schemaVersion": 1,
+    "tenant": "acme-corp",
+    "topology": "local-filesystem-copy-clone"
+  },
+  "summary": "local-filesystem-copy-clone: drill recovery point 0.17s before failure (production worst case is the 24h00m00.00s backup interval; target 24h00m00.00s), recovery time 0.09s on 23.60 KiB — 11 known-answer checks, 4 faults refused, backend software"
+}

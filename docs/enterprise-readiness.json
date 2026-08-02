@@ -201,11 +201,19 @@
         "deploy/reference/systemd/loomd-backup@.timer",
         "crates/loomctl/src/retention.rs",
         "crates/loomctl/src/receipt.rs",
-        "crates/loomctl/tests/backup_operations.rs"
+        "crates/loomctl/tests/backup_operations.rs",
+        "docs/drills/README.md",
+        "docs/drills/local-filesystem-copy-clone.json",
+        "crates/loom-drill/src/lib.rs",
+        "crates/loom-drill/src/receipt.rs",
+        "crates/loom-drill/src/incident.rs",
+        "crates/loom-drill/tests/recovery_drill.rs",
+        "crates/loom-drill/tests/fault_injection.rs"
       ],
       "gaps": [
         "The reference profile now renders scheduled signed backups against a platform-provided point-in-time clone, an independent verification job that runs under a different identity and holds only the public trust root, retention with legal hold, a declared immutable off-account target with a named WORM mechanism, and a restore rehearsal that restores to a fresh path and cannot overwrite or activate a live store. The engine holds an exclusive lock on its store, so no job can read a live tenant volume; the profile refuses to render one that tries.",
-        "Customer-scale RPO/RTO targets and a signed restore drill receipt for each target topology remain required. maxAgeSeconds is a threshold the profile enforces, not a recovery objective anyone has measured, and no drill has been executed against a production storage stack, CSI driver, or backup product."
+        "APPROVED RECOVERY OBJECTIVES (2026-08-01): RPO 24 hours, RTO 4 hours. They describe the mechanism actually deployed - daily signed backups against a platform point-in-time clone, backupIntervalSeconds 86400 with a maxAgeSeconds 129600 staleness alert - because approving targets tighter than the deployed schedule would make the drill fail by construction rather than measure anything. They are pre-production targets, revisitable per deployment. Every drill records MEASURED recovery point and recovery time as first-class results rather than a pass/fail against the targets, so evidence that the real numbers are better is available to justify tightening them when a contract requires it.",
+        "Recovery has been exercised end to end on the local-filesystem topology only, on developer hardware, at developer scale: clone, signed backup under sustained writes, independent verification through trust-root custody, restore to a new path, attested reopen, known-answer reads, provenance and taint checks, and fault injection. Receipts are retained under docs/drills/. Customer-scale data volumes, the target storage stacks (CSI drivers, backup products, object-lock targets), and SRE sign-off are external and unexercised, so EXT-DR remains open. No drill in this repository was run against production-shaped storage."
       ]
     },
     {
@@ -239,10 +247,13 @@
       ],
       "evidence": [
         "SECURITY.md",
-        "docs/incident-response.md"
+        "docs/incident-response.md",
+        "crates/loom-drill/src/incident.rs",
+        "docs/drills/README.md"
       ],
       "gaps": [
-        "Named on-call staff, communication channels, and an exercised customer notification drill are organizational gates."
+        "Incident notification CONTENT is generated from a recovery drill's measured receipt - what was lost, what bounds it, how long recovery took, which backup was consumed, which trust root verified it - for both an operations and a customer audience, and is exercised as a scripted tabletop in crates/loom-drill. Every generated notification records delivered=false and carries what delivery would require.",
+        "Named on-call staff, a paging system wired to a rota, an accountable customer-communications channel, a documented notifiability decision, and an exercised real notification drill are organizational gates. Nothing in this repository has been delivered to anyone; EXT-OPERATIONS remains open."
       ]
     },
     {
