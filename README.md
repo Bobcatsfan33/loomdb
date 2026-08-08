@@ -218,8 +218,9 @@ implemented, 7 partial** — each with its evidence *and its gaps*, **5 open blo
 read the open gates yourself in about a minute.
 
 The five open gates are the ones no amount of code can close from inside this repository: a
-**hardware key ceremony** (the signing keys are provisioned in AWS KMS and round-trip-verified, but no
-dual-control ceremony has been held), a **customer-scale disaster-recovery sign-off** (drills are
+**hardware key ceremony** (there is no hardware-backed signing key at all — releases are signed by a
+software key in a GitHub Actions secret, and the AWS KMS keys that were provisioned in August were
+destroyed with the account before any ceremony), a **customer-scale disaster-recovery sign-off** (drills are
 measured on developer hardware, and say so), a **third-party penetration test**, an **operations rota**,
 and a **compliance audit**. Each is external or human by nature.
 

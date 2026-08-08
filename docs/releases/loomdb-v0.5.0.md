@@ -40,8 +40,10 @@ blocking external gates**, `"deploymentDecision": "not-approved"`, and a review 
 evidence it does not have.
 
 The five open gates are the ones no amount of code closes from inside a repository: a **hardware key
-ceremony** (keys are provisioned in AWS KMS and round-trip-verified, but no dual-control ceremony has
-been held, and both keys are `status: pending`), a **customer-scale disaster-recovery sign-off**
+ceremony** (there is no hardware-backed key: this release is signed by a **software** Ed25519 key held
+as a GitHub Actions secret, and the AWS KMS keys provisioned on 2026-08-02 were destroyed with the
+account on 2026-08-08 before any ceremony — see [`docs/key-custody.md`](https://github.com/Bobcatsfan33/loomdb/blob/main/docs/key-custody.md)
+§5), a **customer-scale disaster-recovery sign-off**
 (drills are measured on developer hardware and say so), a **third-party penetration test**, an
 **operations rota**, and a **compliance audit**.
 
