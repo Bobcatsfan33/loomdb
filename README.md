@@ -294,6 +294,7 @@ architecture of record lives in the substrate repository:
     enterprise evidence index and open production gates
 11. [`docs/known-limits.md`](docs/known-limits.md) — every bound LoomDB knows about itself, with the
     measurements behind it
+12. [`CHANGELOG.md`](CHANGELOG.md) — what changed in each version, and what each one was verified with
 
 ## Contributing
 
