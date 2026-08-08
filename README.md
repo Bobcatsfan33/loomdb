@@ -295,6 +295,20 @@ architecture of record lives in the substrate repository:
 11. [`docs/known-limits.md`](docs/known-limits.md) — every bound LoomDB knows about itself, with the
     measurements behind it
 
+## Contributing
+
+Start with [CONTRIBUTING.md](CONTRIBUTING.md) — it has the setup commands (executed and timed), the
+one trap that will cost you an hour if nobody warns you (`cargo test --all-targets` *runs* the
+`harness = false` benchmarks), and a short section on how this repo is run: measurements carry their
+conditions, a new guard has to be **proven to fire**, and the four model oracles change to match the
+specification rather than your implementation.
+
+Issues labelled [**good first issue**](https://github.com/Bobcatsfan33/loomdb/labels/good%20first%20issue)
+are real gaps, each with a code pointer, acceptance criteria, and a note on the obvious-but-wrong fix.
+
+Participation is governed by the [Code of Conduct](CODE_OF_CONDUCT.md). Security issues go through
+[SECURITY.md](SECURITY.md), never a public issue.
+
 ## License
 
 Apache-2.0.
