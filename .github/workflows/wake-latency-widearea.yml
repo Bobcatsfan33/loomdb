@@ -24,7 +24,7 @@ jobs:
     name: AT-047 wake latency, over real S3
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v7.0.1
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       - name: Measure loom wake → first read over real S3
