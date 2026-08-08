@@ -68,20 +68,20 @@ Use the documented `cargo test --workspace --lib --bins --tests`.
 clippy` — those compile the benches without executing them, which is why CI uses it in both places.
 It is only `cargo test --all-targets` that detonates.
 
-### One local side effect to know about
+### The test suite leaves the tree clean — keep it that way
 
-A full test run rewrites `docs/drills/local-filesystem-copy-clone.json` — the drill regenerates its
-receipt with fresh timestamps and digests. The substance is unchanged (same known-answer count, same
-faults refused, same signed-payload size), but `git status` will show it dirty.
+`cargo test --workspace --lib --bins --tests` should leave `git status --porcelain` **empty**. If a
+change of yours makes the suite write into the working tree, that is a bug in the change, not a
+quirk to document.
 
-**Revert it before committing** unless updating that evidence is genuinely the point of your change:
+The one place this went wrong is worth knowing, because it is an easy pattern to reintroduce: the
+recovery drill used to write its receipt straight into `docs/drills/`, so every test run rewrote
+committed evidence with fresh timestamps. It now writes to a scratch directory by default — and still
+reads it back, so the write path stays exercised. To regenerate the retained evidence deliberately:
 
 ```sh
-git checkout -- docs/drills/local-filesystem-copy-clone.json
+LOOM_DRILL_RETAIN=1 cargo test -p loom-drill --test recovery_drill
 ```
-
-(Fixing this properly is a
-[good first issue](https://github.com/Bobcatsfan33/loomdb/labels/good%20first%20issue).)
 
 ---
 
