@@ -114,8 +114,13 @@ Stated because they are still true, not buried. Full text with measurements in
 - **Phase 3 operations are partially closed** — OpenTelemetry, `loomctl` provenance/taint views, and
   per-topology restore drills remain open.
 - **Signature verification is opt-in and key issuance is external.**
-- **No HSM ceremony has been held.** The KMS keys are provisioned and round-trip-verified, and both
-  are `status: pending` — provisioned is not trusted.
+- **No HSM ceremony has been held, and there is no hardware-backed key.** Release bundles are signed
+  by a **software** Ed25519 key held as a GitHub Actions secret. Two AWS KMS keys were provisioned and
+  round-trip-verified on 2026-08-02 at `status: pending`, then destroyed on 2026-08-08 when the
+  account was closed — before any ceremony, activation, or signature over a real artifact. The
+  committed production register was removed rather than back-dated with approvers who never approved
+  anything; the record is in [`docs/key-custody.md`](docs/key-custody.md) §5. `EXT-HSM` is open and is
+  further from closed than before.
 
 ---
 
