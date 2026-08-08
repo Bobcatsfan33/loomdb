@@ -3,7 +3,11 @@
 //! This is not a unit test of a drill library. It is the drill: a database is written to, cloned
 //! mid-flight, backed up, lost, verified from a separate trust domain, restored somewhere new,
 //! reopened through the attested path, and checked against expectations recorded before the failure.
-//! What it measures is written to `docs/drills/` as a retained receipt.
+//!
+//! What it measures is written to a receipt. By default that goes to a scratch directory, so an
+//! ordinary test run never rewrites committed evidence; `LOOM_DRILL_RETAIN=1` writes it to
+//! `docs/drills/` instead, which is how the retained receipt is deliberately regenerated. See
+//! [`retain`].
 //!
 //! Everything it exercises is the real mechanism. Nothing it cannot exercise is simulated: the
 //! point-in-time clone is a directory copy, the topology says so, and the receipt lists what that
@@ -536,28 +540,75 @@ fn recovery_drill_local_filesystem() -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
-/// Write the receipt into `docs/drills/`, where it is retained as evidence.
+/// Write the receipt, and prove it can be read back.
 ///
-/// `LOOM_DRILL_RETAIN=0` skips the write for a run that is only checking the drill still passes.
+/// # Why this does not write to `docs/drills/` by default
+///
+/// It used to, and an ordinary `cargo test --workspace` therefore rewrote committed evidence on every
+/// run — fresh timestamps, a fresh backup name, fresh digests, identical substance. Two things go
+/// wrong with that. A contributor picks the change up by accident in an unrelated PR, silently
+/// replacing the recorded P9 drill with one a laptop produced. And a suite that always leaves the tree
+/// dirty teaches everyone to skip past `git status`, which is a bad habit to cultivate in a repository
+/// whose argument rests on checked evidence.
+///
+/// So the default destination is a scratch directory. The receipt is still built, still serialized,
+/// still written, and now additionally **read back and re-parsed** — the write path is exercised on
+/// every run rather than skipped, because a receipt that cannot be re-read is a failure worth catching
+/// here rather than during an incident.
+///
+/// **`LOOM_DRILL_RETAIN=1` writes to `docs/drills/` instead.** That is the deliberate,
+/// documented way to regenerate the committed evidence.
 fn retain(
     receipt: &DrillReceipt,
     operations: &loom_drill::incident::Notification,
     customer: &loom_drill::incident::Notification,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    if std::env::var("LOOM_DRILL_RETAIN").as_deref() == Ok("0") {
-        return Ok(());
-    }
-    let target: PathBuf = Path::new(env!("CARGO_MANIFEST_DIR"))
-        .join("../../docs/drills")
-        .canonicalize()?;
     let document = serde_json::json!({
         "receipt": receipt,
         "summary": receipt.summary(),
         "notifications": [operations, customer],
     });
-    std::fs::write(
-        target.join(format!("{}.json", receipt.topology.as_str())),
-        serde_json::to_vec_pretty(&document)?,
-    )?;
+    let bytes = serde_json::to_vec_pretty(&document)?;
+    let filename = format!("{}.json", receipt.topology.as_str());
+
+    // Held for the life of the function: dropping it removes the scratch directory, and the read-back
+    // below has to happen first.
+    let scratch;
+    let (directory, committed): (PathBuf, bool) =
+        if std::env::var("LOOM_DRILL_RETAIN").as_deref() == Ok("1") {
+            let target = Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("../../docs/drills")
+                .canonicalize()?;
+            (target, true)
+        } else {
+            scratch = tempfile::tempdir()?;
+            (scratch.path().to_path_buf(), false)
+        };
+
+    let path = directory.join(&filename);
+    std::fs::write(&path, &bytes)?;
+
+    // The write is not decoration. A receipt nobody can read is the same as no receipt, and the place
+    // to find that out is here.
+    let reread = std::fs::read(&path)?;
+    assert_eq!(
+        reread, bytes,
+        "the receipt on disk differs from what was written"
+    );
+    let parsed: serde_json::Value = serde_json::from_slice(&reread)?;
+    assert!(
+        parsed.get("receipt").is_some() && parsed.get("notifications").is_some(),
+        "the retained receipt lost its structure"
+    );
+
+    if committed {
+        eprintln!("--- retained committed evidence at {} ---", path.display());
+    } else {
+        eprintln!(
+            "--- receipt written to scratch ({}); re-read OK. \
+             Set LOOM_DRILL_RETAIN=1 to update docs/drills/ deliberately. ---",
+            path.display()
+        );
+    }
     Ok(())
 }

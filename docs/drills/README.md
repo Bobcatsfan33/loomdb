@@ -3,7 +3,18 @@
 **The drill is code, not a runbook.** `cargo test -p loom-drill` runs it: a database is written to,
 cloned mid-flight, backed up, lost, verified from a separate trust domain, restored somewhere new,
 reopened through the attested path, and checked against expectations recorded before the failure.
-What it measures lands in [`docs/drills/`](.) as a retained receipt.
+
+**Where the receipt lands.** By default, a scratch directory — the drill still builds, writes, and
+re-reads it every run, but an ordinary `cargo test` must not rewrite the evidence committed here. To
+regenerate the retained receipts in this directory on purpose:
+
+```sh
+LOOM_DRILL_RETAIN=1 cargo test -p loom-drill --test recovery_drill
+```
+
+Review the resulting diff before committing it. Timestamps, the backup name, and the digests change on
+every run; if anything *else* moved — a known-answer count, a fault that stopped being refused, the
+signed-payload size — that is a finding, not noise.
 
 A runbook rots the moment the mechanism changes. This drill drives `Loom::backup_to_signed`,
 `loom-keys`, `restore_signed_backup`, and `Loom::open_production_attested` directly, so if any of
