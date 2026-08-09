@@ -308,6 +308,15 @@ specification rather than your implementation.
 Issues labelled [**good first issue**](https://github.com/Bobcatsfan33/loomdb/labels/good%20first%20issue)
 are real gaps, each with a code pointer, acceptance criteria, and a note on the obvious-but-wrong fix.
 
+Documentation examples are compiled and executed by CI, so they cannot silently go stale:
+
+```sh
+cargo test --workspace --doc
+```
+
+New crate-level examples belong in `lib.rs` as `//!` doc comments — start with `loom-core` and
+`loom-branch`, the two crates a new user touches first.
+
 Participation is governed by the [Code of Conduct](CODE_OF_CONDUCT.md). Security issues go through
 [SECURITY.md](SECURITY.md), never a public issue.
 
