@@ -10,6 +10,15 @@ change that; the decision flips when human ceremonies, audits, and a penetration
 
 ---
 
+## loomdb-v0.5.1 — released Substrate provenance
+
+### Fixed
+
+- Replaced LoomDB's temporary raw Substrate commit pin with the immutable
+  `substrate-v1.6.0` release tag. The tagged source contains the same reviewed
+  `object_store` 0.14.1 security baseline that LoomDB already exercised, while restoring a
+  reproducible component release boundary for downstream products such as MutinyDB.
+
 ## loomdb-v0.5.0 — the adoption release
 
 *Everything merged since `loomdb-v0.2`, including the `v0.3` and `v0.4` feature tags, which were never
