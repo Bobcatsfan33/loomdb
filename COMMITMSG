@@ -1,0 +1,8 @@
+fix: docs: add benchmark index and intentional run commands
+
+- docs/benchmarks.md: index + how to run benches deliberately
+- CONTRIBUTING.md: link to benchmarks index
+
+Fixes #33
+
+Signed-off-by: Vedant Madane <6527493+VedantMadane@users.noreply.github.com>

@@ -193,3 +193,7 @@ Do **not** open a public issue. See [SECURITY.md](SECURITY.md).
 ## Code of conduct
 
 Participation is governed by the [Code of Conduct](CODE_OF_CONDUCT.md).
+
+## Benchmarks
+
+See [docs/benchmarks.md](docs/benchmarks.md) for the bench index and intentional `cargo bench` invocations.
