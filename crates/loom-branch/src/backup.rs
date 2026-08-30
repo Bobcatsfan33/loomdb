@@ -19,14 +19,23 @@ pub const BACKUP_FORMAT_VERSION: u32 = 1;
 pub const BACKUP_MANIFEST_FILE: &str = "loom-backup-manifest.json";
 /// Detached signature stored beside a signed backup manifest.
 pub const BACKUP_SIGNATURE_FILE: &str = "loom-backup-manifest.sig.json";
-/// Current detached-signature format.
+/// The detached-signature format this build *writes* by default.
+///
+/// Still 1. Per `docs/design/backup-signature-v2.md` §5, v2 verification lands everywhere before
+/// anything emits v2 — a writer that emits a format some verifier does not yet accept is the same
+/// distribute-then-trust mistake P8's `expand` step exists to prevent.
 pub const BACKUP_SIGNATURE_VERSION: u32 = 1;
+/// The digest-signing format, accepted by every verifier in this build and written on request.
+pub const BACKUP_SIGNATURE_VERSION_V2: u32 = 2;
 
 const PROCESS_LOCK_RELATIVE: &str = "loom/store.lock";
 const MAX_MANIFEST_BYTES: u64 = 16 * 1024 * 1024;
 const MAX_SIGNATURE_BYTES: u64 = 16 * 1024;
 const MAX_BACKUP_FILES: usize = 1_000_000;
 const SIGNATURE_DOMAIN: &[u8] = b"loomdb-backup-manifest-signature-v1\0";
+/// v2 signs a *digest* of the manifest rather than the manifest itself, so the payload is a fixed
+/// ~95 bytes instead of growing with the store. See `docs/design/backup-signature-v2.md`.
+const SIGNATURE_DOMAIN_V2: &[u8] = b"loomdb-backup-manifest-signature-v2\0";
 static PARTIAL_NONCE: AtomicU64 = AtomicU64::new(0);
 
 /// One file covered by a backup manifest.
@@ -290,7 +299,7 @@ fn decode_hex<const N: usize>(value: &str, what: &str) -> Result<[u8; N], Backup
         )));
     }
     let mut output = [0u8; N];
-    for (index, pair) in value.as_bytes().chunks_exact(2).enumerate() {
+    for (index, pair) in value.as_bytes().as_chunks::<2>().0.iter().enumerate() {
         let pair = std::str::from_utf8(pair)
             .map_err(|error| BackupError::Authenticity(format!("{what}: {error}")))?;
         output[index] = u8::from_str_radix(pair, 16)
@@ -320,6 +329,25 @@ fn write_manifest(root: &Path, manifest: &BackupManifest) -> Result<Vec<u8>, Bac
     Ok(bytes)
 }
 
+/// **The v2 signed payload: a domain tag, the key identity, and a digest the caller computed.**
+///
+/// `manifest_digest` is deliberately a `[u8; 32]` and not a `&str`. The only way to obtain one is to
+/// hash bytes, so a caller cannot reach for the digest a signature record *carries* — which is the
+/// forgery in `docs/design/backup-signature-v2.md` §3, and the reason this signature means anything.
+///
+/// The key id is length-prefixed rather than NUL-separated. v1's separator was safe only because a
+/// key id cannot contain a NUL; the prefix removes the reliance on that and matches the framing
+/// `WriteEnvelope::signing_bytes` and the actor-registry attestation already use.
+fn signature_payload_v2(key_id: &str, manifest_digest: &[u8; 32]) -> Vec<u8> {
+    let key_id = key_id.as_bytes();
+    let mut payload = Vec::with_capacity(SIGNATURE_DOMAIN_V2.len() + 8 + key_id.len() + 32);
+    payload.extend_from_slice(SIGNATURE_DOMAIN_V2);
+    payload.extend_from_slice(&(key_id.len() as u64).to_le_bytes());
+    payload.extend_from_slice(key_id);
+    payload.extend_from_slice(manifest_digest);
+    payload
+}
+
 fn signature_payload(key_id: &str, manifest: &[u8]) -> Vec<u8> {
     let mut payload =
         Vec::with_capacity(SIGNATURE_DOMAIN.len() + key_id.len() + 1 + manifest.len());
@@ -335,18 +363,30 @@ fn write_signature(
     key_id: &str,
     key: &SigningKey,
     manifest: &[u8],
+    format_version: u32,
 ) -> Result<BackupSignature, BackupError> {
     if key_id.trim().is_empty() || key_id.len() > 256 || key_id.contains('\0') {
         return Err(BackupError::Authenticity(
             "backup signing key id must be 1..=256 characters and contain no NUL".into(),
         ));
     }
-    let signature = key.sign(&signature_payload(key_id, manifest));
+    let digest = blake3::hash(manifest);
+    let payload = match format_version {
+        BACKUP_SIGNATURE_VERSION => signature_payload(key_id, manifest),
+        BACKUP_SIGNATURE_VERSION_V2 => signature_payload_v2(key_id, digest.as_bytes()),
+        other => {
+            return Err(BackupError::Authenticity(format!(
+            "cannot write signature format {other}; this build writes {BACKUP_SIGNATURE_VERSION} \
+                 or {BACKUP_SIGNATURE_VERSION_V2}"
+        )))
+        }
+    };
+    let signature = key.sign(&payload);
     let record = BackupSignature {
-        format_version: BACKUP_SIGNATURE_VERSION,
+        format_version,
         algorithm: "ed25519".into(),
         key_id: key_id.into(),
-        manifest_blake3: blake3::hash(manifest).to_hex().to_string(),
+        manifest_blake3: digest.to_hex().to_string(),
         ed25519: encode_hex(&signature.to_bytes()),
     };
     let path = root.join(BACKUP_SIGNATURE_FILE);
@@ -380,7 +420,7 @@ pub(crate) fn create_backup(
     destination: &Path,
     tenant: &str,
 ) -> Result<BackupManifest, BackupError> {
-    create_backup_inner(source, destination, tenant, None)
+    create_backup_inner(source, destination, tenant, None, BACKUP_SIGNATURE_VERSION)
 }
 
 pub(crate) fn create_signed_backup(
@@ -389,8 +429,15 @@ pub(crate) fn create_signed_backup(
     tenant: &str,
     key_id: &str,
     key: &SigningKey,
+    format_version: u32,
 ) -> Result<BackupManifest, BackupError> {
-    create_backup_inner(source, destination, tenant, Some((key_id, key)))
+    create_backup_inner(
+        source,
+        destination,
+        tenant,
+        Some((key_id, key)),
+        format_version,
+    )
 }
 
 fn create_backup_inner(
@@ -398,6 +445,7 @@ fn create_backup_inner(
     destination: &Path,
     tenant: &str,
     signer: Option<(&str, &SigningKey)>,
+    format_version: u32,
 ) -> Result<BackupManifest, BackupError> {
     if destination.exists() {
         return Err(BackupError::DestinationExists(
@@ -427,7 +475,7 @@ fn create_backup_inner(
         };
         let encoded = write_manifest(&partial, &manifest)?;
         if let Some((key_id, key)) = signer {
-            write_signature(&partial, key_id, key, &encoded)?;
+            write_signature(&partial, key_id, key, &encoded, format_version)?;
         }
         publish_partial(&partial, destination)?;
         Ok(manifest)
@@ -593,13 +641,38 @@ fn load_signature(root: &Path) -> Result<BackupSignature, BackupError> {
         .map_err(|error| BackupError::Authenticity(format!("signature record is invalid: {error}")))
 }
 
+/// **Rebuild the exact bytes a signature must cover, for whichever format the record declares.**
+///
+/// The v2 digest is RECOMPUTED here from `manifest`, and `record.manifest_blake3` is never used to
+/// build it. That is the whole point of the format: verifying over a digest the record carries would
+/// bind a claim the record makes about itself rather than the manifest, so an attacker could swap
+/// the manifest, leave the record intact, and still verify. Integrity is not authenticity.
+/// See `docs/design/backup-signature-v2.md` §3.
+///
+/// An unrecognized version is refused rather than guessed at.
+fn verified_payload(record: &BackupSignature, manifest: &[u8]) -> Result<Vec<u8>, BackupError> {
+    match record.format_version {
+        BACKUP_SIGNATURE_VERSION => Ok(signature_payload(&record.key_id, manifest)),
+        BACKUP_SIGNATURE_VERSION_V2 => Ok(signature_payload_v2(
+            &record.key_id,
+            blake3::hash(manifest).as_bytes(),
+        )),
+        other => Err(BackupError::Authenticity(format!(
+            "signature format {other} is unsupported; this build accepts \
+             {BACKUP_SIGNATURE_VERSION} and {BACKUP_SIGNATURE_VERSION_V2}"
+        ))),
+    }
+}
+
 /// The checks both verification paths share: a format this build understands, and a signature
 /// record that actually commits to *these* manifest bytes.
 fn check_signature_record(record: &BackupSignature, manifest: &[u8]) -> Result<(), BackupError> {
-    if record.format_version != BACKUP_SIGNATURE_VERSION {
+    if record.format_version != BACKUP_SIGNATURE_VERSION
+        && record.format_version != BACKUP_SIGNATURE_VERSION_V2
+    {
         return Err(BackupError::Authenticity(format!(
-            "signature format {} is unsupported; this build accepts {}",
-            record.format_version, BACKUP_SIGNATURE_VERSION
+            "signature format {} is unsupported; this build accepts {} and {}",
+            record.format_version, BACKUP_SIGNATURE_VERSION, BACKUP_SIGNATURE_VERSION_V2
         )));
     }
     let digest = blake3::hash(manifest).to_hex().to_string();
@@ -635,7 +708,7 @@ fn verify_signature(
     let bytes = decode_hex::<64>(&record.ed25519, "Ed25519 signature")?;
     let signature = Signature::from_bytes(&bytes);
     public_key
-        .verify(&signature_payload(&record.key_id, manifest), &signature)
+        .verify(&verified_payload(&record, manifest)?, &signature)
         .map_err(|error| {
             BackupError::Authenticity(format!(
                 "Ed25519 signature did not verify for key {:?}: {error}",
@@ -690,7 +763,7 @@ pub fn verify_signed_backup_with(
         .verify(
             &record.key_id,
             &record.algorithm,
-            &signature_payload(&record.key_id, &bytes),
+            &verified_payload(&record, &bytes)?,
             &signature,
         )
         .map_err(|error| BackupError::Authenticity(error.to_string()))?;
@@ -764,4 +837,76 @@ fn restore_verified_backup(
         let _ = fs::remove_dir_all(&partial);
     }
     result
+}
+
+#[cfg(test)]
+mod signature_format_tests {
+    use super::*;
+
+    fn record(format_version: u32, carried_digest: &str) -> BackupSignature {
+        BackupSignature {
+            format_version,
+            algorithm: "ed25519".into(),
+            key_id: "backup-root-2026-q3".into(),
+            manifest_blake3: carried_digest.into(),
+            ed25519: "00".repeat(64),
+        }
+    }
+
+    /// **The discriminating test for design note §3.**
+    ///
+    /// `check_signature_record` also compares the carried digest to the computed one, and it runs
+    /// first — so an end-to-end forgery test proves the *system* refuses without proving anything
+    /// about which value the signature is checked against. This tests that directly: the payload
+    /// v2 verification builds must be identical whether the record carries the right digest, a
+    /// wrong one, or garbage, because it is derived from the manifest bytes alone.
+    ///
+    /// If this ever fails, the signature binds a claim the record makes about itself rather than
+    /// the manifest, and the format is forgeable even with `check_signature_record` in place.
+    #[test]
+    fn v2_payload_ignores_the_digest_the_record_carries() {
+        let manifest = br#"{"format_version":1,"tenant":"acme","files":[]}"#;
+        let truthful = blake3::hash(manifest).to_hex().to_string();
+
+        let from_truthful = verified_payload(&record(2, &truthful), manifest).expect("v2");
+        let from_a_lie = verified_payload(&record(2, &"f".repeat(64)), manifest).expect("v2");
+        let from_garbage = verified_payload(&record(2, "not-a-digest"), manifest).expect("v2");
+
+        assert_eq!(from_truthful, from_a_lie);
+        assert_eq!(from_truthful, from_garbage);
+
+        // ...and it is the digest of THESE bytes, length-prefixed after the v2 domain and key id.
+        let expected =
+            signature_payload_v2("backup-root-2026-q3", blake3::hash(manifest).as_bytes());
+        assert_eq!(from_truthful, expected);
+        assert_eq!(expected.len(), 36 + 8 + "backup-root-2026-q3".len() + 32);
+    }
+
+    /// Changing one byte of the manifest changes the bytes a v2 signature must cover.
+    #[test]
+    fn v2_payload_tracks_the_manifest_bytes() {
+        let a = br#"{"format_version":1,"tenant":"acme","files":[]}"#;
+        let b = br#"{"format_version":1,"tenant":"beta","files":[]}"#;
+        let truthful = blake3::hash(a).to_hex().to_string();
+        assert_ne!(
+            verified_payload(&record(2, &truthful), a).expect("v2"),
+            verified_payload(&record(2, &truthful), b).expect("v2"),
+            "the same record over different manifests must not produce the same signed bytes"
+        );
+    }
+
+    /// v1 still signs the manifest itself, unchanged, so archived backups keep verifying.
+    #[test]
+    fn v1_payload_is_untouched() {
+        let manifest = br#"{"format_version":1,"tenant":"acme","files":[]}"#;
+        assert_eq!(
+            verified_payload(&record(1, "ignored"), manifest).expect("v1"),
+            signature_payload("backup-root-2026-q3", manifest)
+        );
+    }
+
+    #[test]
+    fn an_unknown_format_has_no_payload() {
+        assert!(verified_payload(&record(3, "x"), b"{}").is_err());
+    }
 }

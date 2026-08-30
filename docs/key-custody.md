@@ -167,30 +167,124 @@ and gives an auditor no way to tell a rotation mistake from an attack.
    `EXT-HSM` is open and P8 does not touch it. A green drill is evidence the sequence works, not
    evidence of custody.
 
-2. **AWS KMS cannot sign these artifacts as they stand.** The portfolio decision is AWS KMS as the
-   production backend. Every loomDB signing path is **Ed25519**, and AWS KMS's asymmetric key specs
-   are RSA and ECDSA only — it has no EdDSA offering. So the production ceremony needs one of:
+2. **The KMS provisioning was decommissioned on 2026-08-08. The release trust root is now
+   software-backed, in a GitHub Actions secret.**
 
-   - **AWS CloudHSM**, which does support Ed25519 — every signed format stays byte-identical; or
-   - **an algorithm migration** to ECDSA P-256, which changes signed formats: the backup signature
-     record's `algorithm` field gains a value, and the actor-attestation — which carries no algorithm
-     field at all — would need one. That is a format change, and this increment was explicitly
-     forbidden from making one; or
-   - **KMS wrapping an Ed25519 key** used in-process, which is not non-exportable custody and should
-     not be described as such.
+   > **Current custody, in one line: an Ed25519 private key held as the repository secret
+   > `LOOM_BUNDLE_SIGNING_KEY`, generated with `loom-bundle-tool keygen` and pasted into GitHub.
+   > No hardware. No non-exportable key. No ceremony. `EXT-HSM` is open and is *further* from closed
+   > than it was on 2026-08-02.**
 
-   `Algorithm` is an enum with one variant precisely so adding a second is a deliberate, reviewable
-   change rather than a relaxed string comparison. **Confirm the KMS key-spec list against current
-   AWS documentation before the ceremony** — this is a design constraint to settle, not a settled
-   design.
+   What happened, in order:
 
-3. **The register is not signed** (§1), and its integrity rests on the read-only mount and the
+   | When | What |
+   |---|---|
+   | 2026-08-02 | Two KMS keys provisioned — `actor-governance` (`e8f90cea…`) and `release` (`41a38c5d…`), both `ECC_NIST_EDWARDS25519`. A read-only `kms:Sign` round-trip verified offline against each; [`docs/drills/kms-roundtrip.json`](drills/kms-roundtrip.json). Both `status: pending` — provisioned is not trusted. |
+   | 2026-08-08 | **The AWS account was closed. Both keys were destroyed with it.** No ceremony was ever held, neither key was ever activated, and neither ever signed a release. |
+
+   The round-trip receipt is **retained, not deleted** — that probe genuinely happened and its results
+   stand as a record of what was exercised. It now carries a `decommissioned` block saying what became
+   of the keys, and a test asserts that block stays there, because without it the file reads as a live
+   capability: two provisioned keys, signatures verified, everything PASS, all of it about keys nobody
+   holds.
+
+   **`deploy/reference/trust-roots/production.json` was removed rather than edited**, and the reason
+   is worth keeping:
+
+   > Marking a key `revoked` requires **two distinct recorded approvers**, and `loom-keys` enforces it
+   > at load time — a register with a revoked entry and no approvals is refused. That check exists so
+   > that refusing a key is a decision somebody signed for. Writing two names into that file to make
+   > it load again would have been fabricating a ceremony that never happened. **Closing a cloud
+   > account is not a governance ceremony.** So the choice was an entry that lies about its status, or
+   > no entry. It is no entry.
+
+   The exported public halves stay as `deploy/reference/trust-roots/*.der`, so the hashes in the
+   round-trip receipt remain checkable by anyone. See
+   [`deploy/reference/trust-roots/README.md`](../deploy/reference/trust-roots/README.md).
+
+   **What this costs, stated plainly.** A repository secret is readable by any workflow that runs in
+   its environment and by anyone who can change one; it is exportable by construction, since it exists
+   as hex; and it has no dual control, no attestation, and no hardware boundary. It is an appropriate
+   custody model for signing an open-source release candidate, and it is **not** one for a product
+   handling customer data. That is exactly why `EXT-HSM` is a blocking gate and why
+   `deploymentDecision` is `not-approved`.
+
+   The re-provisioning path is unchanged and is documented above: `expand → activate → drill → revoke`,
+   against whatever backend a future ceremony chooses. The `aws-kms` driver in `loom-keys` still works
+   and is still feature-gated; it is now unexercised rather than removed, because the constraint it
+   encodes — the 4,096-byte `Sign` limit that shaped signature format v2 — is a property of KMS, not of
+   one account.
+
+3. **AWS KMS signs Ed25519 — the P8 blocker was resolved, and the finding still stands.**
+
+   P8 recorded that AWS KMS offered RSA and ECDSA only, so an Ed25519 product would need CloudHSM or
+   an algorithm migration. That was **out of date**: AWS KMS added Ed25519/EdDSA support on
+   **2025-11-07**, in all regions. Checked against the
+   [key spec reference](https://docs.aws.amazon.com/kms/latest/developerguide/asymmetric-key-specs.html)
+   and the [Sign API reference](https://docs.aws.amazon.com/kms/latest/APIReference/API_Sign.html):
+
+   | | value |
+   |---|---|
+   | Key spec | `ECC_NIST_EDWARDS25519` (signing and verification only) |
+   | Signing algorithm | `ED25519_SHA_512` — NIST FIPS 186-5 §7.6, **pure** EdDSA |
+   | Message type | `RAW` (required for `ED25519_SHA_512`) |
+
+   `ED25519_SHA_512` with `MessageType: RAW` is *exactly* the scheme
+   `ed25519_dalek::VerifyingKey::verify_strict` already checks — so every signed format stays
+   byte-identical, `Algorithm` keeps its single `Ed25519` variant, and an algorithm migration is off
+   the table whatever backend a future ceremony picks. (AWS KMS *was* the intended production backend
+   and is no longer provisioned — see item 2. The compatibility finding is recorded here because it
+   is a property of the scheme, and it is what makes re-provisioning a configuration change rather
+   than a format change.)
+
+   Do **not** use `ED25519_PH_SHA_512`. That is HashEdDSA (FIPS 186-5 §7.8, `MessageType: DIGEST`) —
+   a different signature scheme producing signatures this codebase will not verify. The distinction
+   is a one-word difference in a console dropdown and a total difference in outcome.
+
+   **One real constraint remains, and it is per-role.** `Sign` accepts a `Message` of **0–4096
+   bytes**, and `RAW` is required for pure Ed25519, so a signing payload larger than 4 KiB cannot go
+   through KMS unmodified:
+
+   | Role | Signed payload | Fits 4 KiB? |
+   |---|---|---|
+   | `actor-governance` | domain + tenant + generation + fingerprint — fixed, ~100 bytes | yes, comfortably |
+   | `release` | bincode of seven small manifest fields, ~200 bytes | yes |
+   | `backup-root` | domain + key id + **the whole backup manifest**, which lists every file | **grows with the store** |
+
+   **P9 measured it, and the backup role does not fit.** On the smallest store a drill can build —
+   27 files, 24163 bytes restored — the backup signing payload is
+   already **5680 bytes**, 1584 over the
+   4096-byte limit, and it grows with every file in the store. See
+   [`docs/drills/local-filesystem-copy-clone.json`](drills/local-filesystem-copy-clone.json).
+
+   So the position is:
+
+   - **`actor-governance` and `release` can move to KMS unchanged.** Both payloads are small and
+     fixed-shape. The ceremony order Ryan chose puts actor-governance first, which is the role with
+     the most headroom — nothing blocks starting.
+   **Status: this did not happen, and the keys are gone.** Both were provisioned and round-trip
+   verified on 2026-08-02 at `status: pending`, then **destroyed on 2026-08-08 with the AWS account**
+   — before any ceremony, any activation, or any signature over a real artifact. Item 2 above is the
+   current custody position. The `aws-kms` driver remains in `loom-keys` behind an off-by-default
+   feature, because that crate is in `loomd`'s air-gap graph and an SDK there would break the
+   no-network-client claim; `verify_build_flavours.sh` asserts the air-gap graph carries no AWS
+   crate. It is now unexercised rather than removed.
+
+   - **`backup-root` joins as phase 2, behind a versioned format change.** Decided 2026-08-02: it
+     will sign a domain-separated tag plus the manifest *digest* rather than the manifest, taking the
+     payload from 5,680 bytes to a fixed ~95. Keeping one root of three on different custody was the
+     alternative and was rejected — it fragments the ceremony story, and the odd one out would be the
+     DR-critical root. The design is in
+     [`docs/design/backup-signature-v2.md`](design/backup-signature-v2.md) and lands as its own
+     increment (P9.1) before the key moves; v1 backups verify forever and are never rewritten.
+
+4. **The register is not signed** (§1), and its integrity rests on the read-only mount and the
    channel that delivered it.
 
-4. **Only the actor-governance role is wired end to end in a daemon.** `loomd` verifies its
+5. **Only the actor-governance role is wired end to end in a daemon.** `loomd` verifies its
    attestation through custody at startup. The release and backup roles are wired at the library and
-   `loomctl` boundary; the release *pipeline* still signs with a key file, and moving that to the
-   register is deployment work.
+   `loomctl` boundary; the release *pipeline* signs with a key file materialised from the
+   `LOOM_BUNDLE_SIGNING_KEY` secret, and moving that to the register is deployment work.
 
 ---
 

@@ -1,0 +1,42 @@
+{
+  "schemaVersion": 1,
+  "performedUnix": null,
+  "callerIdentity": {
+    "account": "913524920694",
+    "arn": "arn:aws:iam::913524920694:root",
+    "hygiene": "caller is the account root; recorded honestly rather than skipped. A dedicated ceremony principal is an EXT-HSM prerequisite."
+  },
+  "keys": [
+    {
+      "role": "actor-governance",
+      "keyArn": "arn:aws:kms:us-east-1:913524920694:key/e8f90cea-7da1-4c58-b527-fe91b9a93747",
+      "backend": "aws-kms",
+      "spkiSha256": "3d9bb68ae2ed17b0190c0038c965440f6825f7ea17677a4842ca7f14b99bb9d6",
+      "signatureBytes": 64,
+      "offlineVerifyAgainstRegisteredKey": "PASS",
+      "tamperedMessageRefused": true
+    },
+    {
+      "role": "release",
+      "keyArn": "arn:aws:kms:us-east-1:913524920694:key/41a38c5d-1f0c-4770-acf0-505d0715217c",
+      "backend": "aws-kms",
+      "spkiSha256": "7570462a00fd47f356c3ae5e4488579f8fbf981e9507d0267b156854810133fa",
+      "signatureBytes": 64,
+      "offlineVerifyAgainstRegisteredKey": "PASS",
+      "tamperedMessageRefused": true
+    }
+  ],
+  "algorithm": "ED25519_SHA_512",
+  "messageType": "RAW",
+  "note": "Read-only ceremony probe: sts:GetCallerIdentity, kms:GetPublicKey, kms:Sign. Nothing was created or modified in AWS. This is NOT a witnessed dual-control ceremony and does not close EXT-HSM.",
+  "decommissioned": {
+    "onUnix": 1786492800,
+    "onDate": "2026-08-08",
+    "what": "AWS account 913524920694 was closed. Both KMS keys named above were destroyed with it.",
+    "ceremonyHeld": false,
+    "everActivated": false,
+    "everSignedARelease": false,
+    "effect": "The probe recorded in this file genuinely happened on 2026-08-02 and its results stand as a record of what was exercised. The keys it exercised no longer exist, so nothing in this file describes a trust root that can be used today. deploy/reference/trust-roots/production.json was removed for that reason; the exported public halves are retained as deploy/reference/trust-roots/*.der so this record stays checkable.",
+    "replacedBy": "The release trust root is now SOFTWARE-BACKED: an Ed25519 key held as the GitHub Actions secret LOOM_BUNDLE_SIGNING_KEY. See docs/key-custody.md section 5. EXT-HSM remains open and is, if anything, further from closed than before."
+  }
+}

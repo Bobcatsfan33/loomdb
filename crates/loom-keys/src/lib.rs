@@ -57,6 +57,8 @@
 #![warn(rust_2018_idioms)]
 #![cfg_attr(test, allow(clippy::unwrap_used, clippy::expect_used, clippy::panic))]
 
+#[cfg(feature = "aws-kms")]
+pub mod aws_kms;
 mod directory;
 mod error;
 mod register;
@@ -218,7 +220,7 @@ pub(crate) fn decode_hex<const N: usize>(text: &str) -> Option<[u8; N]> {
         return None;
     }
     let mut out = [0u8; N];
-    for (index, pair) in text.as_bytes().chunks_exact(2).enumerate() {
+    for (index, pair) in text.as_bytes().as_chunks::<2>().0.iter().enumerate() {
         let pair = std::str::from_utf8(pair).ok()?;
         out[index] = u8::from_str_radix(pair, 16).ok()?;
     }

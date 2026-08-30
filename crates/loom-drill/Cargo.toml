@@ -1,0 +1,22 @@
+[package]
+name = "loom-drill"
+description = "Recovery and incident exercises: run a restore drill end to end and record what it measured."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+# The drill drives the real mechanisms rather than reimplementing them: the engine, the signed-backup
+# path, trust-root custody, and provenance/taint. Nothing here reaches a network.
+loom-branch = { path = "../loom-branch", default-features = false }
+loom-core.workspace = true
+loom-keys.workspace = true
+loom-provenance = { path = "../loom-provenance", default-features = false }
+ed25519-dalek.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true

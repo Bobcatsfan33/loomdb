@@ -138,6 +138,31 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - run: cargo test -p loom-mcp --test demo -- --nocapture
 
+  # The example a stranger runs first. It is the README's quickstart, so it has to keep working, and
+  # it has to keep telling the truth: it checks both moments itself and exits non-zero if either
+  # breaks (proven by mutation — flipping the influence rule to Allow makes it exit 1). Grepping the
+  # output too, so a refactor that keeps the exit code but loses the narrative is still caught.
+  example:
+    name: the taint_recall example (README quickstart)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      # pipefail is load-bearing: the default shell here is `bash -e`, which reports a pipeline's
+      # LAST exit code. Without it, `cargo run | tee` would return tee's 0 and a broken example
+      # would pass this job green — the same fail-open shape as a `printf | grep` guard.
+      - name: run the example — its own exit code is the gate
+        run: |
+          set -o pipefail
+          cargo run -p loom-mcp --example taint_recall | tee /tmp/example.out
+      - name: the two moments are actually in the output
+        run: |
+          grep -q "REFUSED" /tmp/example.out
+          grep -q "HELPDESK-user-42" /tmp/example.out
+          grep -q "identity.reinstate_account" /tmp/example.out
+          grep -q "Both moments held" /tmp/example.out
+
   # The four model oracles. Each is a naive, obviously-correct reference implementation differentially
   # tested against the real engine under randomized operation sequences. Between them they have found
   # multiple real bugs (a double-counted counter on re-merge; provenance overwritten by the data commit;

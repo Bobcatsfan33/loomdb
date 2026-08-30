@@ -15,6 +15,12 @@ on:
       - "docs/operations.md"
   push:
     tags:
+      # This project's tags are `loomdb-vX.Y.Z`. The pattern used to be `v*` alone, which matched
+      # NONE of loomdb-v0.1 … loomdb-v0.4 — so the release job below never ran once, and every
+      # release to date was published by hand with no bundle, no SBOM, and no provenance. The
+      # PR-triggered `verify-source` job kept passing throughout, which is precisely why nobody
+      # noticed. Both spellings are accepted now so a bare `vX.Y.Z` still works.
+      - "loomdb-v*"
       - "v*"
 
 concurrency:
@@ -58,7 +64,7 @@ jobs:
 
   release:
     name: build, sign, verify, attest, and publish
-    if: startsWith(github.ref, 'refs/tags/v')
+    if: startsWith(github.ref, 'refs/tags/v') || startsWith(github.ref, 'refs/tags/loomdb-v')
     needs: verify-source
     runs-on: ubuntu-latest
     environment: production-release
@@ -81,8 +87,12 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          if [[ ! "${RELEASE_TAG}" =~ ^v[0-9]+\.[0-9]+\.[0-9]+([.-][0-9A-Za-z.-]+)?$ ]]; then
-            echo "::error::release tag must be an explicit semantic version, got ${RELEASE_TAG}"
+          # An explicit patch version is still required — `loomdb-v0.5` is refused, `loomdb-v0.5.0`
+          # is accepted — because the version is bound into the signed bundle claim and verified by
+          # exact match at the enclave. An ambiguous version there is a bundle that authorizes more
+          # than one artifact.
+          if [[ ! "${RELEASE_TAG}" =~ ^(loomdb-)?v[0-9]+\.[0-9]+\.[0-9]+([.-][0-9A-Za-z.-]+)?$ ]]; then
+            echo "::error::release tag must be an explicit semantic version such as loomdb-v0.5.0, got ${RELEASE_TAG}"
             exit 1
           fi
           test "$(git rev-list -n 1 "${RELEASE_TAG}")" = "${GITHUB_SHA}"
@@ -97,10 +107,38 @@ jobs:
         with:
           shared-key: release-1.89.0
 
-      - name: refuse vulnerable locked dependencies
-        uses: rustsec/audit-check@69366f33c96575abad1ee0dba8212993eecbe998
+      # rustsec/audit-check builds cargo-audit from source at release time, without `--locked`, so
+      # it re-resolves the tool's own dependency tree on every run. On the first tag that ever
+      # reached this job it resolved kstring 2.0.4, which requires rustc 1.96.0, and refused to
+      # compile against the 1.89.0 toolchain this job pins — exit 101 before a single advisory was
+      # read. The lockfile was clean; the gate failed on its own tooling. A release gate must fail
+      # only on the thing it gates, so install a checksum-verified prebuilt cargo-audit instead:
+      # no compilation, no dependency resolution, and no Node runtime at release time. The pinned
+      # install-action commit carries the SHA-256 for this exact cargo-audit release, and
+      # `fallback: none` makes a missing or mismatched binary an error rather than a silent
+      # `cargo install` that would reintroduce the same compile.
+      - name: install the pinned audit tool
+        uses: taiki-e/install-action@7f4eb899022d8fe70b20c4f3de697aa85c309026
         with:
-          token: ${{ secrets.GITHUB_TOKEN }}
+          tool: cargo-audit@0.22.2
+          checksum: true
+          fallback: none
+
+      # Flags are deliberately absent. Bare `cargo audit` fails the job on vulnerabilities and
+      # reports `unmaintained` advisories as warnings without failing, which is the same scoping
+      # rustsec/audit-check applied and the reason RUSTSEC-2025-0141 (bincode unmaintained) is
+      # tolerated here. Adding `--deny warnings` would change the gate, not just its plumbing.
+      - name: refuse vulnerable locked dependencies
+        shell: bash
+        run: |
+          set -euo pipefail
+          installed="$(cargo audit --version)"
+          echo "${installed}"
+          case "${installed}" in
+            *0.22.2*) ;;
+            *) echo "::error::expected cargo-audit 0.22.2, got ${installed}" ; exit 1 ;;
+          esac
+          cargo audit
 
       - name: prove the release binary is the air-gap build
         shell: bash
@@ -235,6 +273,16 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
+          # Prefer hand-written notes committed alongside the tag — they carry the Status language
+          # and the known limits, which an auto-generated commit list cannot. Fall back to
+          # --generate-notes only when no notes file exists for this tag.
+          NOTES_FILE="docs/releases/${RELEASE_TAG}.md"
+          if [[ -f "${NOTES_FILE}" ]]; then
+            NOTES_ARG=(--notes-file "${NOTES_FILE}")
+          else
+            echo "::warning::no ${NOTES_FILE}; falling back to generated notes"
+            NOTES_ARG=(--generate-notes)
+          fi
           gh release create "${RELEASE_TAG}" \
             dist/loomd \
             dist/loom-bundle-tool \
@@ -244,5 +292,5 @@ jobs:
             dist/release-receipt.json \
             dist/SHA256SUMS \
             --verify-tag \
-            --generate-notes \
+            "${NOTES_ARG[@]}" \
             --title "LoomDB ${RELEASE_TAG}"

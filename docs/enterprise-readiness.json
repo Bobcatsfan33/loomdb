@@ -156,12 +156,20 @@
         "crates/loom-keys/src/signer.rs",
         "crates/loom-keys/src/rotation.rs",
         "crates/loomctl/tests/key_custody.rs",
-        "crates/loom-mcp/tests/actor_registry.rs"
+        "crates/loom-mcp/tests/actor_registry.rs",
+        "docs/design/backup-signature-v2.md",
+        "docs/drills/kms-roundtrip.json",
+        "deploy/reference/trust-roots/README.md",
+        "crates/loom-keys/src/aws_kms.rs",
+        "crates/loom-keys/tests/provisioned_register.rs"
       ],
       "gaps": [
         "All three signing roles - actor-governance, release, and backup-root - now verify through a named trust-root register rather than a bare public key: key id, algorithm, and role are bound into the verification path, and a revoked key is refused by name even though its material still verifies. The expand/activate/drill/revoke rotation sequence is implemented and exercised, dual control gates the two transitions that change what verifies, and every refusal is separately named. loomd verifies its actor-registry attestation through custody at startup.",
         "EVERY KEY EXERCISED WAS SOFTWARE-BACKED. No hardware ceremony has been run, no key is non-exportable, and no receipt in this repository was produced by an HSM or KMS. Signer receipts record the backend that produced them precisely so a software drill cannot be mistaken for hardware custody; the drill output says so in its own text. EXT-HSM is unchanged and open.",
-        "The approved production backend is AWS KMS, whose asymmetric key specs are RSA and ECDSA only. Every loomDB signed format is Ed25519, so the ceremony requires either an Ed25519-capable backend such as CloudHSM (formats unchanged) or an algorithm migration that changes signed formats. This is unresolved and is a prerequisite for the ceremony, not a consequence of it - see docs/key-custody.md section 5."
+        "SUPERSEDED (recorded so the trail is followable): an earlier assessment held that AWS KMS offered RSA and ECDSA asymmetric keys only, making an Ed25519 product need CloudHSM or an algorithm migration. That was out of date - KMS added Ed25519 (ECC_NIST_EDWARDS25519 / ED25519_SHA_512 / MessageType RAW) on 2025-11-07, which is byte-compatible with what this codebase verifies. No algorithm migration was ever required. See docs/key-custody.md section 5 item 3.",
+        "AWS KMS is wired as a signer backend and exercised against the real service on 2026-08-02. Two keys are provisioned and registered by ARN with their exported public keys pinned to the SPKI SHA-256 from the provisioning record: actor-governance (e8f90cea) and release (41a38c5d), both ECC_NIST_EDWARDS25519 / SIGN_VERIFY. A real kms:Sign with ED25519_SHA_512 and MessageType RAW was performed against each and each signature VERIFIED OFFLINE against the registered public key, with a tampered-message negative control refused. Only read-only calls were made (sts:GetCallerIdentity, kms:GetPublicKey, kms:Sign); nothing in AWS was created or modified. The backup signing payload was reduced from 5,680 bytes to 95 by signature format v2 so the third role can use the same custody; backup-root has no key yet and is deliberately absent from the register. DECOMMISSIONED 2026-08-08: the AWS account 913524920694 was closed and both keys were destroyed with it, before any ceremony, any activation, and any signature over a real artifact. deploy/reference/trust-roots/production.json was REMOVED rather than marked revoked, because loom-keys refuses a revoked entry with no recorded approvers and writing approvers for a ceremony that never happened would be fabricated evidence. The exported public halves are retained as deploy/reference/trust-roots/*.der so the round-trip receipt stays checkable, and docs/drills/kms-roundtrip.json now carries a decommissioned block that a test asserts is present.",
+        "EXT-HSM REMAINS OPEN AND NOTHING HERE IS A CEREMONY. Both registered keys are status 'pending' with zero recorded approvals: they authorize nothing, cannot sign through the directory, and activation is refused by the dual-control check. What has not happened: the witnessed dual-control ceremony, activation of any key, a rotation drill against KMS, and a revocation exercise. The probe was run by the account root (arn:aws:iam::913524920694:root) rather than a dedicated ceremony principal, which is recorded in docs/drills/kms-roundtrip.json rather than omitted; a separate ceremony principal is itself an EXT-HSM prerequisite. Phase 2 - creating the backup-root key and the all-three-keys ceremony - is the PKI owner's action.",
+        "CURRENT RELEASE CUSTODY IS SOFTWARE-BACKED AND WEAKER THAN WHAT WAS PROVISIONED. Release bundles are signed by an Ed25519 key generated with `loom-bundle-tool keygen` and held as the GitHub Actions secret LOOM_BUNDLE_SIGNING_KEY, with its public half in the repository variable LOOM_BUNDLE_PUBLIC_KEY. That key is exportable by construction, is readable by any workflow in its environment and by anyone who can change one, and has no dual control, no attestation, and no hardware boundary. It is appropriate for signing an open-source release candidate and is not appropriate for a product handling customer data. EXT-HSM is open and is further from closed than it was on 2026-08-02."
       ]
     },
     {
@@ -201,11 +209,19 @@
         "deploy/reference/systemd/loomd-backup@.timer",
         "crates/loomctl/src/retention.rs",
         "crates/loomctl/src/receipt.rs",
-        "crates/loomctl/tests/backup_operations.rs"
+        "crates/loomctl/tests/backup_operations.rs",
+        "docs/drills/README.md",
+        "docs/drills/local-filesystem-copy-clone.json",
+        "crates/loom-drill/src/lib.rs",
+        "crates/loom-drill/src/receipt.rs",
+        "crates/loom-drill/src/incident.rs",
+        "crates/loom-drill/tests/recovery_drill.rs",
+        "crates/loom-drill/tests/fault_injection.rs"
       ],
       "gaps": [
         "The reference profile now renders scheduled signed backups against a platform-provided point-in-time clone, an independent verification job that runs under a different identity and holds only the public trust root, retention with legal hold, a declared immutable off-account target with a named WORM mechanism, and a restore rehearsal that restores to a fresh path and cannot overwrite or activate a live store. The engine holds an exclusive lock on its store, so no job can read a live tenant volume; the profile refuses to render one that tries.",
-        "Customer-scale RPO/RTO targets and a signed restore drill receipt for each target topology remain required. maxAgeSeconds is a threshold the profile enforces, not a recovery objective anyone has measured, and no drill has been executed against a production storage stack, CSI driver, or backup product."
+        "APPROVED RECOVERY OBJECTIVES (2026-08-01): RPO 24 hours, RTO 4 hours. They describe the mechanism actually deployed - daily signed backups against a platform point-in-time clone, backupIntervalSeconds 86400 with a maxAgeSeconds 129600 staleness alert - because approving targets tighter than the deployed schedule would make the drill fail by construction rather than measure anything. They are pre-production targets, revisitable per deployment. Every drill records MEASURED recovery point and recovery time as first-class results rather than a pass/fail against the targets, so evidence that the real numbers are better is available to justify tightening them when a contract requires it.",
+        "Recovery has been exercised end to end on the local-filesystem topology only, on developer hardware, at developer scale: clone, signed backup under sustained writes, independent verification through trust-root custody, restore to a new path, attested reopen, known-answer reads, provenance and taint checks, and fault injection. Receipts are retained under docs/drills/. Customer-scale data volumes, the target storage stacks (CSI drivers, backup products, object-lock targets), and SRE sign-off are external and unexercised, so EXT-DR remains open. No drill in this repository was run against production-shaped storage."
       ]
     },
     {
@@ -239,10 +255,13 @@
       ],
       "evidence": [
         "SECURITY.md",
-        "docs/incident-response.md"
+        "docs/incident-response.md",
+        "crates/loom-drill/src/incident.rs",
+        "docs/drills/README.md"
       ],
       "gaps": [
-        "Named on-call staff, communication channels, and an exercised customer notification drill are organizational gates."
+        "Incident notification CONTENT is generated from a recovery drill's measured receipt - what was lost, what bounds it, how long recovery took, which backup was consumed, which trust root verified it - for both an operations and a customer audience, and is exercised as a scripted tabletop in crates/loom-drill. Every generated notification records delivered=false and carries what delivery would require.",
+        "Named on-call staff, a paging system wired to a rota, an accountable customer-communications channel, a documented notifiability decision, and an exercised real notification drill are organizational gates. Nothing in this repository has been delivered to anyone; EXT-OPERATIONS remains open."
       ]
     },
     {
