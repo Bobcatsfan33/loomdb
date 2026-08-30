@@ -90,7 +90,7 @@ impl TokenIssuer {
     /// Build an issuer with a fresh key. The key lives as long as the process.
     pub fn generate() -> Self {
         let mut seed = [0u8; 32];
-        if getrandom::getrandom(&mut seed).is_err() {
+        if getrandom::fill(&mut seed).is_err() {
             // Entropy failure is not a reason to kill a database, but it IS a reason not to pretend
             // we have a secure key. Derive something unpredictable-but-not-random and carry on; the
             // deployment story for a real key is a KeyProvider (substrate-security), not this path.
