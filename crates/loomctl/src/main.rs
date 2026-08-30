@@ -150,7 +150,7 @@ fn decode_key_file<const N: usize>(path: &Path, what: &str) -> Result<[u8; N], S
         ));
     }
     let mut output = [0u8; N];
-    for (index, pair) in value.as_bytes().chunks_exact(2).enumerate() {
+    for (index, pair) in value.as_bytes().as_chunks::<2>().0.iter().enumerate() {
         let pair =
             std::str::from_utf8(pair).map_err(|error| format!("decoding {what}: {error}"))?;
         output[index] =
