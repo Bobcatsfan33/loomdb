@@ -299,7 +299,7 @@ fn decode_hex<const N: usize>(value: &str, what: &str) -> Result<[u8; N], Backup
         )));
     }
     let mut output = [0u8; N];
-    for (index, pair) in value.as_bytes().chunks_exact(2).enumerate() {
+    for (index, pair) in value.as_bytes().as_chunks::<2>().0.iter().enumerate() {
         let pair = std::str::from_utf8(pair)
             .map_err(|error| BackupError::Authenticity(format!("{what}: {error}")))?;
         output[index] = u8::from_str_radix(pair, 16)
