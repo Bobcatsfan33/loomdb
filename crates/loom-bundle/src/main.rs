@@ -108,7 +108,7 @@ fn run(cli: Cli) -> std::result::Result<(), String> {
             out_public,
         } => {
             let mut seed = [0u8; 32];
-            getrandom::getrandom(&mut seed).map_err(|e| format!("generating key material: {e}"))?;
+            getrandom::fill(&mut seed).map_err(|e| format!("generating key material: {e}"))?;
             let signing = ed25519_dalek::SigningKey::from_bytes(&seed);
             let verifying = signing.verifying_key();
             write_file(
