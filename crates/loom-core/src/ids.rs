@@ -84,7 +84,7 @@ macro_rules! hash_id {
                 let mut bytes = [0u8; 32];
                 // BLAKE3 of an OS-random seed. Not cryptographic identity — just unguessable.
                 let mut seed = [0u8; 32];
-                if getrandom::getrandom(&mut seed).is_err() {
+                if getrandom::fill(&mut seed).is_err() {
                     // Entropy failure is not a reason to kill a database. Fall back to a hash of the
                     // address of a fresh allocation, which is not great but is not predictable
                     // either, and record nothing that pretends it was random.

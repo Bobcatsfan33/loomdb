@@ -20,7 +20,7 @@ serde.workspace = true
 bincode.workspace = true
 thiserror.workspace = true
 # Filling a 32-byte key seed for `keygen`. Same crate the rest of LoomDB uses for key material.
-getrandom = "0.2"
+getrandom = "0.4"
 
 [dependencies.clap]
 version = "4"
