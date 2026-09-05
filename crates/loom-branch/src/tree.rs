@@ -578,6 +578,12 @@ impl<'a> Tree<'a> {
 /// commit, and the caller sees a `PageTooLarge` for a write that looked fine. So this rounds up: the
 /// bincode length prefixes are 8 bytes each, and `SLACK` covers the enum tags and any discrepancy
 /// between `serialized_size` and the real thing.
+///
+/// **This is a claim about the serializer, so it is tested rather than asserted in prose.** The
+/// 8-byte prefix, the 4-byte enum tag, and the requirement that `SLACK` cover the per-entry framing
+/// the estimate does not count are all pinned by `tests::page_fitting` below — as is the fanout they
+/// produce, so a serializer whose framing differs fails loudly instead of silently repacking every
+/// page. See `docs/design/serialization-format.md` (issue #50).
 const SLACK: usize = 24;
 
 fn entry_cost(key: &[u8], record: &Record) -> Result<usize> {
@@ -797,5 +803,215 @@ mod tests {
         assert_eq!(child_index(&keys, b"e"), 1);
         assert_eq!(child_index(&keys, b"f"), 2);
         assert_eq!(child_index(&keys, b"z"), 2);
+    }
+
+    /// **The page-fitting invariant, pinned against the serializer.**
+    ///
+    /// # Why this module exists
+    ///
+    /// `is_full`/`overflowed` decides B-tree shape by *measuring the encoding*: `entry_cost` adds
+    /// `bincode::serialized_size(record)` to the key length and a fixed `SLACK`, and the surrounding
+    /// comment reasons explicitly about bincode's 8-byte length prefixes. So the serializer does not
+    /// merely decide what a node *looks like* on disk — it decides **how many records fit in a
+    /// page**, and therefore the tree's fanout, its depth, and its write amplification.
+    ///
+    /// A successor with different framing (a varint length prefix, say) would keep every existing
+    /// test green while quietly repacking every page. That is not a correctness bug the suite can
+    /// see; it is a performance and layout change that arrives unannounced.
+    ///
+    /// These tests fix the current relationship between a node's *logical contents* and its
+    /// *serialized size*, so such a change fails loudly and names itself. They are companions to the
+    /// golden byte fixtures in `tests/golden_format.rs`: the fixtures pin the bytes, this pins what
+    /// the bytes *cost*.
+    ///
+    /// Issue #50; design note: `docs/design/serialization-format.md`.
+    mod page_fitting {
+        use super::*;
+
+        /// The record shape the numbers below are measured against. Deliberately the simplest one:
+        /// a fixed-size scalar, so a change in the measurement is a change in the *framing* and not
+        /// in some incidental payload.
+        fn counter(n: i64) -> Record {
+            Record::Value(Value::Counter(n))
+        }
+
+        /// **`serialized_size` must agree with `serialize`.**
+        ///
+        /// `entry_cost` trusts `serialized_size` as a cheap stand-in for the real encode. If a
+        /// successor's size oracle over- or under-reports relative to its own encoder, the whole
+        /// over-count discipline in `Tree::overflowed` collapses — an under-report lets a node grow
+        /// past the page and the pager rejects the write at commit, which surfaces as a
+        /// `PageTooLarge` for an insert that looked fine.
+        #[test]
+        fn the_size_oracle_agrees_with_the_encoder() {
+            for record in [
+                counter(0),
+                counter(-9_007_199_254_740_993),
+                Record::Value(Value::Text("café ☕".to_string())),
+                Record::Value(Value::Blob(vec![0xAB; 300])),
+                Record::Value(Value::Bool(true)),
+            ] {
+                let claimed = bincode::serialized_size(&record).expect("size") as usize;
+                let actual = bincode::serialize(&record).expect("encode").len();
+                assert_eq!(
+                    claimed, actual,
+                    "serialized_size disagreed with serialize for {record:?}"
+                );
+            }
+        }
+
+        /// The pinned cost of one record, in encoded bytes.
+        ///
+        /// 16 = a 4-byte `Record` discriminant + a 4-byte `Value` discriminant + an 8-byte `i64`.
+        /// Every one of those three widths is a bincode 1.x format property (see
+        /// `tests/golden_format.rs::format_contract`), and a successor that changes any of them
+        /// changes page packing.
+        #[test]
+        fn a_counter_record_encodes_to_sixteen_bytes() {
+            assert_eq!(bincode::serialized_size(&counter(42)).expect("size"), 16);
+        }
+
+        /// `entry_cost` is `key.len() + serialized_size(record) + SLACK`, with nothing else in it.
+        #[test]
+        fn entry_cost_is_key_plus_record_plus_slack() -> Result<()> {
+            let k = key(42);
+            assert_eq!(k.len(), 12);
+            assert_eq!(entry_cost(&k, &counter(42))?, 12 + 16 + SLACK);
+            assert_eq!(entry_cost(&k, &counter(42))?, 52);
+            assert_eq!(SLACK, 24);
+            Ok(())
+        }
+
+        /// **What a leaf entry really costs, and the margin `SLACK` is buying.**
+        ///
+        /// A `(Key, Record)` pair in a leaf costs the key's 8-byte length prefix plus its bytes plus
+        /// the record — 36 bytes for a 12-byte key and a counter. `entry_cost` charges 52. The
+        /// 16-byte gap is the over-count, and it exists so the fullness check can only ever fire
+        /// *early*.
+        ///
+        /// **The invariant that must hold, not merely the number:** `SLACK` must cover at least the
+        /// per-entry framing that `entry_cost` does not otherwise count — which under bincode 1.x is
+        /// the key's 8-byte length prefix. A successor with a *larger* per-entry framing than
+        /// `SLACK` would make the estimate under-count, and `Tree::overflowed` would start firing
+        /// late. That is the failure mode this assertion exists to prevent.
+        #[test]
+        fn slack_covers_the_per_entry_framing_the_estimate_does_not_count() -> Result<()> {
+            let k = key(1);
+            let record = counter(1);
+
+            let one = bincode::serialize(&Node::Leaf {
+                entries: vec![(k.clone(), record.clone())],
+            })
+            .expect("encode")
+            .len();
+            let two = bincode::serialize(&Node::Leaf {
+                entries: vec![(k.clone(), record.clone()), (key(2), counter(2))],
+            })
+            .expect("encode")
+            .len();
+
+            let marginal = two - one;
+            assert_eq!(marginal, 36, "the true marginal cost of one leaf entry");
+
+            let uncounted =
+                marginal - k.len() - bincode::serialized_size(&record).expect("size") as usize;
+            assert_eq!(
+                uncounted, 8,
+                "the key's length prefix, which entry_cost omits"
+            );
+            assert!(
+                SLACK >= uncounted,
+                "SLACK ({SLACK}) must cover the per-entry framing ({uncounted}) or the fullness \
+                 estimate under-counts and a node can grow past its page"
+            );
+            assert_eq!(entry_cost(&k, &record)?, marginal + 16);
+            Ok(())
+        }
+
+        /// **The estimate over-counts for real leaves, at every size.** A property, not a constant:
+        /// it must survive a serializer change even if the numbers above move.
+        #[test]
+        fn the_running_estimate_never_under_counts_a_real_leaf() -> Result<()> {
+            for count in [1usize, 2, 7, 40, 79, 80, 500] {
+                let entries: Vec<(Key, Record)> = (0..count as u64)
+                    .map(|n| (key(n), counter(n as i64)))
+                    .collect();
+                let estimate: usize = entries
+                    .iter()
+                    .map(|(k, r)| entry_cost(k, r))
+                    .sum::<Result<usize>>()?;
+                let real = bincode::serialize(&Node::Leaf {
+                    entries: entries.clone(),
+                })
+                .expect("encode")
+                .len();
+                assert!(
+                    estimate >= real,
+                    "the fullness estimate UNDER-counted a {count}-entry leaf ({estimate} < \
+                     {real}). `Tree::overflowed` would fire late and the pager would reject the \
+                     write at commit."
+                );
+            }
+            Ok(())
+        }
+
+        /// **The split point.** With 4096-byte pages, a leaf of this record shape holds 79 entries
+        /// and splits on the 80th.
+        ///
+        /// 79 entries encode to 2856 bytes, one under the 2867-byte limit (`4096 × 0.7`); 80 encode
+        /// to 2892, one over. A serializer that framed entries differently would move this number,
+        /// which is precisely the silent fanout change worth failing on.
+        #[test]
+        fn a_leaf_splits_on_the_eightieth_record() {
+            let limit = (MIN_PAGE_SIZE as f64 * FILL_FACTOR) as usize;
+            assert_eq!(limit, 2867);
+
+            let leaf = |n: u64| {
+                bincode::serialize(&Node::Leaf {
+                    entries: (0..n).map(|i| (key(i), counter(i as i64))).collect(),
+                })
+                .expect("encode")
+                .len()
+            };
+            assert_eq!(leaf(79), 2856);
+            assert_eq!(leaf(80), 2892);
+            assert!(leaf(79) <= limit, "79 entries must still fit");
+            assert!(leaf(80) > limit, "80 entries must not");
+        }
+
+        /// **The tree's shape, end to end.** Ascending inserts of 2000 records into 4096-byte pages
+        /// produce exactly 50 leaves of 40 entries under a root at page 3.
+        ///
+        /// This is the assertion that catches a repacking serializer even if every byte-level test
+        /// above were somehow satisfied: it measures the thing the format actually decides.
+        #[test]
+        fn the_shape_of_a_two_thousand_record_tree_is_pinned() -> Result<()> {
+            let st = store();
+            let pairs: Vec<_> = (0..2_000u64).map(|n| (key(n), counter(n as i64))).collect();
+            write_all(&st, &pairs)?;
+
+            let mut tree = Tree::open(&st)?;
+            assert_eq!(tree.meta.count, 2_000);
+            assert_eq!(tree.meta.root, 3, "root page");
+            assert_eq!(tree.meta.next_free, 52, "logical pages allocated");
+
+            let mut leaves = Vec::new();
+            for page in 1..tree.meta.next_free {
+                if let Ok(Node::Leaf { entries }) = tree.node(page) {
+                    leaves.push(entries.len());
+                }
+            }
+            assert_eq!(leaves.len(), 50, "leaf count — this IS the fanout");
+            assert!(
+                leaves.iter().all(|n| *n == 40),
+                "every leaf should hold 40 entries, got {leaves:?}"
+            );
+
+            // And the data survived the shape, which is the only reason any of it matters.
+            for n in 0..2_000u64 {
+                assert_eq!(tree.get(&key(n))?, Some(counter(n as i64)), "lost key {n}");
+            }
+            Ok(())
+        }
     }
 }

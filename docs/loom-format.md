@@ -42,6 +42,15 @@ Encoded with bincode. A node splits when its encoding exceeds **70%** of the pag
 because a node that fills its page exactly leaves no room for the *next* insert to be encoded before
 the split is detected, and a split that cannot be encoded is a wedged database.
 
+**The encoding is a format contract, and it is pinned.** bincode 1.x's defaults — fixed-width
+little-endian integers, 8-byte length prefixes, 4-byte enum discriminants, a 1-byte `Option` tag —
+are what every stored byte and every page-fitting calculation depends on. They are asserted
+byte-for-byte by `crates/loom-branch/tests/golden_format.rs` against committed fixtures, and the
+page-fitting numbers they produce by `tree.rs::tests::page_fitting`. Note in particular that an enum
+discriminant is the variant's **declaration index**, so reordering the variants listed below is an
+on-disk format change with no compiler error. See
+[`docs/design/serialization-format.md`](design/serialization-format.md) (issue #50).
+
 ## Records
 
 ```rust

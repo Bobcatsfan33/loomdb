@@ -1,0 +1,57 @@
+# LoomDB golden format fixtures — format v1.
+#
+# GENERATED. Do not edit by hand, and do not regenerate to make a test
+# pass: a diff here is an ON-DISK FORMAT CHANGE, and for a storage engine
+# that is data loss. See docs/design/serialization-format.md (issue #50).
+#
+# These are the bytes bincode 1.3.3 produces with its default settings:
+#   * integers fixed-width and little-endian, never varint
+#   * every length prefix a bare u64 (8 bytes), for any size
+#   * enum discriminants a u32 of the variant's DECLARATION INDEX
+#   * Option a one-byte tag; bool one byte
+#   * structs a bare concatenation — no field names, no count, no type tag
+#
+# To ADD a case (never to bless a diff):
+#   LOOMDB_UPDATE_GOLDEN=1 cargo test --test golden_format
+
+[bundle_manifest]
+type: loom_bundle::BundleManifest
+case: the Ed25519 signing payload — seven fields, no field names on the wire
+len:  147 bytes
+010000000e00000000000000706f6c6963792d323032362d3037060000000000
+0000706f6c6963790b00000000000000302e312e302d636166c3a90068e5cf8b
+0100004000000000000000303536383962393839323434303832653631343735
+3534376539353562626563653537613237346336643961323862663434323265
+33616437393034353864630b00000000000000
+
+[bundle_manifest_empty]
+type: loom_bundle::BundleManifest
+case: every string empty — four bare 8-byte zero length prefixes
+len:  52 bytes
+0100000000000000000000000000000000000000000000000000000000000000
+0000000000000000000000000000000000000000
+
+[bundle_transport]
+type: loom_bundle::Bundle
+case: the whole bundle as it travels on physical media: manifest, payload, 64-byte signature
+len:  238 bytes
+010000000e00000000000000706f6c6963792d323032362d3037060000000000
+0000706f6c6963790b00000000000000302e312e302d636166c3a90068e5cf8b
+0100004000000000000000303536383962393839323434303832653631343735
+3534376539353562626563653537613237346336643961323862663434323265
+33616437393034353864630b000000000000000b000000000000007468652070
+61796c6f61644000000000000000811791fa730d64f801e5a1f83afada0dfbe8
+5eb142ccbe1d744c1fdd0daf45cc85d69619f5b709799d7249f9a5e875a0ea38
+30ff269dc3d264d70a60e3938706
+
+[bundle_transport_empty_payload]
+type: loom_bundle::Bundle
+case: a zero-length payload — the length prefix with nothing after it
+len:  208 bytes
+010000000500000000000000656d7074790600000000000000706f6c69637901
+0000000000000030000000000000000040000000000000006166313334396239
+6635663961316136613034303464656133366463633934393962636232356339
+6164633131326237636339613933636165343166333236320000000000000000
+00000000000000004000000000000000513e6eb7ad6a95ba8957dce8d329f345
+bc62b575cb3dfdf5b3ae7ddf4e95945a3d8a01da2d3cbbabd0a845abbb725aad
+ed2301fa3993b7ee9c6902282c323209
