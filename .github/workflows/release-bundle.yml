@@ -118,7 +118,7 @@ jobs:
       # `fallback: none` makes a missing or mismatched binary an error rather than a silent
       # `cargo install` that would reintroduce the same compile.
       - name: install the pinned audit tool
-        uses: taiki-e/install-action@7f4eb899022d8fe70b20c4f3de697aa85c309026
+        uses: taiki-e/install-action@fa23953489c080190314742a9b907f8e97c6767c
         with:
           tool: cargo-audit@0.22.2
           checksum: true
