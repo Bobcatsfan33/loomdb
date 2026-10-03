@@ -309,21 +309,30 @@ jobs:
       - uses: actions/checkout@v7.0.1
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
+      # MinIO withdrew public distribution in Sep/Oct 2026: dl.min.io binaries return
+      # 410 Gone, Docker Hub's repo was removed, and quay.io/minio went private.
+      # Chainguard's Wolfi builds are the remaining maintained public images; free tier
+      # is :latest-only, so pinned by digest (resolved 2026-10-03 — re-resolve from
+      # cgr.dev/chainguard/{minio,minio-client}:latest if a pull 404s). --network host
+      # keeps the latency profile binary-equivalent (no docker-proxy hop) for AT-047.
       - name: Stand up MinIO and create the bucket
         run: |
           set -euo pipefail
-          curl -fsSL https://dl.min.io/server/minio/release/linux-amd64/minio -o minio
-          curl -fsSL https://dl.min.io/client/mc/release/linux-amd64/mc -o mc
-          chmod +x minio mc
-          MINIO_ROOT_USER=minioadmin MINIO_ROOT_PASSWORD=minioadmin \
-            ./minio server /tmp/minio-data --address :9000 >/tmp/minio.log 2>&1 &
+          mkdir -p "$RUNNER_TEMP/minio-data" && chmod 0777 "$RUNNER_TEMP/minio-data"
+          docker run -d --name minio --network host \
+            -e MINIO_ROOT_USER=minioadmin -e MINIO_ROOT_PASSWORD=minioadmin \
+            -v "$RUNNER_TEMP/minio-data:/data" \
+            cgr.dev/chainguard/minio@sha256:4cf4831a2bbcf13ddca09c1cbcc9faff716dd3c4247e0babc32864b8ee8e0034 \
+            server /data --address :9000
           for i in $(seq 1 40); do
             if curl -fsS http://localhost:9000/minio/health/live >/dev/null 2>&1; then break; fi
             sleep 1
           done
           curl -fsS http://localhost:9000/minio/health/live && echo "MinIO is live"
-          ./mc alias set local http://localhost:9000 minioadmin minioadmin
-          ./mc mb --ignore-existing local/loomdb
+          docker run --rm --network host \
+            -e MC_HOST_local=http://minioadmin:minioadmin@localhost:9000 \
+            cgr.dev/chainguard/minio-client@sha256:b20bdc339b3f2596c8f731793f861d2445fd13a9a3cfb517ff020969f4e4bf71 \
+            mb --ignore-existing local/loomdb
       - name: Measure loom wake → first read over object storage
         env:
           MINIO_URL: http://localhost:9000
